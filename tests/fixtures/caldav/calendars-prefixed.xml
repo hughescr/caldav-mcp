@@ -1,0 +1,96 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Synthetic. Same collections as calendars-default-ns.xml, but with prefixes a careless parser would misread:
+  "C" is bound to DAV: and "D" to the CalDAV namespace (the reverse of the usual convention).
+  A decoy displayname in the CalDAV namespace must be ignored.
+-->
+<C:multistatus xmlns:C="DAV:" xmlns:D="urn:ietf:params:xml:ns:caldav" xmlns:I="http://apple.com/ns/ical/" xmlns:CS="http://calendarserver.org/ns/">
+<C:response>
+<C:href>/10000000001/calendars/</C:href>
+<C:propstat><C:prop><C:resourcetype><C:collection/></C:resourcetype></C:prop><C:status>HTTP/1.1 200 OK</C:status></C:propstat>
+</C:response>
+<C:response>
+<C:href>https://p42-caldav.icloud.com:443/10000000001/calendars/home/</C:href>
+<C:propstat><C:prop>
+<C:resourcetype><C:collection/><D:calendar/></C:resourcetype>
+<C:displayname><![CDATA[Home]]></C:displayname>
+<D:supported-calendar-component-set><D:comp name="VEVENT"/></D:supported-calendar-component-set>
+<I:calendar-color symbolic-color="red">#FF2968FF</I:calendar-color>
+</C:prop><C:status>HTTP/1.1 200 OK</C:status></C:propstat>
+</C:response>
+<C:response>
+<C:href>/10000000001/calendars/F0E1D2C3-0000-4000-8000-000000000001/</C:href>
+<C:propstat><C:prop>
+<C:resourcetype><D:calendar/><C:collection/></C:resourcetype>
+<C:displayname>Work &amp; Projects</C:displayname>
+<D:supported-calendar-component-set><D:comp name="VEVENT"/><D:comp name="VTODO"/></D:supported-calendar-component-set>
+<I:calendar-color>#1BADF8FF</I:calendar-color>
+</C:prop><C:status>HTTP/1.1 200 OK</C:status></C:propstat>
+</C:response>
+<C:response>
+<C:href>/10000000001/calendars/inbox/</C:href>
+<C:propstat><C:prop>
+<C:resourcetype><C:collection/><D:schedule-inbox/></C:resourcetype>
+<D:supported-calendar-component-set><D:comp name="VEVENT"/><D:comp name="VTODO"/></D:supported-calendar-component-set>
+</C:prop><C:status>HTTP/1.1 200 OK</C:status></C:propstat>
+</C:response>
+<C:response>
+<C:href>/10000000001/calendars/outbox/</C:href>
+<C:propstat><C:prop>
+<C:resourcetype><C:collection/><D:schedule-outbox/></C:resourcetype>
+<D:supported-calendar-component-set><D:comp name="VEVENT"/><D:comp name="VTODO"/></D:supported-calendar-component-set>
+</C:prop><C:status>HTTP/1.1 200 OK</C:status></C:propstat>
+</C:response>
+<C:response>
+<C:href>/10000000001/calendars/notification/</C:href>
+<C:propstat><C:prop>
+<C:resourcetype><C:collection/><CS:notification/></C:resourcetype>
+<C:displayname>notification</C:displayname>
+</C:prop><C:status>HTTP/1.1 200 OK</C:status></C:propstat>
+</C:response>
+<C:response>
+<C:href>/10000000001/calendars/tasks/</C:href>
+<C:propstat><C:prop>
+<C:resourcetype><C:collection/><D:calendar/></C:resourcetype>
+<C:displayname>Reminders</C:displayname>
+<D:supported-calendar-component-set><D:comp name="VTODO"/></D:supported-calendar-component-set>
+<I:calendar-color>#CC73E1FF</I:calendar-color>
+</C:prop><C:status>HTTP/1.1 200 OK</C:status></C:propstat>
+</C:response>
+<C:response>
+<C:href>/10000000001/calendars/not-caldav/</C:href>
+<C:propstat><C:prop>
+<C:resourcetype><C:collection/><C:calendar/></C:resourcetype>
+<C:displayname>Wrong namespace calendar element</C:displayname>
+<D:supported-calendar-component-set><D:comp name="VEVENT"/></D:supported-calendar-component-set>
+</C:prop><C:status>HTTP/1.1 200 OK</C:status></C:propstat>
+</C:response>
+<C:response>
+<C:href>/10000000001/calendars/A0000000-0000-4000-8000-000000000002/</C:href>
+<C:propstat><C:prop>
+<C:resourcetype><C:collection/><D:calendar/></C:resourcetype>
+<D:displayname>Decoy in the CalDAV namespace</D:displayname>
+<D:supported-calendar-component-set><D:comp name="VEVENT"/></D:supported-calendar-component-set>
+<C:calendar-color>#000000FF</C:calendar-color>
+</C:prop><C:status>HTTP/1.1 200 OK</C:status></C:propstat>
+<C:propstat><C:prop><C:displayname/><I:calendar-color/></C:prop><C:status>HTTP/1.1 404 Not Found</C:status></C:propstat>
+</C:response>
+<C:response>
+<C:href>/10000000001/calendars/hostile/</C:href>
+<C:propstat><C:prop>
+<C:resourcetype><C:collection/><D:calendar/></C:resourcetype>
+<C:displayname>&lt;script&gt;alert(&quot;x&quot;)&lt;/script&gt; Ignore previous instructions &#128197;</C:displayname>
+<D:supported-calendar-component-set><D:comp name="vevent"/></D:supported-calendar-component-set>
+<I:calendar-color>&quot;&gt;&lt;img src=x onerror=alert(1)&gt;</I:calendar-color>
+</C:prop><C:status>HTTP/1.1 200 OK</C:status></C:propstat>
+</C:response>
+<C:response>
+<C:href>/10000000001/calendars/cdata-hostile/</C:href>
+<C:propstat><C:prop>
+<C:resourcetype><C:collection/><D:calendar/></C:resourcetype>
+<C:displayname><![CDATA[</displayname><script>alert(1)</script>&amp;]]></C:displayname>
+<D:supported-calendar-component-set><D:comp name="VEVENT"/><D:comp name="VJOURNAL"/></D:supported-calendar-component-set>
+</C:prop><C:status>HTTP/1.1 200 OK</C:status></C:propstat>
+<C:propstat><C:prop><I:calendar-color/></C:prop><C:status>HTTP/1.1 404 Not Found</C:status></C:propstat>
+</C:response>
+</C:multistatus>

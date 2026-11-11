@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<A:multistatus xmlns:A="DAV:" xmlns:B="urn:ietf:params:xml:ns:caldav">
+  <A:response>
+    <A:href>/10000000001/principal/</A:href>
+    <A:propstat>
+      <A:prop>
+        <B:calendar-home-set>
+          <A:href>https://p42-caldav.icloud.com/10000000001/calendars/</A:href>
+        </B:calendar-home-set>
+      </A:prop>
+      <A:status>HTTP/1.1 200 OK</A:status>
+    </A:propstat>
+    <A:propstat>
+      <A:prop>
+        <B:calendar-user-address-set/>
+      </A:prop>
+      <A:status>HTTP/1.1 404 Not Found</A:status>
+    </A:propstat>
+  </A:response>
+</A:multistatus>

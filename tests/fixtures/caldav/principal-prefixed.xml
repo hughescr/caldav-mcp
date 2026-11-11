@@ -1,0 +1,4 @@
+<?xml version="1.0" encoding="utf-8"?>
+<ns0:multistatus xmlns:ns0="DAV:" xmlns:ns1="urn:ietf:params:xml:ns:caldav"><ns0:response><ns0:href>https://caldav.icloud.com/</ns0:href><ns0:propstat><ns0:prop><ns0:current-user-principal><ns0:href>
+  https://caldav.icloud.com:443/10000000001/principal/
+</ns0:href></ns0:current-user-principal></ns0:prop><ns0:status>HTTP/1.1 200 OK</ns0:status></ns0:propstat></ns0:response></ns0:multistatus>
