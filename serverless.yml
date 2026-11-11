@@ -1,0 +1,81 @@
+service: caldav-mcp
+frameworkVersion: '4'
+configValidationMode: error
+
+provider:
+  name: aws
+  runtime: nodejs26.x
+  architecture: arm64
+  region: us-west-2
+  stage: prod
+  memorySize: 1024
+  timeout: 60
+  versionFunctions: true
+  logRetentionInDays: 14
+  deploymentBucket:
+    name: ${env:AWS_DEPLOYMENT_BUCKET_NAME, 'caldav-mcp-artifacts-unconfigured'}
+    blockPublicAccess: true
+  iam:
+    role: ${env:AWS_EXECUTION_ROLE_ARN, 'arn:aws:iam::000000000000:role/caldav-mcp-prod-execution'}
+  environment:
+    PUBLIC_BASE_URL:
+      Fn::ImportValue: caldav-mcp-prod-public-origin
+    AUTH_KEYRING_PARAMETER: ${env:AUTH_KEYRING_PARAMETER, ''}
+    # Comma-separated account hashes. Empty means nobody may connect (fail closed).
+    ALLOWED_APPLE_ID_HASHES: ${env:ALLOWED_APPLE_ID_HASHES, ''}
+    CREDENTIAL_TABLE_NAME:
+      Ref: CredentialTable
+  stackTags:
+    Project: caldav-mcp
+
+# Build once in the unprivileged CI job; deploy that exact artifact.
+build:
+  esbuild: false
+package:
+  artifact: dist/function.zip
+
+functions:
+  api:
+    handler: handler.handler
+    url: true
+
+resources:
+  Resources:
+    CredentialTable:
+      Type: AWS::DynamoDB::Table
+      DeletionPolicy: Retain
+      UpdateReplacePolicy: Retain
+      Properties:
+        TableName: ${self:service}-${sls:stage}-state
+        TableClass: STANDARD
+        BillingMode: PROVISIONED
+        ProvisionedThroughput:
+          ReadCapacityUnits: 1
+          WriteCapacityUnits: 1
+        AttributeDefinitions:
+          - AttributeName: pk
+            AttributeType: S
+          - AttributeName: sk
+            AttributeType: S
+        KeySchema:
+          - AttributeName: pk
+            KeyType: HASH
+          - AttributeName: sk
+            KeyType: RANGE
+        TimeToLiveSpecification:
+          AttributeName: expiresAt
+          Enabled: true
+        SSESpecification:
+          SSEEnabled: true
+        PointInTimeRecoverySpecification:
+          PointInTimeRecoveryEnabled: false
+        Tags:
+          - Key: Project
+            Value: caldav-mcp
+  Outputs:
+    PublicBaseUrl:
+      Value:
+        Fn::ImportValue: caldav-mcp-prod-public-origin
+    CredentialTableName:
+      Value:
+        Ref: CredentialTable

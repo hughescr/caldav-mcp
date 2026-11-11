@@ -1,0 +1,352 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Stable CloudFront endpoint, artifact bucket and IAM roles for caldav-mcp production CI
+
+Parameters:
+  FunctionUrlOrigin:
+    Type: String
+    Description: Existing service Function URL HTTPS origin, without a trailing slash
+    AllowedPattern: '^https://[a-z0-9]+\.lambda-url\.[a-z0-9-]+\.on\.aws$'
+  PublicDomainName:
+    Type: String
+    Default: caldav-mcp.rungie.com
+    AllowedValues: [caldav-mcp.rungie.com]
+    Description: Approved stable public OAuth hostname
+  HostedZoneId:
+    Type: String
+    Default: Z1VXUCOF8PCGCR
+    AllowedValues: [Z1VXUCOF8PCGCR]
+    Description: Existing rungie.com hosted zone
+
+Resources:
+  # Same shared certificate custom-resource contract as webservices.
+  SSLCertificate:
+    Type: Custom::DNSCertificate
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      DomainName:
+        Ref: PublicDomainName
+      ValidationMethod: DNS
+      Region: us-east-1
+      DomainValidationOptions:
+        - DomainName:
+            Ref: PublicDomainName
+          HostedZoneId:
+            Ref: HostedZoneId
+      ServiceToken:
+        Fn::ImportValue: CertificateAccepterLambda-Arn
+  BearerResponseHeaders:
+    Type: AWS::CloudFront::ResponseHeadersPolicy
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      ResponseHeadersPolicyConfig:
+        Name: caldav-mcp-prod-bearer
+        CustomHeadersConfig:
+          Items:
+            - Header: WWW-Authenticate
+              Value:
+                Fn::Sub: 'Bearer resource_metadata="https://${PublicDomainName}/.well-known/oauth-protected-resource/mcp"'
+              Override: false
+  BasicResponseHeaders:
+    Type: AWS::CloudFront::ResponseHeadersPolicy
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      ResponseHeadersPolicyConfig:
+        Name: caldav-mcp-prod-basic
+        CustomHeadersConfig:
+          Items:
+            - Header: WWW-Authenticate
+              Value: 'Basic realm="oauth"'
+              Override: false
+  PublicDistribution:
+    Type: AWS::CloudFront::Distribution
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      DistributionConfig:
+        Aliases:
+          - Ref: PublicDomainName
+        Comment: caldav-mcp canonical OAuth endpoint
+        Enabled: true
+        IPV6Enabled: true
+        HttpVersion: http2and3
+        PriceClass: PriceClass_100
+        ViewerCertificate:
+          AcmCertificateArn:
+            Ref: SSLCertificate
+          SslSupportMethod: sni-only
+          MinimumProtocolVersion: TLSv1.2_2021
+        Origins:
+          - Id: lambda-function-url
+            DomainName:
+              Fn::Select: [2, {Fn::Split: ['/', {Ref: FunctionUrlOrigin}]}]
+            CustomOriginConfig:
+              OriginProtocolPolicy: https-only
+              OriginReadTimeout: 60
+              OriginSSLProtocols: [TLSv1.2]
+        DefaultCacheBehavior:
+          TargetOriginId: lambda-function-url
+          ViewerProtocolPolicy: https-only
+          AllowedMethods: [GET, HEAD, OPTIONS, PUT, PATCH, POST, DELETE]
+          CachedMethods: [GET, HEAD]
+          # AWS managed CachingDisabled and AllViewerExceptHostHeader policies.
+          CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad
+          OriginRequestPolicyId: b689b0a8-53d0-40ab-baf2-68738e2966ac
+          ResponseHeadersPolicyId:
+            Ref: BearerResponseHeaders
+        CacheBehaviors:
+          - PathPattern: /token
+            TargetOriginId: lambda-function-url
+            ViewerProtocolPolicy: https-only
+            AllowedMethods: [GET, HEAD, OPTIONS, PUT, PATCH, POST, DELETE]
+            CachedMethods: [GET, HEAD]
+            CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad
+            OriginRequestPolicyId: b689b0a8-53d0-40ab-baf2-68738e2966ac
+            ResponseHeadersPolicyId:
+              Ref: BasicResponseHeaders
+          - PathPattern: /revoke
+            TargetOriginId: lambda-function-url
+            ViewerProtocolPolicy: https-only
+            AllowedMethods: [GET, HEAD, OPTIONS, PUT, PATCH, POST, DELETE]
+            CachedMethods: [GET, HEAD]
+            CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad
+            OriginRequestPolicyId: b689b0a8-53d0-40ab-baf2-68738e2966ac
+            ResponseHeadersPolicyId:
+              Ref: BasicResponseHeaders
+        # 401 is not a configurable CloudFront custom-error status. Supported
+        # errors keep their actual status/body, with no edge error-cache lifetime.
+        CustomErrorResponses:
+          - {ErrorCode: 400, ErrorCachingMinTTL: 0}
+          - {ErrorCode: 403, ErrorCachingMinTTL: 0}
+          - {ErrorCode: 404, ErrorCachingMinTTL: 0}
+          - {ErrorCode: 405, ErrorCachingMinTTL: 0}
+          - {ErrorCode: 414, ErrorCachingMinTTL: 0}
+          - {ErrorCode: 416, ErrorCachingMinTTL: 0}
+          - {ErrorCode: 500, ErrorCachingMinTTL: 0}
+          - {ErrorCode: 501, ErrorCachingMinTTL: 0}
+          - {ErrorCode: 502, ErrorCachingMinTTL: 0}
+          - {ErrorCode: 503, ErrorCachingMinTTL: 0}
+          - {ErrorCode: 504, ErrorCachingMinTTL: 0}
+      Tags:
+        - Key: Project
+          Value: caldav-mcp
+  PublicDnsA:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneId:
+        Ref: HostedZoneId
+      Name:
+        Ref: PublicDomainName
+      Type: A
+      AliasTarget:
+        DNSName:
+          Fn::GetAtt: [PublicDistribution, DomainName]
+        HostedZoneId: Z2FDTNDATAQYW2
+  PublicDnsAAAA:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneId:
+        Ref: HostedZoneId
+      Name:
+        Ref: PublicDomainName
+      Type: AAAA
+      AliasTarget:
+        DNSName:
+          Fn::GetAtt: [PublicDistribution, DomainName]
+        HostedZoneId: Z2FDTNDATAQYW2
+  ArtifactBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      VersioningConfiguration:
+        Status: Enabled
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      LifecycleConfiguration:
+        Rules:
+          - Id: OldArtifactVersions
+            Status: Enabled
+            NoncurrentVersionExpiration:
+              NoncurrentDays: 30
+  ExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: caldav-mcp-prod-execution
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: runtime
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource:
+                  Fn::Sub: arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/caldav-mcp-prod-api:*
+              - Effect: Allow
+                Action: ssm:GetParameter
+                Resource:
+                  Fn::Sub: arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/caldav-mcp/prod/auth-keyring
+              - Effect: Allow
+                Action: [dynamodb:GetItem, dynamodb:PutItem, dynamodb:UpdateItem, dynamodb:DeleteItem, dynamodb:ConditionCheckItem]
+                Resource:
+                  Fn::Sub: arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/caldav-mcp-prod-state
+                Condition:
+                  ForAllValues:StringLike:
+                    dynamodb:LeadingKeys: ['caldav-mcp#*']
+  GitHubDeployRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: caldav-mcp-github-deploy
+      MaxSessionDuration: 3600
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated:
+                Fn::ImportValue: GitHubOIDCProvider-Arn
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                token.actions.githubusercontent.com:aud: sts.amazonaws.com
+                # New repositories use immutable owner/repository IDs in the subject.
+                # Verify with: gh api repos/hughescr/caldav-mcp/actions/oidc/customization/sub
+                token.actions.githubusercontent.com:sub: repo:hughescr@46348/caldav-mcp@1454444258:ref:refs/heads/main
+      Policies:
+        - PolicyName: deploy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [cloudformation:CreateStack, cloudformation:UpdateStack, cloudformation:CreateChangeSet, cloudformation:DeleteChangeSet, cloudformation:DescribeChangeSet, cloudformation:ExecuteChangeSet, cloudformation:DescribeStacks, cloudformation:DescribeStackEvents, cloudformation:DescribeStackResource, cloudformation:DescribeStackResources, cloudformation:GetTemplate, cloudformation:GetTemplateSummary, cloudformation:ListStackResources, cloudformation:ListChangeSets, cloudformation:CancelUpdateStack, cloudformation:ContinueUpdateRollback]
+                Resource:
+                  Fn::Sub: arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/caldav-mcp-prod/*
+              - Effect: Allow
+                Action: cloudformation:ValidateTemplate
+                Resource: '*'
+              - Effect: Allow
+                Action: [s3:ListBucket, s3:GetBucketLocation, s3:GetBucketVersioning, s3:GetEncryptionConfiguration, s3:GetBucketPublicAccessBlock]
+                Resource:
+                  Fn::GetAtt: [ArtifactBucket, Arn]
+              - Effect: Allow
+                Action: [s3:GetObject, s3:PutObject, s3:DeleteObject]
+                Resource:
+                  Fn::Sub: ${ArtifactBucket.Arn}/serverless/caldav-mcp/prod/*
+              - Effect: Allow
+                Action: ['lambda:*']
+                Resource:
+                  - Fn::Sub: arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:caldav-mcp-prod-api
+                  - Fn::Sub: arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:caldav-mcp-prod-api:*
+              - Effect: Allow
+                Action: [iam:GetRole, iam:PassRole]
+                Resource:
+                  Fn::GetAtt: [ExecutionRole, Arn]
+                Condition:
+                  StringEqualsIfExists:
+                    iam:PassedToService: lambda.amazonaws.com
+              # CloudFormation locates log groups using the account-level list API.
+              - Effect: Allow
+                Action: logs:DescribeLogGroups
+                Resource: '*'
+              - Effect: Allow
+                Action: ['logs:*']
+                Resource:
+                  - Fn::Sub: arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/caldav-mcp-prod-api
+                  - Fn::Sub: arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/caldav-mcp-prod-api:*
+              # State table: control plane only, for the table defined in serverless.yml
+              # (provisioned throughput, TTL, SSE, PITR flag, tags). No data-plane action and
+              # no DeleteTable. This list is unverified against a real deploy: if CloudFormation
+              # fails with AccessDenied on a dynamodb:Describe* or dynamodb:Update* action, add
+              # exactly that action here.
+              - Effect: Allow
+                Action:
+                  - dynamodb:CreateTable
+                  - dynamodb:UpdateTable
+                  - dynamodb:DescribeTable
+                  - dynamodb:DescribeTimeToLive
+                  - dynamodb:UpdateTimeToLive
+                  - dynamodb:DescribeContinuousBackups
+                  - dynamodb:UpdateContinuousBackups
+                  - dynamodb:TagResource
+                  - dynamodb:UntagResource
+                  - dynamodb:ListTagsOfResource
+                  - dynamodb:DescribeContributorInsights
+                  - dynamodb:DescribeKinesisStreamingDestination
+                Resource:
+                  Fn::Sub: arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/caldav-mcp-prod-state
+              # Explicit Deny wins over any Allow, so a future broadening of this role cannot
+              # silently grant CI the sealed credential records or the means to destroy them.
+              - Effect: Deny
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:BatchGetItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:DeleteItem
+                  - dynamodb:BatchWriteItem
+                  - dynamodb:TransactGetItems
+                  - dynamodb:TransactWriteItems
+                  - dynamodb:PartiQLSelect
+                  - dynamodb:PartiQLInsert
+                  - dynamodb:PartiQLUpdate
+                  - dynamodb:PartiQLDelete
+                  - dynamodb:ExportTableToPointInTime
+                  - dynamodb:GetRecords
+                  - dynamodb:GetShardIterator
+                  - dynamodb:DescribeStream
+                  - dynamodb:DeleteTable
+                  - dynamodb:CreateBackup
+                  - dynamodb:RestoreTableFromBackup
+                  - dynamodb:RestoreTableToPointInTime
+                Resource:
+                  - Fn::Sub: arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/caldav-mcp-prod-state
+                  - Fn::Sub: arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/caldav-mcp-prod-state/*
+              - Effect: Deny
+                Action: ['ssm:GetParameter*', 'ssm:PutParameter', 'ssm:DeleteParameter*']
+                Resource:
+                  Fn::Sub: arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/caldav-mcp/prod/auth-keyring
+              # Residual risk, stated plainly: the Allow statements above still give this role
+              # lambda:* on the function, so it can change the Lambda's code and configuration.
+              # Code running as the execution role can read the keyring and the table. The Denies
+              # above stop CI from reading them directly, not from deploying code that does, so
+              # deploys from main remain inside the trust boundary.
+
+Outputs:
+  DistributionId:
+    Value:
+      Ref: PublicDistribution
+  DistributionDomainName:
+    Value:
+      Fn::GetAtt: [PublicDistribution, DomainName]
+  PublicBaseUrl:
+    Value:
+      Fn::Sub: https://${PublicDomainName}
+    Export:
+      Name: caldav-mcp-prod-public-origin
+  ArtifactBucketName:
+    Value:
+      Ref: ArtifactBucket
+  ExecutionRoleArn:
+    Value:
+      Fn::GetAtt: [ExecutionRole, Arn]
+  GitHubDeployRoleArn:
+    Value:
+      Fn::GetAtt: [GitHubDeployRole, Arn]

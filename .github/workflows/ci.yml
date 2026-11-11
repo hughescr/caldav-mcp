@@ -1,0 +1,99 @@
+name: Verify and deploy
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main, develop]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.4
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '26'
+      - run: bun install --frozen-lockfile --ignore-scripts
+      - run: bun run validate
+      - uses: actions/upload-artifact@v7
+        with:
+          name: lambda
+          path: dist/
+          if-no-files-found: error
+          retention-days: 7
+
+  deployment-status:
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    needs: verify
+    runs-on: ubuntu-latest
+    steps:
+      - name: Explain bootstrap requirement
+        if: vars.DEPLOY_ENABLED != 'true'
+        run: echo 'Deployment is disabled. Follow README bootstrap steps, then set DEPLOY_ENABLED=true. No live service was deployed.' >> "$GITHUB_STEP_SUMMARY"
+      - name: Validate deployment variables
+        if: vars.DEPLOY_ENABLED == 'true'
+        env:
+          ROLE: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          BUCKET: ${{ vars.AWS_DEPLOYMENT_BUCKET_NAME }}
+          EXECUTION_ROLE: ${{ vars.AWS_EXECUTION_ROLE_ARN }}
+          AUTH_KEYRING_PARAMETER: ${{ vars.AUTH_KEYRING_PARAMETER }}
+          ALLOWED_APPLE_ID_HASHES: ${{ vars.ALLOWED_APPLE_ID_HASHES }}
+          ACCESS_KEY: ${{ secrets.SERVERLESS_ACCESS_KEY }}
+        run: |
+          test -n "$ROLE"
+          test -n "$BUCKET"
+          test -n "$EXECUTION_ROLE"
+          test -n "$ACCESS_KEY"
+          test -n "$ALLOWED_APPLE_ID_HASHES"
+          test "$AUTH_KEYRING_PARAMETER" = /caldav-mcp/prod/auth-keyring
+
+  deploy:
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main' && vars.DEPLOY_ENABLED == 'true'
+    needs: [verify, deployment-status]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    concurrency:
+      group: production-deployment
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.4
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '26'
+      - run: bun install --frozen-lockfile --ignore-scripts
+      - uses: actions/download-artifact@v8
+        with:
+          name: lambda
+          path: dist
+      - uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: us-west-2
+          role-session-name: deploy-${{ github.run_id }}-${{ github.run_attempt }}
+      - name: Deploy verified artifact
+        run: bun run deploy
+        env:
+          AWS_DEPLOYMENT_BUCKET_NAME: ${{ vars.AWS_DEPLOYMENT_BUCKET_NAME }}
+          AWS_EXECUTION_ROLE_ARN: ${{ vars.AWS_EXECUTION_ROLE_ARN }}
+          AUTH_KEYRING_PARAMETER: ${{ vars.AUTH_KEYRING_PARAMETER }}
+          ALLOWED_APPLE_ID_HASHES: ${{ vars.ALLOWED_APPLE_ID_HASHES }}
+          SERVERLESS_ACCESS_KEY: ${{ secrets.SERVERLESS_ACCESS_KEY }}
+      - name: Verify live OAuth readiness
+        run: node scripts/verify-deployment.mjs
+        env:
+          STACK_NAME: caldav-mcp-prod
+          AWS_REGION: us-west-2
