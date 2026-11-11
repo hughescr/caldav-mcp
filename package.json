@@ -40,6 +40,7 @@
     "validate": "bun check --no-script && bun run lint && bun test && bun run build && bun run smoke",
     "package": "serverless package --stage prod",
     "deploy": "bash scripts/deploy.sh",
+    "setup:deployment": "bash scripts/setup-deployment.sh",
     "postversion": "bash scripts/postversion.sh",
     "gitflow:init": "bash scripts/init-gitflow.sh",
     "test:release": "bash scripts/test-release.sh",

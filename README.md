@@ -107,33 +107,22 @@ The public hostname is `caldav-mcp.rungie.com`. The template pins it as the only
 
 The bootstrap stack creates the CloudFront distribution, two challenge-header policies, DNS records in the existing `rungie.com` zone, the artifact bucket and two IAM roles. It needs the existing `GitHubOIDCProvider-Arn` and `CertificateAccepterLambda-Arn` exports. The distribution's origin is the `FunctionUrlOrigin` parameter, an existing Function URL origin without a trailing slash. The service stack imports the bootstrap export `caldav-mcp-prod-public-origin`.
 
-First deployment, run by an administrator. This procedure has not been executed yet for this repository. It follows the stages wildduck-mcp went through: roles and bucket first, then the service, then the distribution on the real Function URL.
+First deployment, run once by the repository owner on a machine where `aws` (v2) and `gh` are already logged in and `bun` is installed. It follows the stages wildduck-mcp went through: roles and bucket first, then the service, then the distribution on the real Function URL.
 
-1. Create the bootstrap stack with a placeholder origin that is syntactically valid:
-
-   ```sh
-   aws cloudformation deploy --region us-west-2 \
-     --stack-name caldav-mcp-bootstrap --template-file infra/bootstrap.yml \
-     --capabilities CAPABILITY_NAMED_IAM \
-     --parameter-overrides "FunctionUrlOrigin=https://placeholder.lambda-url.us-west-2.on.aws"
-   ```
-
-   Until step 5 is done, the public hostname answers with CloudFront origin errors.
-2. Read the stack outputs and set the repository variables `AWS_DEPLOY_ROLE_ARN`, `AWS_DEPLOYMENT_BUCKET_NAME` and `AWS_EXECUTION_ROLE_ARN`.
-3. Provision the keyring and set `AUTH_KEYRING_PARAMETER=/caldav-mcp/prod/auth-keyring`. Set `ALLOWED_APPLE_ID_HASHES` from `bun run apple-id-hash`; the deploy refuses to start if it is empty. Add `SERVERLESS_ACCESS_KEY` as a repository secret, through the secret UI or stdin.
-4. Set `DEPLOY_ENABLED=true` and deploy from `main`. This creates the service and its real Function URL. The CI verification step at the end of that run fails while the placeholder is in place; the deployment itself is not affected.
-5. Update the bootstrap stack with the real Function URL origin, without a trailing slash. It is the `ApiLambdaFunctionUrl` output of the service stack `caldav-mcp-prod`:
+1. Run the one-time setup. Put the allowlist hashes (from `bun run apple-id-hash`) in the environment, never in a file:
 
    ```sh
-   aws cloudformation deploy --region us-west-2 \
-     --stack-name caldav-mcp-bootstrap --template-file infra/bootstrap.yml \
-     --capabilities CAPABILITY_NAMED_IAM \
-     --parameter-overrides "FunctionUrlOrigin=$FUNCTION_URL_ORIGIN"
+   ALLOWED_APPLE_ID_HASHES='<hash>[,<hash>...]' bun run setup:deployment
    ```
 
-6. Run `node scripts/verify-deployment.mjs` with AWS credentials for the account.
+   If `SERVERLESS_ACCESS_KEY` is not already a repository secret, export it too, or run from a terminal and `gh` will ask for it without echoing. Add `--dry-run` to see what would run. Re-running is safe.
+2. When you are ready to deploy: `bun run setup:deployment -- --enable-deploy`
+3. Release to `main` with the gitflow `postversion` flow (see "Branches and releases"). The deploy creates the service and its real Function URL. The live verification step at the end of that first CI deploy fails until step 4 has been run; the deployment itself is not affected, and until then the public hostname answers with CloudFront origin errors.
+4. Point the distribution at the real Function URL and verify the live service: `bun run setup:deployment -- --finish`
 
-Keep passing the real `FunctionUrlOrigin` on later bootstrap updates. Change it if the Function URL is ever recreated.
+The script (`scripts/setup-deployment.sh`) uses `us-west-2` and `hughescr/caldav-mcp` and nothing else. Step 1 creates or updates the `caldav-mcp-bootstrap` stack (a new stack gets a placeholder `FunctionUrlOrigin`; an existing one keeps its stored value), sets the repository variables from the stack outputs and from `ALLOWED_APPLE_ID_HASHES`, provisions the SSM keyring if it does not exist, and sets the `SERVERLESS_ACCESS_KEY` secret if it does not exist. It never touches `DEPLOY_ENABLED` unless given `--enable-deploy`. Secret values go to `gh` on stdin and are never printed. Step 4 reads the Function URL from the `caldav-mcp-prod` stack, strips the trailing slash, updates the bootstrap stack with it and runs `node scripts/verify-deployment.mjs`. This script has only been run against stub `aws`, `gh` and `bun` programs, never against real AWS or GitHub.
+
+Re-running step 1 keeps the stored `FunctionUrlOrigin`. Run `--finish` again if the Function URL is ever recreated.
 
 The OIDC trust pins the immutable owner and repository IDs and the `main` branch. Verify the subject format with `gh api repos/hughescr/caldav-mcp/actions/oidc/customization/sub`.
 
