@@ -1,0 +1,53 @@
+{
+  "name": "caldav-mcp",
+  "version": "0.1.0",
+  "description": "A lightweight remote MCP service for Apple iCloud calendars over CalDAV",
+  "type": "module",
+  "private": true,
+  "license": "UNLICENSED",
+  "author": "Craig Hughes",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/hughescr/caldav-mcp.git"
+  },
+  "engines": {
+    "node": ">=26 <27",
+    "bun": ">=1.4.4"
+  },
+  "dependencies": {
+    "@aws-sdk/client-dynamodb": "^3.1157.0",
+    "@aws-sdk/client-ssm": "^3.1156.0",
+    "@aws-sdk/lib-dynamodb": "^3.1157.0",
+    "@better-auth/cimd": "^1.7.13",
+    "@hono/aws-lambda": "^1.0.1",
+    "@modelcontextprotocol/server": "^2.4.0",
+    "fast-xml-parser": "^5.12.0",
+    "hono": "^4.13.14",
+    "zod": "^4.6.7"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.4.4",
+    "oxlint": "^1.89.0",
+    "serverless": "^4.45.0"
+  },
+  "scripts": {
+    "dev": "bun --hot src/dev.ts",
+    "typecheck": "bun check --no-script",
+    "lint": "oxlint --deny-warnings .",
+    "test": "bun test",
+    "build": "bun scripts/build.ts",
+    "smoke": "node scripts/smoke.mjs",
+    "validate": "bun check --no-script && bun run lint && bun test && bun run build && bun run smoke",
+    "package": "serverless package --stage prod",
+    "deploy": "bash scripts/deploy.sh",
+    "postversion": "bash scripts/postversion.sh",
+    "gitflow:init": "bash scripts/init-gitflow.sh",
+    "test:release": "bash scripts/test-release.sh",
+    "probe": "bun scripts/probe.ts",
+    "build:probe": "bun scripts/build-probe.ts",
+    "apple-id-hash": "bun scripts/apple-id-hash.ts"
+  },
+  "trustedDependencies": [
+    "serverless"
+  ]
+}
