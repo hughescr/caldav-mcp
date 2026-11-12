@@ -1,0 +1,10 @@
+BEGIN:VCALENDAR
+VERSION:2.0
+PRODID:-//Synthetic from probe evidence//EN
+BEGIN:VEVENT
+UID:synthetic-run5-outside-zoned
+DTSTART;TZID=America/New_York:20270131T100000
+DTEND;TZID=America/New_York:20270131T110000
+SUMMARY:Ten days outside requested Thursday
+END:VEVENT
+END:VCALENDAR

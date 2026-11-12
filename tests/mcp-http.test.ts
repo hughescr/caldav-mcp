@@ -81,7 +81,7 @@ test('initialize and tools/list never decrypt the stored credential', async () =
         expect(initialize.status).toBe(200);
         const list = await rpc(env, tokens.access_token, 'tools/list');
         expect(list.status).toBe(200);
-        expect((await list.json()).result.tools.map((tool: { name: string }) => tool.name)).toEqual(['list_calendars']);
+        expect((await list.json()).result.tools.map((tool: { name: string }) => tool.name)).toEqual(['list_calendars', 'list_events', 'search_events', 'get_event']);
         expect(open).not.toHaveBeenCalled();
     } finally { open.mockRestore(); }
 });

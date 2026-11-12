@@ -1,0 +1,9 @@
+{
+  "source":"synthetic, from probe evidence; W6 clamp and W8 equal DATE/RANGE; RANGE dates/text are illustrative, not a capture",
+  "clamped_dates":["2028-02-29","2029-02-28","2030-02-28"],
+  "equal_start":{"date":"2026-12-11","all_day":true},
+  "equal_end":{"date":"2026-12-11","all_day":true},
+  "range_starts":["2027-01-11T10:00:00Z","2027-01-12T12:00:00Z","2027-01-13T10:00:00Z"],
+  "range_titles":["Regular","Named override only","Regular"],
+  "oracle_disagreements":"No oracle is run. RFC skipping and ical.js rollover do not override the iCloud Feb-28 result."
+}

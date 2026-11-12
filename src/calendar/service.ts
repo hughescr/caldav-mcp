@@ -1,6 +1,11 @@
 import { CalDavError, type CalDavBackend } from '../caldav/contracts';
 import { UnreadableCredentials, type ConnectionStatus, type UpstreamCredentials } from '../auth/contracts';
 import { MAX_CALENDARS, calendarSummarySchema, type ListCalendarsOutput, type ToolErrorCode } from './schemas';
+import type { CalDavReadBackend } from '../caldav/read-contracts';
+import { createReadBudget } from './budget';
+import type { GetEventArgs, ListEventsArgs, SearchEventsArgs } from './event-schemas';
+import { BudgetError } from './model';
+import { getEvent, listEvents, ReadError, searchEvents, type DetailReadResult, type EventsReadResult, type ReadDeps } from './read';
 
 /** A fixed, sanitized tool failure. It never carries upstream text. */
 export class CalendarError extends Error {
@@ -9,10 +14,14 @@ export class CalendarError extends Error {
 
 export interface BoundCalendarService {
     list_calendars(input: Record<string, never>): Promise<ListCalendarsOutput>;
+    list_events(input: ListEventsArgs): Promise<EventsReadResult>;
+    search_events(input: SearchEventsArgs): Promise<EventsReadResult>;
+    get_event(input: GetEventArgs): Promise<DetailReadResult>;
 }
 
 export interface CalendarBinding {
-    caldav: Pick<CalDavBackend, 'listCalendars'>;
+    /** Production has all read methods; phase-1-only injected backends fail closed for event reads. */
+    caldav: Pick<CalDavBackend, 'listCalendars'> & Partial<Omit<CalDavReadBackend, 'listCalendars'>>;
     connectionStatus: ConnectionStatus;
     /**
      * Decrypts and re-validates the stored credentials. Called only when a tool needs iCloud and
@@ -32,28 +41,62 @@ export function bindCalendarService(binding: CalendarBinding): BoundCalendarServ
         // The client is told to reconnect even if recording fails, because that is still true.
         try { await binding.markReconnectRequired(); } catch { /* the next call re-detects it */ }
     };
-    const upstream = async <T>(call: (credentials: UpstreamCredentials) => Promise<T>): Promise<T> => {
+    const upstream = async <T>(call: (credentials: UpstreamCredentials, unauthorized: () => Promise<void>) => Promise<T>, read = false): Promise<T> => {
+        let marked = false;
+        const unauthorized = async (): Promise<void> => {
+            if (marked) { return; }
+            marked = true;
+            await markReconnectRequired();
+        };
         if (binding.connectionStatus !== 'active') { throw new CalendarError('reconnect_required'); }
         let credentials: UpstreamCredentials;
         try { credentials = binding.credentials(); } catch (error) {
             if (!(error instanceof UnreadableCredentials)) { throw new CalendarError('temporarily_unavailable'); }
             // A stored credential that can never be opened needs a new login, like a revoked password.
-            await markReconnectRequired();
+            await unauthorized();
             throw new CalendarError('reconnect_required');
         }
         try {
-            return await call(credentials);
+            return await call(credentials, unauthorized);
         } catch (error) {
+            if (read && (error instanceof ReadError || error instanceof CalendarError)) { throw new CalendarError(error.code); }
+            if (read && error instanceof BudgetError) { throw new CalendarError(error.kind === 'deadline' ? 'temporarily_unavailable' : 'result_too_large'); }
             if (!(error instanceof CalDavError)) { throw new CalendarError('temporarily_unavailable'); }
             if (error.code === 'unauthorized') {
                 // iCloud definitively rejected the stored password. Record it for this generation only.
-                await markReconnectRequired();
+                await unauthorized();
                 throw new CalendarError('reconnect_required');
             }
+            if (read && error.code === 'too_large') { throw new CalendarError('result_too_large'); }
+            if (read && error.code === 'not_found') { throw new CalendarError('not_found'); }
             throw new CalendarError(error.code === 'temporary' ? 'temporarily_unavailable' : 'upstream_error');
         }
     };
+    const read = <T>(call: (deps: ReadDeps) => Promise<T>): Promise<T> => {
+        // Starts before credential binding/membership, not anew for each calendar or HTTP send.
+        const budget = createReadBudget();
+        return upstream(async (credentials, onUnauthorized) => {
+            const backend = binding.caldav;
+            const { queryEvents, multigetEvents } = backend;
+            if (queryEvents === undefined || multigetEvents === undefined) { throw new CalendarError('temporarily_unavailable'); }
+            return call({
+                backend: {
+                    listCalendars: backend.listCalendars.bind(backend),
+                    queryEvents: queryEvents.bind(backend),
+                    multigetEvents: multigetEvents.bind(backend),
+                },
+                auth: { appleId: credentials.appleId, appPassword: credentials.appPassword },
+                discovery: { principalUrl: credentials.principalUrl, calendarHomeUrl: credentials.calendarHomeUrl },
+                accountId: credentials.accountId,
+                budget,
+                onUnauthorized,
+            });
+        }, true);
+    };
     return {
+        list_events: input => read(deps => listEvents(deps, input)),
+        search_events: input => read(deps => searchEvents(deps, input)),
+        get_event: input => read(deps => getEvent(deps, input)),
         list_calendars: async () => {
             const raw = await upstream(credentials => binding.caldav.listCalendars(
                 { appleId: credentials.appleId, appPassword: credentials.appPassword },

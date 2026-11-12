@@ -11,6 +11,11 @@
  * outgoing request headers; every failure is a bare CalDavError code.
  */
 import { Buffer } from 'node:buffer';
+import { MAX_MEMBERSHIP_BYTES, MAX_REPORT_BYTES } from '../calendar/limits';
+import { isCanonicalPath } from '../calendar/model';
+import { canonicalizeCalendarPath, canonicalizeServerHref, isDirectChildResource } from './identifiers';
+import { buildExpandedQuery, buildMultiget, extractEventReport } from './reports';
+import type { CalDavReadBackend, CalendarResource, DavCallOptions, ResourceLookup } from './read-contracts';
 import { CalDavError, type CalDavAuth, type CalDavBackend, type CalDavErrorCode, type CalendarSummary, type Discovery } from './contracts';
 import { ICLOUD_CALDAV_ROOT, assertAllowedCalDavUrl, createGuardedFetch, isAllowedCalDavUrl, type FetchLike } from './hosts';
 import {
@@ -53,6 +58,9 @@ function fail(code: CalDavErrorCode): never {
 function codeForStatus(status: number): CalDavErrorCode {
     if (status === 401) {
         return 'unauthorized';
+    }
+    if (status === 507) {
+        return 'too_large';
     }
     if (status === 403 || status === 408 || status === 429 || status >= 500) {
         return 'temporary';
@@ -141,16 +149,23 @@ function componentNames(set: XmlElement): string[] {
     return names;
 }
 
-/** null when the entry is not a VEVENT calendar collection. */
+/** Membership requires affirmative successful evidence; failed instances cannot be hidden by a successful one. */
+function membershipProperty(response: DavResponse, ns: string, local: string): XmlElement {
+    for (const propstat of response.propstats) {
+        if ((propstat.status < 200 || propstat.status >= 300) && propstat.props.some(prop => isElement(prop, ns, local))) { return fail('temporary'); }
+    }
+    const property = findOkProp(response, ns, local);
+    if (!property) { return fail('temporary'); }
+    return property;
+}
+
+/** null only when successful properties prove the entry is not a VEVENT calendar collection. */
 function toSummary(response: DavResponse, id: string): CalendarSummary | null {
-    const resourcetype = findOkProp(response, DAV_NS, 'resourcetype');
-    if (!resourcetype || !resourcetype.children.some((child) => isElement(child, CALDAV_NS, 'calendar'))) {
+    const resourcetype = membershipProperty(response, DAV_NS, 'resourcetype');
+    if (!resourcetype.children.some((child) => isElement(child, CALDAV_NS, 'calendar'))) {
         return null;
     }
-    const componentSet = findOkProp(response, CALDAV_NS, 'supported-calendar-component-set');
-    if (!componentSet) {
-        return null;
-    }
+    const componentSet = membershipProperty(response, CALDAV_NS, 'supported-calendar-component-set');
     const components = componentNames(componentSet);
     if (!components.includes('VEVENT')) {
         return null;
@@ -164,23 +179,18 @@ function toSummary(response: DavResponse, id: string): CalendarSummary | null {
 }
 
 /** Resolves a child href; it must stay on the home's origin, pass the host rule, and sit under the home path. */
-function childPath(href: string, home: URL, homePath: string): string {
-    let url: URL;
-    try {
-        url = new URL(href, home);
-    } catch {
+function childPath(href: string, finalUrl: URL, home: URL, homePath: string): string {
+    const path = canonicalizeServerHref(href, finalUrl.href);
+    // canonicalizeServerHref checks the final response origin; it must also be the authenticated home origin.
+    if (finalUrl.origin !== home.origin || (path !== homePath.slice(0, -1) && path !== homePath
+        && (!path.startsWith(homePath) || !path.endsWith('/') || path.slice(homePath.length, -1).includes('/')))) {
         return fail('protocol');
     }
-    if (!isAllowedCalDavUrl(url) || url.origin !== home.origin || url.search !== '' || url.hash !== '') {
-        return fail('protocol');
-    }
-    if (url.pathname !== home.pathname && !url.pathname.startsWith(homePath)) {
-        return fail('protocol');
-    }
-    return url.pathname;
+    return path;
 }
 
-export function createICloudBackend(options: ICloudBackendOptions = {}): CalDavBackend {
+/** Creates the phase-1 backend plus the batched event-read capability; injected fetch remains probe-compatible. */
+export function createICloudBackend(options: ICloudBackendOptions = {}): CalDavBackend & CalDavReadBackend {
     const guardedFetch = createGuardedFetch(options.fetch);
 
     function send(url: URL, depth: '0' | '1', body: string, authorization: string): Promise<Response> {
@@ -205,7 +215,67 @@ export function createICloudBackend(options: ICloudBackendOptions = {}): CalDavB
         return { responses, url: assertAllowedCalDavUrl(response.url) };
     }
 
+    /** Scope is independent of the broad host rule: not even another allowed Apple account may receive a read. */
+    function scopeGuard(home: URL, path: string): (url: URL, raw: string) => void {
+        return (url, raw) => {
+            if (url.origin !== home.origin || canonicalizeServerHref(raw, url.href) !== path
+                || canonicalizeServerHref(url.href, home.href) !== path) { fail('protocol'); }
+        };
+    }
+
+    async function readDav(url: URL, home: URL, method: 'PROPFIND' | 'REPORT', body: string, auth: CalDavAuth, call: DavCallOptions = {}): Promise<Response> {
+        if (call.deadlineMs !== undefined && (!Number.isFinite(call.deadlineMs) || call.deadlineMs <= 0)) { return fail('temporary'); }
+        const authorization = basicAuthorization(auth);
+        const guarded = createGuardedFetch(options.fetch, {
+            timeoutMs: Math.min(10_000, call.deadlineMs ?? 10_000),
+            maxResponseBytes: method === 'REPORT' ? MAX_REPORT_BYTES : MAX_MEMBERSHIP_BYTES,
+            overflowCode: 'too_large',
+            ...(call.charge ? { charge: call.charge } : {}),
+            preserveMethod: true,
+            validateUrl: scopeGuard(home, canonicalizeServerHref(url.href, home.href)),
+        });
+        return guarded(url.href, {
+            method,
+            headers: { authorization, depth: '1', 'content-type': 'application/xml; charset=utf-8', accept: 'application/xml, text/xml' },
+            body,
+            ...(call.signal ? { signal: call.signal } : {}),
+        });
+    }
+
+    function readTarget(discovery: Discovery, calendarId: string): { home: URL; target: URL } {
+        const home = assertAllowedCalDavUrl(discovery.calendarHomeUrl);
+        const homePath = canonicalizeServerHref(home.href, home.href).replace(/\/?$/u, '/');
+        if (!isCanonicalPath(calendarId) || !calendarId.endsWith('/') || !calendarId.startsWith(homePath)) { return fail('protocol'); }
+        const child = calendarId.slice(homePath.length, -1);
+        if (child === '' || child.includes('/')) { return fail('protocol'); }
+        return { home, target: new URL(calendarId, home) };
+    }
+
+    async function eventReport(auth: CalDavAuth, discovery: Discovery, calendarId: string, body: string, call?: DavCallOptions, hrefs?: readonly string[]): Promise<CalendarResource[]> {
+        const { home, target } = readTarget(discovery, calendarId);
+        if (hrefs?.some((href) => !isDirectChildResource(calendarId, href))) { return fail('protocol'); }
+        const response = await readDav(target, home, 'REPORT', body, auth, call);
+        if (response.status !== 207) { return fail(response.status === 404 ? 'not_found' : codeForStatus(response.status)); }
+        return extractEventReport(decodeBody(await response.arrayBuffer()), {
+            calendarId, homeUrl: home.href, requestUrl: response.url,
+            ...(hrefs ? { requestedHrefs: hrefs } : {}),
+        });
+    }
+
     return {
+        async queryEvents(auth, discovery, query, call): Promise<readonly CalendarResource[]> {
+            return eventReport(auth, discovery, query.calendarId, buildExpandedQuery(query.range), call);
+        },
+
+        async multigetEvents(auth, discovery, query, call): Promise<readonly ResourceLookup[]> {
+            const resources = await eventReport(auth, discovery, query.calendarId, buildMultiget(query.hrefs), call, query.hrefs);
+            const byHref = new Map(resources.map((resource) => [resource.href, resource]));
+            return query.hrefs.map((href) => {
+                const resource = byHref.get(href);
+                return resource ? { kind: 'found', resource } : { kind: 'not_found', href };
+            });
+        },
+
         async discover(auth: CalDavAuth): Promise<Discovery> {
             const authorization = basicAuthorization(auth);
             const root = await propfind(assertAllowedCalDavUrl(ICLOUD_CALDAV_ROOT), '0', PRINCIPAL_BODY, authorization);
@@ -237,24 +307,25 @@ export function createICloudBackend(options: ICloudBackendOptions = {}): CalDavB
             }
         },
 
-        async listCalendars(auth: CalDavAuth, discovery: Discovery): Promise<CalendarSummary[]> {
-            const authorization = basicAuthorization(auth);
+        async listCalendars(auth: CalDavAuth, discovery: Discovery, call?: DavCallOptions): Promise<CalendarSummary[]> {
             const home = assertAllowedCalDavUrl(discovery.calendarHomeUrl);
-            const homePath = home.pathname.endsWith('/') ? home.pathname : `${home.pathname}/`;
-            const { responses } = await propfind(home, '1', CALENDARS_BODY, authorization);
+            const homePath = canonicalizeCalendarPath(home.pathname.endsWith('/') ? home.pathname : `${home.pathname}/`);
+            const response = await readDav(home, home, 'PROPFIND', CALENDARS_BODY, auth, call);
+            if (response.status !== 207) { return fail(codeForStatus(response.status)); }
+            const responses = parseMultistatus(decodeBody(await response.arrayBuffer()), true);
+            const finalUrl = assertAllowedCalDavUrl(response.url);
             const seen = new Set<string>();
             const calendars: CalendarSummary[] = [];
             for (const response of responses) {
-                const path = childPath(response.href, home, homePath);
+                const path = childPath(response.href, finalUrl, home, homePath);
                 if (seen.has(path)) {
                     return fail('protocol');
                 }
                 seen.add(path);
                 const isHome = path === home.pathname || path === homePath;
                 const failed = response.status !== null && (response.status < 200 || response.status >= 300);
-                if (isHome || failed) {
-                    continue;
-                }
+                if (isHome) { continue; }
+                if (failed) { return fail('temporary'); }
                 const summary = toSummary(response, path);
                 if (summary) {
                     calendars.push(summary);

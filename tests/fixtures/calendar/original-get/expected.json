@@ -1,0 +1,11 @@
+{
+  "source":"synthetic, from probe evidence; run 4 W5 moved tuple pattern; cancelled/EXDATE/detached variants are unmeasured defensive cases, not captures",
+  "token":"occ1_20270112T100000Z",
+  "moved_start":{"utc":"2027-02-01T10:00:00Z"},
+  "master_title":"Old master",
+  "occurrence_title":"Moved effective text",
+  "status":"CANCELLED",
+  "occurrence_window":{"startUtc":"20270131T100000Z","endUtc":"20270202T110000Z"},
+  "detached_kind":"occurrence_only",
+  "detached_start":{"date":"2026-12-14","all_day":true}
+}

@@ -1,0 +1,16 @@
+{
+  "source": "synthetic, from probe evidence; W1-W4 and run 4 repeated-hour tuple; defensive unknown/Windows/stray-DATE/gap cases are not measured iCloud outputs",
+  "starts": [
+    {"date":"2026-12-11","all_day":true},
+    {"local":"2026-12-12T10:00:00","floating":true,"timezone_warning":"no_timezone_on_event"},
+    {"local":"2027-03-14T09:00:00","zone":"America/New_York","utc":"2027-03-14T13:00:00Z","offset":"-04:00"},
+    {"utc":"2027-11-07T06:30:00Z"},
+    {"local":"2026-12-13T10:00:00","zone":"Probe/Custom","timezone_warning":"unrecognized_timezone"},
+    {"local":"2027-03-14T09:00:00","zone":"Eastern Standard Time","timezone_warning":"unrecognized_timezone"},
+    {"date":"2026-12-14","all_day":true,"timezone_warning":"timezone_dropped_from_date"},
+    {"local":"2027-11-07T01:30:00","zone":"America/New_York","utc":"2027-11-07T05:30:00Z","offset":"-04:00","timezone_warning":"utc_uncertain_dst_transition"},
+    {"local":"2027-03-14T02:30:00","zone":"America/New_York","utc":"2027-03-14T07:30:00Z","offset":"-04:00","timezone_warning":"utc_uncertain_dst_transition"},
+    {"local":"2027-03-21T01:30:00","floating":true,"timezone_warning":"no_timezone_on_event"}
+  ],
+  "tokens":["occ1_20261211T000000Z","occ1_20261212T100000Z","occ1_20270314T130000Z",null,"occ1_20261213T100000Z","occ1_20270314T140000Z","occ1_20261214T000000Z","occ1_20271107T063000Z","occ1_20270314T073000Z","occ1_20270321T013000Z"]
+}

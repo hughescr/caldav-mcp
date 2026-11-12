@@ -1,0 +1,9 @@
+{
+  "source":"synthetic, from probe evidence; expanded REPORT getetag/calendar-data and XML LF representation; canonical spelling/security mutations are defensive, not captures",
+  "resource":{"href":"/10000000001/calendars/work/event%20%7B1%7D.ics","etag":"\"v1\"","calendarData":"BEGIN:VCALENDAR\nVERSION:2.0\nPRODID:-//Synthetic from probe evidence//EN\nBEGIN:VEVENT\nUID:synthetic-transport\nDTSTART:20270111T100000Z\nDTEND:20270111T110000Z\nSUMMARY:A & B\nEND:VEVENT\nEND:VCALENDAR\n"},
+  "query_xml":"<?xml version=\"1.0\" encoding=\"UTF-8\"?><c:calendar-query xmlns:d=\"DAV:\" xmlns:c=\"urn:ietf:params:xml:ns:caldav\"><d:prop><d:getetag/><c:calendar-data><c:expand start=\"20261211T000000Z\" end=\"20270212T000000Z\"/></c:calendar-data></d:prop><c:filter><c:comp-filter name=\"VCALENDAR\"><c:comp-filter name=\"VEVENT\"><c:time-range start=\"20261211T000000Z\" end=\"20270212T000000Z\"/></c:comp-filter></c:comp-filter></c:filter></c:calendar-query>",
+  "multiget_xml":"<?xml version=\"1.0\" encoding=\"UTF-8\"?><c:calendar-multiget xmlns:d=\"DAV:\" xmlns:c=\"urn:ietf:params:xml:ns:caldav\"><d:prop><d:getetag/><c:calendar-data/></d:prop><d:href>/10000000001/calendars/work/a&amp;b&apos;(x).ics</d:href></c:calendar-multiget>",
+  "transport_range":{"startUtc":"20261211T000000Z","endUtc":"20270212T000000Z"},
+  "minimal_markup_bytes":135,
+  "resource_cap":131072
+}

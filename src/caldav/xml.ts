@@ -10,6 +10,10 @@
  * Every failure is CalDavError('protocol') with no input text attached.
  */
 import { XMLParser, XMLValidator } from 'fast-xml-parser';
+import {
+    MAX_PROPFIND_XML_ELEMENTS, MAX_PROPFIND_XML_NAMESPACE_DECLARATIONS,
+    MAX_REPORT_XML_ELEMENTS, MAX_REPORT_XML_NAMESPACE_DECLARATIONS, MAX_XML_BINDINGS, MAX_XML_DEPTH,
+} from '../calendar/limits';
 import { CalDavError } from './contracts';
 
 export const DAV_NS = 'DAV:';
@@ -17,13 +21,12 @@ export const CALDAV_NS = 'urn:ietf:params:xml:ns:caldav';
 export const APPLE_ICAL_NS = 'http://apple.com/ns/ical/';
 const XML_NS = 'http://www.w3.org/XML/1998/namespace';
 
-const MAX_DEPTH = 64;
-// A legitimate 1 MiB iCloud multistatus (one xmlns per property element) holds roughly 25000
-// elements and 5000 declarations, with a handful of prefixes in scope. Over any bound => protocol.
-const MAX_ELEMENTS = 50_000;
-const MAX_DECLARATIONS = 20_000;
+const MAX_DEPTH = MAX_XML_DEPTH;
+// Discovery keeps its original protocol classification. Read profiles report bounded-work overflow as too_large.
+const MAX_ELEMENTS = MAX_PROPFIND_XML_ELEMENTS;
+const MAX_DECLARATIONS = MAX_PROPFIND_XML_NAMESPACE_DECLARATIONS;
 /** Prefix bindings in scope at one element, counting the predeclared xml prefix and the default. */
-const MAX_BINDINGS = 64;
+const MAX_BINDINGS = MAX_XML_BINDINGS;
 const WRAPPER = 'caldav-mcp-document';
 const XML_DECLARATION = /^﻿?<\?xml[^?]*\?>/;
 const ATTRIBUTE_PREFIX = '@_';
@@ -187,11 +190,14 @@ function isRawNode(value: unknown): value is RawNode {
 interface Budget {
     elements: number;
     declarations: number;
+    overflow: 'protocol' | 'too_large';
 }
+
+function overflow(budget: Budget): never { throw new CalDavError(budget.overflow); }
 
 function buildElement(node: RawNode, parentScope: ReadonlyMap<string, string>, depth: number, budget: Budget): XmlElement {
     if (depth > MAX_DEPTH || --budget.elements < 0) {
-        return protocol();
+        return overflow(budget);
     }
     const qualified = elementName(node);
     const attributesRaw = rawAttributes(node);
@@ -200,12 +206,12 @@ function buildElement(node: RawNode, parentScope: ReadonlyMap<string, string>, d
     let declared: Map<string, string> | undefined;
     const declare = (prefix: string, value: string) => {
         if (--budget.declarations < 0) {
-            return protocol();
+            return overflow(budget);
         }
         declared ??= new Map(parentScope);
         declared.set(prefix, value);
         if (declared.size > MAX_BINDINGS) {
-            return protocol();
+            return overflow(budget);
         }
     };
     const plain: [string, string][] = [];
@@ -259,10 +265,12 @@ function buildElement(node: RawNode, parentScope: ReadonlyMap<string, string>, d
 }
 
 /** Parses one XML document into a namespace-resolved element tree. Throws CalDavError('protocol'). */
-export function parseXml(xml: string): XmlElement {
+export function parseXml(xml: string, profile: 'propfind' | 'membership' | 'report' = 'propfind'): XmlElement {
     if (typeof xml !== 'string' || ILLEGAL_CHAR.test(xml)) {
         return protocol();
     }
+    // XML 1.0 section 2.11 applies to text and CDATA alike, before entity decoding.
+    xml = xml.replace(/\r\n?/gu, '\n');
     assertNoMarkupDeclarations(xml);
     if (XMLValidator.validate(xml, { allowBooleanAttributes: false }) !== true) {
         return protocol();
@@ -274,7 +282,8 @@ export function parseXml(xml: string): XmlElement {
     try {
         wrapped = parser.parse(`<${WRAPPER}>${body}</${WRAPPER}>`);
     } catch {
-        return protocol();
+        // Syntax was validated above; the tokenizer's remaining failure is its depth guard.
+        throw new CalDavError(profile === 'propfind' ? 'protocol' : 'too_large');
     }
     const [wrapper, ...others] = Array.isArray(wrapped) ? (wrapped as unknown[]) : [];
     const top = isRawNode(wrapper) && others.length === 0 ? wrapper[WRAPPER] : undefined;
@@ -300,7 +309,11 @@ export function parseXml(xml: string): XmlElement {
     if (!root || extra.length > 0) {
         return protocol();
     }
-    return buildElement(root, new Map([['xml', XML_NS]]), 1, { elements: MAX_ELEMENTS, declarations: MAX_DECLARATIONS });
+    return buildElement(root, new Map([['xml', XML_NS]]), 1, {
+        elements: profile === 'report' ? MAX_REPORT_XML_ELEMENTS : MAX_ELEMENTS,
+        declarations: profile === 'report' ? MAX_REPORT_XML_NAMESPACE_DECLARATIONS : MAX_DECLARATIONS,
+        overflow: profile === 'propfind' ? 'protocol' : 'too_large',
+    });
 }
 
 export function isElement(element: XmlElement, ns: string, local: string): boolean {
@@ -346,11 +359,26 @@ function parseResponse(element: XmlElement): DavResponse {
     return { href, status: status ? parseStatusLine(status) : null, propstats };
 }
 
-/** Parses a DAV:multistatus body. Throws CalDavError('protocol') on anything unexpected. */
-export function parseMultistatus(xml: string): DavResponse[] {
-    const root = parseXml(xml);
+/** Rejects partial-result markers anywhere in a namespace-resolved DAV document, never returning a prefix. */
+export function assertCompleteMultistatus(element: XmlElement): void {
+    if ((element.ns === DAV_NS || element.ns === CALDAV_NS)
+        && (element.local === 'number-of-matches-within-limits' || element.local === 'limit')) {
+        throw new CalDavError('too_large');
+    }
+    if (isElement(element, DAV_NS, 'status') && parseStatusLine(element) === 507) { throw new CalDavError('too_large'); }
+    for (const child of element.children) { assertCompleteMultistatus(child); }
+}
+
+/** Parses a DAV:multistatus body; membership reads additionally refuse partial results and use read overflow codes. */
+export function parseMultistatus(xml: string, membership = false): DavResponse[] {
+    const root = parseXml(xml, membership ? 'membership' : 'propfind');
     if (!isElement(root, DAV_NS, 'multistatus')) {
         return protocol();
+    }
+    if (membership) {
+        assertCompleteMultistatus(root);
+        if (root.text.trim() !== '' || root.children.some((child) => !isElement(child, DAV_NS, 'response')
+            && !isElement(child, DAV_NS, 'responsedescription'))) { return protocol(); }
     }
     return childrenNamed(root, DAV_NS, 'response').map(parseResponse);
 }

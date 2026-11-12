@@ -1,9 +1,10 @@
 import { z } from 'zod';
+import { readToolErrorCodeSchema } from './event-schemas';
 
 /** list_calendars returns at most this many collections; more are reported with truncated: true. */
 export const MAX_CALENDARS = 200;
 
-export const toolErrorCodeSchema = z.enum(['reconnect_required', 'temporarily_unavailable', 'insufficient_scope', 'upstream_error']);
+export const toolErrorCodeSchema = readToolErrorCodeSchema;
 export type ToolErrorCode = z.infer<typeof toolErrorCodeSchema>;
 
 export const listCalendarsInputSchema = z.strictObject({});

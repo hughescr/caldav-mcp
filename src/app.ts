@@ -19,7 +19,7 @@ export function createApp(options: AppOptions = {}) {
     app.use('*', async (context, next) => { context.header('Cache-Control', 'no-store'); context.header('Referrer-Policy', 'no-referrer'); await next(); });
     app.use('/mcp', bodyLimit({ maxSize: 5 * 1024 * 1024, onError: context => context.json({ error: 'payload_too_large' }, 413) }));
     app.use('*', async (context, next) => {
-        if (context.req.method === 'OPTIONS') { context.header('Access-Control-Allow-Origin', '*'); context.header('Access-Control-Allow-Headers', 'Authorization, Content-Type, MCP-Protocol-Version'); context.header('Access-Control-Allow-Methods', 'GET, POST, DELETE, OPTIONS'); return context.body(null, 204); }
+        if (context.req.method === 'OPTIONS') { context.header('Access-Control-Allow-Origin', '*'); context.header('Access-Control-Allow-Headers', 'Authorization, Content-Type, MCP-Protocol-Version, Mcp-Method, Mcp-Name'); context.header('Access-Control-Allow-Methods', 'GET, POST, DELETE, OPTIONS'); return context.body(null, 204); }
         if (['/register', '/token', '/revoke', '/mcp'].includes(context.req.path) || context.req.path.startsWith('/.well-known/')) { context.header('Access-Control-Allow-Origin', '*'); context.header('Access-Control-Expose-Headers', 'WWW-Authenticate'); }
         await next();
     });

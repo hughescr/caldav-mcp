@@ -1,0 +1,24 @@
+BEGIN:VCALENDAR
+BEGIN:VEVENT
+DTSTAMP:20261101T120000Z
+CREATED:20261020T080000Z
+LAST-MODIFIED:20261101T115500Z
+SEQUENCE:2
+SUMMARY:Synthetic review
+UID:synthetic-icloud-e-0005
+DTSTART;TZID=America/New_York:20261109T130000
+DTEND;TZID=America/New_York:20261109T140000
+ORGANIZER;CN="Olive Organizer, Esq.";EMAIL=olive@example.invalid;SCHEDULE-STATUS=1.2:mailto:olive@example.invalid
+ATTENDEE;CN="Olive Organizer, Esq.";CUTYPE=INDIVIDUAL;EMAIL=olive@example.invalid;PARTSTAT=ACCEPTED;ROLE=CHAIR:mailto:olive@example.invalid
+ATTENDEE;CN="Ann Attendee";CUTYPE=INDIVIDUAL;EMAIL=ann@example.invalid;PARTSTAT=NEEDS-ACTION;ROLE=REQ-PARTICIPANT;RSVP=TRUE;X-CALENDARSERVER-DTSTAMP=20261101T120000Z;X-CALENDARSERVER-RECURRENCE-ID="20261109T180000Z":mailto:ann@example.invalid
+ATTENDEE;CN=Room 7;CUTYPE=ROOM;PARTSTAT=TENTATIVE;ROLE=NON-PARTICIPANT;X-CALENDARSERVER-AUTO-SCHEDULE=true:mailto:room7@example.invalid
+DESCRIPTION:Agenda:\n1. Status\, risks\; blockers\n2. Café menu review - na
+ ïve plan, résumé of "quoted" items\n\nLink: https://example.in
+ valid/a?b=c;d=e\nSigned\, Émilie ☃
+LOCATION:Main office
+CLASS:PRIVATE
+STATUS:CONFIRMED
+RELATED-TO;RELTYPE=PARENT:parent-uid-0001
+ATTACH;FMTTYPE=application/pdf;FILENAME=agenda.pdf;X-APPLE-FILENAME=agenda.pdf:https://example.invalid/agenda.pdf
+END:VEVENT
+END:VCALENDAR

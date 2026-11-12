@@ -1,7 +1,9 @@
-import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
+import { afterEach, beforeEach, describe, expect, jest, test } from 'bun:test';
 import { CalDavError, type CalDavAuth, type CalDavErrorCode, type CalendarSummary, type Discovery } from '../src/caldav/contracts';
 import { createICloudBackend } from '../src/caldav/icloud';
 import { withRequestBudget } from '../src/request-budget';
+import { getEvent, listEvents, searchEvents } from '../src/calendar/read';
+import { createReadBudget } from '../src/calendar/budget';
 import {
     type FakeHandler,
     createFakeFetch,
@@ -388,6 +390,36 @@ describe('validate', () => {
     });
 });
 
+for (const mode of ['oversized', 'never-finishing'] as const) {
+    test(`concurrent ${mode} 401 bodies stop dispatch and mark reconnect once`, async () => {
+        jest.useFakeTimers();
+        let cancelled = 0;
+        let marked = 0;
+        const ids = ['a', 'b', 'c', 'd', 'e'].map(name => `/10000000001/calendars/${name}/`);
+        const fake = createFakeFetch({
+            [`PROPFIND ${HOME}`]: () => xmlResponse(listingXml(...ids.map(id => calendarXml(id)))),
+            ...Object.fromEntries(ids.map(id => [`REPORT ${new URL(id, HOME).href}`, () => new Response(new ReadableStream<Uint8Array>({
+                start(controller) { if (mode === 'oversized') { controller.enqueue(new Uint8Array(8 * 1024 * 1024 + 1)); } },
+                cancel() { cancelled++; },
+            }), { status: 401 })])),
+        });
+        const backend = createICloudBackend({ fetch: fake.fetch });
+        const pending = listEvents({ backend, auth: AUTH, discovery: DISCOVERY, accountId: 'synthetic', budget: createReadBudget({ now: () => 0 }), onUnauthorized: async () => { marked++; } }, { range: { start: '2027-01-01T00:00:00Z', end: '2027-02-01T00:00:00Z' } });
+        try {
+            // Drain finite async transport chains; fake deadlines also let the unfixed implementation finish.
+            for (let round = 0; round < 3; round++) {
+                for (let step = 0; step < 100; step++) { await Promise.resolve(); }
+                jest.advanceTimersByTime(10_000);
+            }
+            const result = await pending;
+            expect(result.calendars.map(item => item.status)).toEqual(ids.map(() => 'reconnect_required'));
+            expect(fake.calls.filter(call => call.method === 'REPORT')).toHaveLength(3);
+            expect(cancelled).toBe(3);
+            expect(marked).toBe(1);
+        } finally { jest.useRealTimers(); }
+    });
+}
+
 describe('listCalendars', () => {
     test('maps the default-namespace fixture, filtering non-calendar and VTODO-only collections', async () => {
         const fake = createFakeFetch({ [`PROPFIND ${HOME}`]: () => xmlResponse(fixture('calendars-default-ns.xml')) });
@@ -426,20 +458,52 @@ describe('listCalendars', () => {
         expect(calendar?.displayName).toBeNull();
     });
 
-    test('a collection without supported-calendar-component-set is not listed', async () => {
+    test('a collection without supported-calendar-component-set fails membership closed', async () => {
         const body = listingXml('<response><href>/10000000001/calendars/x/</href><propstat><prop><resourcetype><collection/><C:calendar/></resourcetype></prop><status>HTTP/1.1 200 OK</status></propstat></response>');
         const fake = createFakeFetch({ [`PROPFIND ${HOME}`]: () => xmlResponse(body) });
-        expect(await createICloudBackend({ fetch: fake.fetch }).listCalendars(AUTH, DISCOVERY)).toEqual([]);
+        expect(await codeOf(createICloudBackend({ fetch: fake.fetch }).listCalendars(AUTH, DISCOVERY))).toBe('temporary');
     });
 
-    test('a response-level 404 entry is skipped', async () => {
+    test('a response-level 404 entry fails membership closed', async () => {
         const body = listingXml(
             '<response><href>/10000000001/calendars/gone/</href><status>HTTP/1.1 404 Not Found</status></response>',
             calendarXml('/10000000001/calendars/ok/'),
         );
         const fake = createFakeFetch({ [`PROPFIND ${HOME}`]: () => xmlResponse(body) });
-        const calendars = await createICloudBackend({ fetch: fake.fetch }).listCalendars(AUTH, DISCOVERY);
-        expect(calendars.map((calendar) => calendar.id)).toEqual(['/10000000001/calendars/ok/']);
+        expect(await codeOf(createICloudBackend({ fetch: fake.fetch }).listCalendars(AUTH, DISCOVERY))).toBe('temporary');
+    });
+
+    for (const failure of ['response 500', 'component-set propstat 500', 'resourcetype propstat 500', 'all children failed']) {
+        test(`membership ${failure} fails list/search and explicit selection before REPORT`, async () => {
+            const id = '/10000000001/calendars/failed/';
+            const property = failure.startsWith('resourcetype') ? '<resourcetype/>' : '<C:supported-calendar-component-set/>';
+            const failed = failure.includes('propstat')
+                ? `<response><href>${id}</href><propstat><prop>${failure.startsWith('resourcetype') ? '' : '<resourcetype><C:calendar/></resourcetype>'}</prop><status>HTTP/1.1 200 OK</status></propstat><propstat><prop>${property}</prop><status>HTTP/1.1 500 Failed</status></propstat></response>`
+                : `<response><href>${id}</href><status>HTTP/1.1 500 Failed</status></response>`;
+            const body = listingXml(failed, ...(failure === 'all children failed' ? [] : [calendarXml('/10000000001/calendars/ok/')]));
+            const fake = createFakeFetch({ [`PROPFIND ${HOME}`]: () => xmlResponse(body) });
+            const backend = createICloudBackend({ fetch: fake.fetch });
+            expect(await codeOf(backend.listCalendars(AUTH, DISCOVERY))).toBe('temporary');
+            const deps = () => ({ backend, auth: AUTH, discovery: DISCOVERY, accountId: 'synthetic', budget: createReadBudget(), onUnauthorized: async () => {} });
+            const range = { start: '2027-01-01T00:00:00Z', end: '2027-02-01T00:00:00Z' };
+            for (const call of [
+                () => listEvents(deps(), { range }),
+                () => searchEvents(deps(), { range, query: 'test' }),
+                () => listEvents(deps(), { range, calendar_ids: [id] }),
+                () => getEvent(deps(), { calendar_id: id, resource_href: `${id}e.ics` }),
+            ]) {
+                await expect(call()).rejects.toMatchObject({ code: 'temporarily_unavailable', message: 'temporarily_unavailable' });
+            }
+            expect(fake.calls.every(call => call.method === 'PROPFIND')).toBe(true);
+        });
+    }
+
+    test('a successful membership property cannot hide a failed instance of the same property', async () => {
+        for (const property of ['<resourcetype/>', '<C:supported-calendar-component-set/>']) {
+            const entry = calendarXml('/10000000001/calendars/a/').replace('</response>', `<propstat><prop>${property}</prop><status>HTTP/1.1 500 Failed</status></propstat></response>`);
+            const fake = createFakeFetch({ [`PROPFIND ${HOME}`]: () => xmlResponse(listingXml(entry)) });
+            expect(await codeOf(createICloudBackend({ fetch: fake.fetch }).listCalendars(AUTH, DISCOVERY))).toBe('temporary');
+        }
     });
 
     test('duplicate component names are reported once', async () => {

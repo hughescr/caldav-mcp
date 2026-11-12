@@ -1,4 +1,4 @@
-export type CalDavErrorCode = 'unauthorized' | 'temporary' | 'forbidden_host' | 'protocol';
+export type CalDavErrorCode = 'unauthorized' | 'temporary' | 'forbidden_host' | 'protocol' | 'not_found' | 'too_large';
 export class CalDavError extends Error {
     constructor(public readonly code: CalDavErrorCode) { super(code); }
 }

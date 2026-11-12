@@ -21,6 +21,204 @@
     "import/no-cycle": "error",
     "unicorn/prefer-node-protocol": "error"
   },
+  "overrides": [
+    {
+      "files": [
+        "**/src/**"
+      ],
+      "rules": {
+        "no-restricted-imports": [
+          "error",
+          {
+            "paths": [
+              {
+                "name": "ical.js",
+                "message": "ical.js may be imported only by src/calendar/ical.ts, which uses ICAL.parse alone (design v3 section 6)."
+              }
+            ],
+            "patterns": [
+              {
+                "group": [
+                  "ical.js/*",
+                  "**/ical.js/**"
+                ],
+                "message": "ical.js internals are never imported."
+              }
+            ]
+          }
+        ],
+        "no-restricted-properties": [
+          "error",
+          {
+            "object": "ICAL",
+            "allowProperties": [
+              "parse"
+            ],
+            "message": "Only ICAL.parse is allowed: no Component, Time, Timezone, Event or iterator (design v3 section 6)."
+          },
+          {
+            "property": "Time",
+            "message": "ical.js Time is banned: times pass through as stored and use calendar/time-core."
+          },
+          {
+            "property": "Timezone",
+            "message": "ical.js Timezone is banned: zones are never interpreted from the card."
+          },
+          {
+            "property": "TimezoneService",
+            "message": "ical.js TimezoneService is banned."
+          },
+          {
+            "property": "Event",
+            "message": "ical.js Event is banned: no local recurrence expansion."
+          },
+          {
+            "property": "RecurExpansion",
+            "message": "ical.js RecurExpansion is banned: no local recurrence expansion."
+          },
+          {
+            "property": "RecurIterator",
+            "message": "ical.js RecurIterator is banned: no local recurrence expansion."
+          },
+          {
+            "property": "Recur",
+            "message": "ical.js Recur is banned."
+          },
+          {
+            "property": "Component",
+            "message": "ical.js Component is banned: jCal arrays are validated directly."
+          },
+          {
+            "property": "ComponentParser",
+            "message": "ical.js ComponentParser is banned."
+          },
+          {
+            "property": "Property",
+            "message": "ical.js Property is banned: jCal arrays are validated directly."
+          },
+          {
+            "property": "VCardTime",
+            "message": "ical.js VCardTime is banned."
+          },
+          {
+            "property": "UtcOffset",
+            "message": "ical.js UtcOffset is banned."
+          },
+          {
+            "property": "Period",
+            "message": "ical.js Period is banned."
+          },
+          {
+            "property": "Binary",
+            "message": "ical.js Binary is banned."
+          },
+          {
+            "property": "Duration",
+            "allowObjects": [
+              "Temporal"
+            ],
+            "message": "ical.js Duration is banned; Temporal.Duration is allowed."
+          },
+          {
+            "property": "getFirstValue",
+            "message": "ical.js hydration is banned."
+          },
+          {
+            "property": "getValues",
+            "message": "ical.js hydration is banned."
+          },
+          {
+            "property": "getFirstPropertyValue",
+            "message": "ical.js hydration is banned."
+          },
+          {
+            "property": "getAllPropertyValues",
+            "message": "ical.js hydration is banned."
+          },
+          {
+            "property": "getFirstProperty",
+            "message": "ical.js hydration is banned."
+          },
+          {
+            "property": "getAllProperties",
+            "message": "ical.js hydration is banned."
+          },
+          {
+            "property": "getFirstSubcomponent",
+            "message": "ical.js hydration is banned."
+          },
+          {
+            "property": "getAllSubcomponents",
+            "message": "ical.js hydration is banned."
+          },
+          {
+            "property": "fromData",
+            "message": "ical.js hydration is banned."
+          },
+          {
+            "property": "fromJSDate",
+            "message": "ical.js time conversion is banned."
+          },
+          {
+            "property": "fromDateTimeString",
+            "message": "ical.js time conversion is banned."
+          },
+          {
+            "property": "toUnixTime",
+            "message": "ical.js time conversion is banned."
+          },
+          {
+            "property": "toJSDate",
+            "message": "ical.js time conversion is banned."
+          },
+          {
+            "property": "convertToZone",
+            "message": "ical.js time conversion is banned."
+          },
+          {
+            "property": "subtractDate",
+            "message": "ical.js date arithmetic is banned."
+          },
+          {
+            "property": "adjust",
+            "message": "ical.js date arithmetic is banned."
+          },
+          {
+            "property": "utcOffset",
+            "message": "ical.js offset computation is banned."
+          },
+          {
+            "property": "iterator",
+            "allowObjects": [
+              "Symbol"
+            ],
+            "message": "ical.js recurrence iterators are banned; Symbol.iterator is allowed."
+          }
+        ]
+      }
+    },
+    {
+      "files": [
+        "**/src/calendar/ical.ts"
+      ],
+      "rules": {
+        "no-restricted-imports": [
+          "error",
+          {
+            "paths": [
+              {
+                "name": "ical.js",
+                "allowImportNames": [
+                  "default"
+                ],
+                "message": "Only the default ICAL object may be imported, and only ICAL.parse used."
+              }
+            ]
+          }
+        ]
+      }
+    }
+  ],
   "ignorePatterns": [
     "dist/**",
     ".serverless/**",

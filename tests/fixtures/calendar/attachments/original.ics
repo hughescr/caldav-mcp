@@ -1,0 +1,28 @@
+BEGIN:VCALENDAR
+VERSION:2.0
+PRODID:-//Synthetic from probe evidence//EN
+BEGIN:VEVENT
+UID:synthetic-attachments
+DTSTART:20270111T100000Z
+DTEND:20270111T110000Z
+RRULE:FREQ=DAILY;COUNT=2
+SUMMARY:Attachment metadata
+ATTACH;FILENAME=probe.txt;FMTTYPE=text/plain;MANAGED-ID=synthetic-managed;SIZE=32:https://synthetic-attachment.icloud.com/object/synthetic
+ATTACH;FMTTYPE=text/plain;FILENAME=inline.txt;VALUE=BINARY;ENCODING=BASE64:SGk=
+ATTACH;FMTTYPE=text/plain;FILENAME=inline.txt;VALUE=BINARY;ENCODING=BASE64:SGk=
+ATTACH;FMTTYPE=text/plain;SIZE=01:https://caldav.icloud.com/attachment-without-managed-id
+ATTACH;VALUE=BINARY;ENCODING=BASE64;ENCODING=BASE64;FMTTYPE=text/plain:SGk=
+BEGIN:VALARM
+ACTION:AUDIO
+TRIGGER:-PT5M
+ATTACH:https://example.test/alarm-only
+END:VALARM
+END:VEVENT
+BEGIN:VEVENT
+UID:synthetic-attachments
+RECURRENCE-ID;TZID=America/New_York:20270112T050000
+DTSTART:20270112T100000Z
+DTEND:20270112T110000Z
+ATTACH;FILENAME=override.txt;FMTTYPE=text/plain;SIZE=2:https://example.test/override
+END:VEVENT
+END:VCALENDAR

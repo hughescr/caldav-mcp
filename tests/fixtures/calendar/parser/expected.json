@@ -1,0 +1,7 @@
+{
+  "source":"synthetic, from probe evidence; VTIMEZONE is dropped in expansion and must be ignored when defensively present; malformed/hostile variants are not captures",
+  "malformed_reason":"malformed",
+  "vtimezone_count":1,
+  "hostile_start":{"local":"2027-03-14T09:00:00","zone":"America/New_York","utc":"2027-03-14T13:00:00Z","offset":"-04:00"},
+  "wall_clock_bound_ms":2000
+}

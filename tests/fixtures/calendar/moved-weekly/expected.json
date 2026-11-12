@@ -1,0 +1,8 @@
+{
+  "source":"synthetic, from probe evidence Run 5 MOVED OVERRIDE INSIDE THE SERIES SPAN; exact dates and Tuesday/Thursday tuple pattern are measured, 10:00/11:00 and text are illustrative, not a capture; outside-zoned is a defensive over-fetch case",
+  "range":{"start":"2027-01-21T00:00:00Z","end":"2027-01-22T00:00:00Z"},
+  "transport_range":{"startUtc":"20261221T000000Z","endUtc":"20270222T000000Z"},
+  "events":[{"title":"Moved to Thursday","recurrence_id":"occ1_20270119T100000Z","start":{"utc":"2027-01-21T10:00:00Z"},"end":{"utc":"2027-01-21T11:00:00Z"}}],
+  "outside_zoned_returned_count":0,
+  "civil_filter_range":{"start":"2027-01-20T00:00:00Z","end":"2027-01-23T00:00:00Z"}
+}

@@ -1,0 +1,10 @@
+BEGIN:VCALENDAR
+VERSION:2.0
+PRODID:-//Synthetic from probe evidence//EN
+BEGIN:VEVENT
+UID:synthetic-invalid-date
+DTSTART:20270230T100000Z
+DTEND:20270230T110000Z
+SUMMARY:Must not clamp invalid dates
+END:VEVENT
+END:VCALENDAR

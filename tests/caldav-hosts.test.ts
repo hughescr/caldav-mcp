@@ -1,6 +1,7 @@
 import { describe, expect, test } from 'bun:test';
 import { CalDavError } from '../src/caldav/contracts';
-import { assertAllowedCalDavUrl, isAllowedCalDavUrl } from '../src/caldav/hosts';
+import { assertAllowedCalDavUrl, createGuardedFetch, isAllowedCalDavUrl } from '../src/caldav/hosts';
+import { createFakeFetch, redirectResponse } from './fixtures/caldav/fake-fetch';
 
 describe('isAllowedCalDavUrl accepts only the fixed iCloud CalDAV hosts', () => {
     const allowed = [
@@ -116,6 +117,14 @@ describe('IDNA normalization yields the real host, which is allowed', () => {
         expect(new URL('https://caldav%2eicloud.com/').hostname).toBe('caldav.icloud.com');
         expect(isAllowedCalDavUrl('https://caldav%2eicloud.com/')).toBe(true);
     });
+});
+
+test('REPORT rejects a method-rewriting 303 even without an explicit read profile', async () => {
+    const url = 'https://caldav.icloud.com/';
+    const fake = createFakeFetch({ [url]: () => redirectResponse('https://p1-caldav.icloud.com/', 303) });
+    await expect(createGuardedFetch(fake.fetch)(url, { method: 'REPORT', headers: { authorization: 'Basic synthetic' }, body: '<report/>' }))
+        .rejects.toEqual(new CalDavError('protocol'));
+    expect(fake.calls).toHaveLength(1);
 });
 
 describe('assertAllowedCalDavUrl', () => {

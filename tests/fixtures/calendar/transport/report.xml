@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<D:multistatus xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav">
+<D:response><D:href>/10000000001/calendars/work/%65vent%20%7b1%7d.ics</D:href><D:propstat><D:prop><D:getetag>&quot;v1&quot;</D:getetag><C:calendar-data><![CDATA[BEGIN:VCALENDAR
+VERSION:2.0
+PRODID:-//Synthetic from probe evidence//EN
+BEGIN:VEVENT
+UID:synthetic-transport
+DTSTART:20270111T100000Z
+DTEND:20270111T110000Z
+SUMMARY:A & B
+END:VEVENT
+END:VCALENDAR
+]]></C:calendar-data></D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response>
+</D:multistatus>

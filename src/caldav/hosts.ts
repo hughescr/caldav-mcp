@@ -15,7 +15,9 @@
  * - Too many redirects is reported as `forbidden_host`, like a redirect to a disallowed host.
  */
 import { remainingRequestTimeMs } from '../request-budget';
+import { BudgetError } from '../calendar/model';
 import { CalDavError } from './contracts';
+import type { ReadCharge } from './read-contracts';
 
 export const ICLOUD_CALDAV_ROOT = 'https://caldav.icloud.com/';
 export const MAX_REDIRECTS = 3;
@@ -37,6 +39,14 @@ export type FetchLike = (input: string | URL | Request, init?: RequestInit) => P
 export interface GuardedFetchOptions {
     /** Per-call timeout covering every redirect hop and the body read. Default 10 s. */
     timeoutMs?: number;
+    /** Explicit read profile: streamed decompressed cap; generic phase-1 callers retain their defaults. */
+    maxResponseBytes?: number;
+    overflowCode?: 'protocol' | 'too_large';
+    charge?: ReadCharge;
+    /** Checks account/collection scope after the fixed-host rule, before every send. rawUrl is the redirect spelling. */
+    validateUrl?: (url: URL, rawUrl: string) => void;
+    /** Refuse method-rewriting redirects, and assert the final operation method. REPORT always enables this. */
+    preserveMethod?: boolean;
 }
 
 function parseUrl(url: unknown): URL | undefined {
@@ -151,11 +161,12 @@ function discard(response: Response): void {
     response.body?.cancel().catch(() => undefined);
 }
 
-async function readCapped(response: Response, signal: AbortSignal): Promise<Uint8Array<ArrayBuffer>> {
+async function readCapped(response: Response, signal: AbortSignal, options: GuardedFetchOptions): Promise<Uint8Array<ArrayBuffer>> {
+    const cap = options.maxResponseBytes ?? MAX_RESPONSE_BYTES;
     const declared = response.headers.get('content-length');
-    if (declared !== null && Number(declared) > MAX_RESPONSE_BYTES) {
+    if (declared !== null && Number(declared) > cap) {
         discard(response);
-        throw new CalDavError('protocol');
+        throw new CalDavError(options.overflowCode ?? 'protocol');
     }
     if (!response.body) {
         return new Uint8Array(0);
@@ -174,15 +185,19 @@ async function readCapped(response: Response, signal: AbortSignal): Promise<Uint
             if (value.byteLength === 0 && ++emptyChunks > MAX_EMPTY_CHUNKS) {
                 throw new CalDavError('protocol');
             }
+            // Never refund failed reads, including the chunk crossing the per-response cap.
+            options.charge?.chargeBytes(value.byteLength);
             total += value.byteLength;
-            if (total > MAX_RESPONSE_BYTES) {
-                throw new CalDavError('protocol');
+            if (total > cap) {
+                throw new CalDavError(options.overflowCode ?? 'protocol');
             }
             chunks.push(value);
         }
     } catch (error) {
         reader.cancel().catch(() => undefined);
         throw error;
+    } finally {
+        reader.releaseLock();
     }
     const bytes = new Uint8Array(total);
     let offset = 0;
@@ -193,7 +208,7 @@ async function readCapped(response: Response, signal: AbortSignal): Promise<Uint
     return bytes;
 }
 
-function nextHop(request: PreparedRequest, status: number, location: string): PreparedRequest {
+function nextHop(request: PreparedRequest, status: number, location: string, options: GuardedFetchOptions): PreparedRequest {
     let target: URL;
     try {
         target = new URL(location, request.url);
@@ -203,7 +218,11 @@ function nextHop(request: PreparedRequest, status: number, location: string): Pr
     if (!passesRule(target)) {
         throw new CalDavError('forbidden_host');
     }
+    options.validateUrl?.(target, location);
     const method = request.method.toUpperCase();
+    if (status === 303 && method !== 'GET' && method !== 'HEAD' && (options.preserveMethod || method === 'REPORT')) {
+        throw new CalDavError('protocol');
+    }
     // Fetch-standard method rewriting: 303 (except HEAD), and 301/302 for POST, become a bodiless GET.
     if ((status === 303 && method !== 'HEAD') || ((status === 301 || status === 302) && method === 'POST')) {
         const headers = new Headers(request.headers);
@@ -218,9 +237,11 @@ function nextHop(request: PreparedRequest, status: number, location: string): Pr
 /**
  * Wraps a fetch so that every request (and every redirect hop) must pass the fixed-host rule
  * before it is sent. Redirects are always handled here (`redirect: 'manual'` is forced), at most
- * MAX_REDIRECTS times. The returned Response is fully buffered (at most MAX_RESPONSE_BYTES) and
- * its `url` is the final URL. Failures are CalDavError: 'forbidden_host' (host rule or redirect
- * limit), 'temporary' (timeout, abort, network error), 'protocol' (oversize or unusable response).
+ * MAX_REDIRECTS times. The returned Response is fully buffered (default MAX_RESPONSE_BYTES; a read
+ * profile selects its own cap), and its `url` is the final URL. REPORT can never become GET; callers
+ * may additionally require method preservation and account/collection scope on every hop.
+ * Failures are bare CalDavError codes; a shared charge's BudgetError is preserved without refund.
+ * Generic phase-1 overflow stays protocol; explicit read profiles use too_large.
  * Without `baseFetch`, the global fetch is looked up at call time.
  */
 export function createGuardedFetch(baseFetch?: FetchLike, options: GuardedFetchOptions = {}): FetchLike {
@@ -232,6 +253,8 @@ export function createGuardedFetch(baseFetch?: FetchLike, options: GuardedFetchO
 
     return async (input, init) => {
         let request = await prepare(input, init);
+        const originalMethod = request.method.toUpperCase();
+        options.validateUrl?.(request.url, request.url.href);
         const budgetMs = effectiveTimeoutMs(timeoutMs);
         if (budgetMs <= 0) {
             throw new CalDavError('temporary');
@@ -255,6 +278,13 @@ export function createGuardedFetch(baseFetch?: FetchLike, options: GuardedFetchO
                     signal,
                 );
                 const { status } = response;
+                // Authentication is decided by headers, never by an untrusted error body or its read budget.
+                if (status === 401) {
+                    discard(response);
+                    const unauthorized = new Response(null, { status: 401 });
+                    Object.defineProperty(unauthorized, 'url', { value: request.url.href });
+                    return unauthorized;
+                }
                 if (response.type === 'opaqueredirect' || status < 200 || status > 599) {
                     discard(response);
                     throw new CalDavError('protocol');
@@ -265,10 +295,18 @@ export function createGuardedFetch(baseFetch?: FetchLike, options: GuardedFetchO
                     if (redirects >= MAX_REDIRECTS) {
                         throw new CalDavError('forbidden_host');
                     }
-                    request = nextHop(request, status, location);
+                    const next = nextHop(request, status, location, options);
+                    if ((options.preserveMethod || originalMethod === 'REPORT') && next.method.toUpperCase() !== originalMethod) {
+                        throw new CalDavError('protocol');
+                    }
+                    request = next;
                     continue;
                 }
-                const bytes = await readCapped(response, signal);
+                if ((options.preserveMethod || originalMethod === 'REPORT') && request.method.toUpperCase() !== originalMethod) {
+                    discard(response);
+                    throw new CalDavError('protocol');
+                }
+                const bytes = await readCapped(response, signal, options);
                 const buffered = new Response(NULL_BODY_STATUSES.has(status) ? null : bytes, {
                     status,
                     statusText: response.statusText,
@@ -278,7 +316,7 @@ export function createGuardedFetch(baseFetch?: FetchLike, options: GuardedFetchO
                 return buffered;
             }
         } catch (error) {
-            if (error instanceof CalDavError) {
+            if (error instanceof CalDavError || error instanceof BudgetError) {
                 throw error;
             }
             // Network failures and aborts: the cause is deliberately dropped (it may echo URLs or headers).
