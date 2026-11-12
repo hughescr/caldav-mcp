@@ -1,13 +1,21 @@
 import { AuthCrypto, connectionAAD, digest, equal, randomId } from './crypto';
 import { SCOPES } from './http';
-import { OAuthError, TemporaryUnavailable, type AtomicStore, type AuthContext, type AuthorizationCode, type BackendSessionValidator, type ClientIdentity, type Connection, type Grant, type TokenResponse, type UpstreamCredentials } from './contracts';
+import { OAuthError, TemporaryUnavailable, type AtomicStore, type AuthContext, type AuthorizationCode, type BackendSessionValidator, type ClientIdentity, type Condition, type Connection, type Consent, type Grant, type TokenResponse, type UpstreamCredentials } from './contracts';
 export interface EngineConfig { issuer: string; accessSeconds?: number; grantSeconds?: number; refreshRetrySeconds?: 0 | 10 }
-export interface CodeRequest { client: ClientIdentity; connectionId: string; redirectUri: string; resource: string; scopes: string[]; challenge: string }
+/** `flowId` identifies the browser consent flow; a redelivery of the same flow carries the same id. */
+export interface CodeRequest { client: ClientIdentity; connectionId: string; redirectUri: string; resource: string; scopes: string[]; challenge: string; flowId: string }
 export interface ExchangeRequest { client: ClientIdentity; code: string; verifier: string; redirectUri: string; resource: string }
 export interface ConnectRequest { accountId: string; credentials: UpstreamCredentials; expiresAt: number; expectedCredentialGeneration?: number }
 export interface RefreshRequest { client: ClientIdentity; refreshToken: string; resource: string; scopes?: string[] }
 const scopesKey = (scopes: readonly string[]) => [...new Set(scopes)].sort().join(' ');
-const condition = (record: Connection | Grant | AuthorizationCode) => ({ kind: record.kind, id: record.id, revision: record.revision });
+const condition = (record: Connection | Grant | AuthorizationCode | Consent): Condition => ({ kind: record.kind, id: record.id, revision: record.revision });
+/** One consent record per (account, client). Domain-separated, so it never collides with another key. */
+const consentId = (accountId: string, clientId: string) => digest(JSON.stringify(['caldav-mcp', 1, 'consent', accountId, clientId]));
+const flowDigest = (flowId: string) => digest(JSON.stringify(['caldav-mcp', 1, 'consent-flow', flowId]));
+/** Pins the observed consent state, including its absence, into a transaction. */
+const consentCondition = (accountId: string, clientId: string, record: Consent | undefined): Condition => ({ kind: 'consent', id: consentId(accountId, clientId), revision: record?.revision ?? null });
+/** A grant is its client's current one when the consent record names it; a grant from before consent records is current only while its client has none. */
+const isCurrent = (grant: Grant, consent: Consent | undefined) => consent === undefined || consent.grantId === grant.id;
 const MAX_URL = 2048;
 const boundedString = (value: unknown, max: number): value is string => typeof value === 'string' && value.length > 0 && value.length <= max;
 /** Explicit projection: nothing but the contract fields is ever sealed. */
@@ -66,13 +74,39 @@ export class AuthEngine {
         if (connection.status !== 'active') { return false; }
         return this.store.transact({ conditions: [condition(connection)], puts: [{ ...connection, revision: connection.revision + 1, status: 'reconnect_required' }], operationId: randomId() });
     }
+    /** The consent record of one client for one account. A record under that key that names anyone else is a store fault. */
+    private async consent(accountId: string, clientId: string): Promise<Consent | undefined> {
+        const id = consentId(accountId, clientId);
+        const record = await this.store.get('consent', id);
+        if (record === undefined) { return undefined; }
+        if (record.kind !== 'consent' || record.id !== id || record.accountId !== accountId || record.clientId !== clientId) { throw new TemporaryUnavailable(); }
+        return record;
+    }
+    /**
+     * Issues a code for a completed, iCloud-proven consent. A consent flow other than the client's
+     * current one replaces it in the same transaction as the code: every earlier grant and outstanding
+     * code of this client for this account ends here, before any exchange, so a client cannot keep a
+     * wider earlier grant by never exchanging the new code. A redelivery of the same flow keeps the
+     * consent, so its first code and a grant already exchanged from it stay valid.
+     */
     async issueCode(request: CodeRequest): Promise<string> {
-        if (request.resource !== this.resource || !request.client.redirectUris.includes(request.redirectUri) || !/^[A-Za-z0-9_-]{43}$/.test(request.challenge) || request.scopes.length === 0 || request.scopes.some(s => !SCOPES.includes(s))) {throw new OAuthError('invalid_request');}
+        if (request.resource !== this.resource || !request.client.redirectUris.includes(request.redirectUri) || !/^[A-Za-z0-9_-]{43}$/.test(request.challenge) || !/^[A-Za-z0-9_-]{43}$/.test(request.flowId) || request.scopes.length === 0 || request.scopes.some(s => !SCOPES.includes(s))) {throw new OAuthError('invalid_request');}
         const connection = await this.connection(request.connectionId);
         await this.validateConnection(connection);
+        const { accountId } = connection; const { clientId } = request.client;
+        const previous = await this.consent(accountId, clientId);
+        const flow = flowDigest(request.flowId);
+        // Never below the connection generation's expiry: the record must outlive every grant it refuses.
+        const expiresAt = Math.max(previous?.expiresAt ?? 0, connection.expiresAt);
+        let consent: Consent | undefined;
+        if (previous && equal(previous.flow, flow)) {
+            if (previous.expiresAt < expiresAt) { consent = { ...previous, revision: previous.revision + 1, expiresAt }; }
+        } else {
+            consent = { kind: 'consent', id: consentId(accountId, clientId), revision: previous ? previous.revision + 1 : 0, expiresAt, accountId, clientId, flow };
+        }
         const code = this.crypto.sign('authorization-code', randomId());
-        const record: AuthorizationCode = { kind: 'code', id: digest(code), revision: 0, expiresAt: this.now() + 120, clientId: request.client.clientId, connectionId: connection.id, accountId: connection.accountId, credentialGeneration: connection.credentialGeneration, redirectUri: request.redirectUri, resource: request.resource, scopes: scopesKey(request.scopes).split(' '), challenge: request.challenge };
-        if (!await this.store.transact({ conditions: [condition(connection), { kind: 'code', id: record.id, revision: null }], puts: [record], operationId: randomId() })) {throw new TemporaryUnavailable();}
+        const record: AuthorizationCode = { kind: 'code', id: digest(code), revision: 0, expiresAt: this.now() + 120, clientId, connectionId: connection.id, accountId, credentialGeneration: connection.credentialGeneration, redirectUri: request.redirectUri, resource: request.resource, scopes: scopesKey(request.scopes).split(' '), challenge: request.challenge, flow };
+        if (!await this.store.transact({ conditions: [condition(connection), { kind: 'code', id: record.id, revision: null }, consentCondition(accountId, clientId, previous)], puts: consent ? [record, consent] : [record], operationId: randomId() })) {throw new TemporaryUnavailable();}
         return code;
     }
     private tokens(grant: Grant): TokenResponse {
@@ -87,11 +121,17 @@ export class AuthEngine {
         if (code?.kind !== 'code' || code.expiresAt <= this.now() || code.consumedGrantId || code.clientId !== request.client.clientId || code.redirectUri !== request.redirectUri || !request.client.redirectUris.includes(request.redirectUri) || code.resource !== request.resource || request.resource !== this.resource || !equal(code.challenge, digest(request.verifier))) {throw new OAuthError('invalid_grant');}
         const connection = await this.connection(code.connectionId);
         if (connection.accountId !== code.accountId || connection.credentialGeneration !== code.credentialGeneration) {throw new OAuthError('invalid_grant');}
+        // Only a code of the client's current consent flow; a newer consent ended this one.
+        const consent = await this.consent(code.accountId, code.clientId);
+        if (!consent || code.flow === undefined || !equal(consent.flow, code.flow)) { throw new OAuthError('invalid_grant'); }
         await this.validateConnection(connection);
         if (code.expiresAt <= this.now() || connection.expiresAt <= this.now()) { throw new OAuthError('invalid_grant'); }
         const grant: Grant = { kind: 'grant', id: randomId(), revision: 0, expiresAt: Math.min(this.now() + this.grantSeconds, connection.expiresAt), clientId: code.clientId, connectionId: code.connectionId, accountId: code.accountId, resource: code.resource, scopes: code.scopes, status: 'active', credentialGeneration: connection.credentialGeneration, tokenVersion: 0, refreshGeneration: 0, refreshHash: '' };
         const response = this.tokens(grant); grant.refreshHash = digest(response.refresh_token);
-        if (!await this.store.transact({ conditions: [condition(code), condition(connection), { kind: 'grant', id: grant.id, revision: null }], puts: [{ ...code, revision: code.revision + 1, consumedGrantId: grant.id }, grant], operationId: randomId() })) {throw new OAuthError('invalid_grant');}
+        // The new grant becomes the client's only valid one in the same transaction that creates it:
+        // of two codes from one flow, the later completed exchange wins.
+        const current: Consent = { ...consent, revision: consent.revision + 1, expiresAt: Math.max(consent.expiresAt, connection.expiresAt), grantId: grant.id };
+        if (!await this.store.transact({ conditions: [condition(code), condition(connection), { kind: 'grant', id: grant.id, revision: null }, condition(consent)], puts: [{ ...code, revision: code.revision + 1, consumedGrantId: grant.id }, grant, current], operationId: randomId() })) {throw new OAuthError('invalid_grant');}
         return response;
     }
     private binding(request: RefreshRequest, grant: Grant): string {
@@ -114,10 +154,12 @@ export class AuthEngine {
         if (!this.backend.isAllowed(grant.accountId)) { throw new OAuthError('invalid_grant'); }
         const connection = await this.connection(grant.connectionId);
         if (connection.accountId !== grant.accountId || connection.credentialGeneration !== grant.credentialGeneration) { throw new OAuthError('invalid_grant'); }
-        // A check-only transaction establishes one authorization point for both records.
+        const consent = await this.consent(grant.accountId, grant.clientId);
+        if (!isCurrent(grant, consent)) { throw new OAuthError('invalid_grant'); }
+        // A check-only transaction establishes one authorization point for the three records.
         // Its fresh operation ID is local to this recovery attempt; adapters retain it only
         // for bounded retries of the identical check, never for a later HTTP request.
-        if (!await this.store.transact({ conditions: [condition(grant), condition(connection)], puts: [], operationId: randomId() })) {
+        if (!await this.store.transact({ conditions: [condition(grant), condition(connection), consentCondition(grant.accountId, grant.clientId, consent)], puts: [], operationId: randomId() })) {
             throw new OAuthError('invalid_grant');
         }
         const now = this.now();
@@ -130,6 +172,9 @@ export class AuthEngine {
         try { found = await this.grant(request.refreshToken, 'refresh'); } catch (error) { if (error instanceof OAuthError && error.error === 'invalid_token') { throw new OAuthError('invalid_grant'); } throw error; }
         const { grant, generation } = found;
         if (grant.clientId !== request.client.clientId || request.resource !== grant.resource || request.resource !== this.resource) {throw new OAuthError('invalid_grant');}
+        // A grant replaced by a newer consent of its client is dead; nothing below may touch it.
+        const consent = await this.consent(grant.accountId, grant.clientId);
+        if (!isCurrent(grant, consent)) { throw new OAuthError('invalid_grant'); }
         const hash = digest(request.refreshToken);
         if (!equal(grant.refreshHash, hash) || generation !== grant.refreshGeneration) {
             if (generation < grant.refreshGeneration) {
@@ -158,7 +203,8 @@ export class AuthEngine {
         const next: Grant = { ...grant, revision: grant.revision + 1, refreshGeneration: grant.refreshGeneration + 1, scopes: (request.scopes === undefined ? grant.scopes : scopesKey(request.scopes).split(' ')), previousRefreshHash: hash, receiptBinding: binding, receiptUntil: this.now() + this.grace };
         const response = this.tokens(next); next.refreshHash = digest(response.refresh_token);
         next.receipt = this.crypto.seal('refresh-receipt', this.receiptAAD(next, binding), response);
-        if (!await this.store.transact({ conditions: [condition(grant), condition(connection)], puts: [next], operationId: randomId() })) {
+        // Conditioned on the consent observed above: a replacement committed meanwhile fails this rotation.
+        if (!await this.store.transact({ conditions: [condition(grant), condition(connection), consentCondition(grant.accountId, grant.clientId, consent)], puts: [next], operationId: randomId() })) {
             // A concurrent winner may have committed the identical delivery receipt.
             const winner = await this.store.get('grant', grant.id);
             if (winner?.kind === 'grant' && winner.refreshGeneration === generation + 1 && winner.previousRefreshHash === hash) { const receipt = await this.recoverReceipt(winner, binding); if (receipt) { return receipt; } }
@@ -169,8 +215,8 @@ export class AuthEngine {
     async verifyAccess(token: string, requiredScopes: readonly string[] = []): Promise<AuthContext> {
         const { grant } = await this.grant(token, 'access');
         if (grant.resource !== this.resource || requiredScopes.some(s => !grant.scopes.includes(s))) {throw new OAuthError('invalid_token');}
-        const connection = await this.store.get('connection', grant.connectionId);
-        if (connection?.kind !== 'connection' || connection.accountId !== grant.accountId || connection.credentialGeneration !== grant.credentialGeneration || connection.status === 'revoked') {throw new OAuthError('invalid_token');}
+        const [connection, consent] = await Promise.all([this.store.get('connection', grant.connectionId), this.consent(grant.accountId, grant.clientId)]);
+        if (connection?.kind !== 'connection' || connection.accountId !== grant.accountId || connection.credentialGeneration !== grant.credentialGeneration || connection.status === 'revoked' || !isCurrent(grant, consent)) {throw new OAuthError('invalid_token');}
         return { grantId: grant.id, accountId: grant.accountId, connectionId: grant.connectionId, scopes: grant.scopes, connectionStatus: connection.expiresAt <= this.now() ? 'reconnect_required' : connection.status };
     }
     async revoke(token: string, client: ClientIdentity): Promise<void> {

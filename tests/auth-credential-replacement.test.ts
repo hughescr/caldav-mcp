@@ -1,6 +1,5 @@
 import { afterEach, beforeEach, describe, expect, spyOn, test, type Mock } from 'bun:test';
-import { digest } from '../src/auth/crypto';
-import { ACCOUNT_ID, APPLE_ID, CALENDARS, PASSWORD, callTool, connect, issuer, post, setup, submit, start, type Env } from './helpers/http-env';
+import { ACCOUNT_ID, APPLE_ID, CALENDARS, callTool, connect, connectOtherClient, issuer, post, setup, type Env } from './helpers/http-env';
 
 let spies: Mock<(...args: unknown[]) => void>[] = [];
 beforeEach(() => { spies = (['log', 'info', 'warn', 'error', 'debug'] as const).map(method => spyOn(console, method).mockImplementation(() => {})); });
@@ -10,20 +9,6 @@ const NEW_PASSWORD = 'brand-new-pass-word-1';
 
 function refresh(env: Env, clientId: string, refreshToken: string) {
     return post(env.app, '/token', new URLSearchParams({ grant_type: 'refresh_token', client_id: clientId, refresh_token: refreshToken, resource: `${issuer}/mcp` }));
-}
-
-/** A second, separately registered client completing the whole browser flow. */
-async function connectOtherClient(env: Env, password = PASSWORD) {
-    const redirect = 'https://other-client.example/callback';
-    const registration = env.runtime.clients.register({ client_name: 'Other client', redirect_uris: [redirect], token_endpoint_auth_method: 'none', grant_types: ['authorization_code', 'refresh_token'] });
-    const verifier = 'o'.repeat(43);
-    const params = new URLSearchParams({ response_type: 'code', client_id: registration.client_id, redirect_uri: redirect, resource: `${issuer}/mcp`, scope: 'calendar:read', code_challenge_method: 'S256', code_challenge: digest(verifier), state: 'other-state' });
-    const response = await submit(env, await start(env, params), { password });
-    expect(response.status).toBe(302);
-    const code = new URL(response.headers.get('location') ?? '').searchParams.get('code') ?? '';
-    const exchanged = await post(env.app, '/token', new URLSearchParams({ grant_type: 'authorization_code', client_id: registration.client_id, redirect_uri: redirect, resource: `${issuer}/mcp`, code, code_verifier: verifier }));
-    expect(exchanged.status).toBe(200);
-    return { clientId: registration.client_id, tokens: await exchanged.json() as { access_token: string; refresh_token: string } };
 }
 
 async function expectChallenge(response: Response) {

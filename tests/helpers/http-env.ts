@@ -115,6 +115,20 @@ export async function connect(env: Env, options: SubmitOptions & { duplicate?: b
     return { tokens: await response.json() as { access_token: string; refresh_token: string; scope: string }, fields, form, redirect };
 }
 
+/** A second, separately registered client completing the whole browser flow for `scope`. */
+export async function connectOtherClient(env: Env, password = PASSWORD, scope = 'calendar:read') {
+    const redirect = 'https://other-client.example/callback';
+    const registration = env.runtime.clients.register({ client_name: 'Other client', redirect_uris: [redirect], token_endpoint_auth_method: 'none', grant_types: ['authorization_code', 'refresh_token'] });
+    const verifier = 'o'.repeat(43);
+    const params = new URLSearchParams({ response_type: 'code', client_id: registration.client_id, redirect_uri: redirect, resource: `${issuer}/mcp`, scope, code_challenge_method: 'S256', code_challenge: digest(verifier), state: 'other-state' });
+    const response = await submit(env, await start(env, params), { password });
+    expect(response.status).toBe(302);
+    const code = new URL(response.headers.get('location') ?? '').searchParams.get('code') ?? '';
+    const exchanged = await post(env.app, '/token', new URLSearchParams({ grant_type: 'authorization_code', client_id: registration.client_id, redirect_uri: redirect, resource: `${issuer}/mcp`, code, code_verifier: verifier }));
+    expect(exchanged.status).toBe(200);
+    return { clientId: registration.client_id, tokens: await exchanged.json() as { access_token: string; refresh_token: string; scope: string } };
+}
+
 export function rpc(env: Env, token: string, method: string, params?: unknown, id = 1) {
     return env.app.request('/mcp', { method: 'POST', headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json', accept: 'application/json, text/event-stream', 'mcp-protocol-version': '2025-11-25' }, body: JSON.stringify({ jsonrpc: '2.0', id, method, ...(params === undefined ? {} : { params }) }) });
 }

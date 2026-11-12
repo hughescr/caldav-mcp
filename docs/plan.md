@@ -481,6 +481,12 @@ No decisions are open.
   read both the keyring parameter and the table can decrypt stored passwords.
 - CI actions are trusted by tag, and deploys have no approval step.
 - A rotation of the app-specific password signs out every client.
+- A new consent replaces only grants with the same `client_id` (on develop, not released). A
+  client that registers again gets a new `client_id`, so its old grants live until they
+  expire, the password is replaced or they are revoked. Installations that share one
+  `client_id` count as one client: connecting one ends the other's grant. A consent whose
+  code is never exchanged leaves that client without a working grant until it authorizes
+  again.
 - Calendar `id` values returned by `list_calendars` contain the account's numeric iCloud
   path.
 - A short `list_events` or `search_events` query can miss an occurrence that was moved more

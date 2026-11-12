@@ -22,6 +22,7 @@ const APPLE_HELP_URL = 'https://support.apple.com/102654';
 const FAILED ='Sign-in failed. Check the Apple ID and app-specific password, then start the connection again.';
 const THROTTLED = 'Too many failed sign-in attempts for this Apple ID. Wait 15 minutes, then start the connection again.';
 const UNAVAILABLE = 'iCloud sign-in is temporarily unavailable. Try again later.';
+const REPLACES = 'Your choice replaces what this client was allowed before.';
 const NO_PERMISSION = 'Choose at least one permission';
 const NO_PERMISSION_TEXT = 'Nothing was saved and iCloud was not contacted. Start the connection again and tick at least one permission.';
 function cookie(context: Context, runtime: AuthRuntime, flow?: Flow) {
@@ -35,7 +36,7 @@ function read(context: Context, runtime: AuthRuntime): Flow {
         if (entries.length !== 1) { throw new Error(); }
         const sealed = JSON.parse(Buffer.from((entries[0] ?? '').slice(COOKIE.length + 1), 'base64url').toString('utf8')) as Sealed;
         const flow = runtime.crypto.open<Flow>('browser-flow', JSON.stringify([runtime.issuer, 1]), sealed);
-        if (!Number.isSafeInteger(flow.deadline) || flow.deadline <= now() || flow.deadline > now() + 600 || typeof flow.csrf !== 'string' || typeof flow.binding !== 'string') { throw new Error(); }
+        if (!Number.isSafeInteger(flow.deadline) || flow.deadline <= now() || flow.deadline > now() + 600 || typeof flow.csrf !== 'string' || typeof flow.binding !== 'string' || typeof flow.flowId !== 'string') { throw new Error(); }
         return flow;
     } catch { throw new OAuthError('invalid_request'); }
 }
@@ -83,6 +84,8 @@ function render(context: Context, runtime: AuthRuntime, auth: Authorization, flo
         `<div class="field row"><label for="password">App-specific password</label><input id="password" name="app_password" type="password" autocomplete="off" autocapitalize="none" spellcheck="false" maxlength="256" aria-describedby="password-help" required><a class="aside" href="${APPLE_HELP_URL}" target="_blank" rel="noopener noreferrer" referrerpolicy="no-referrer">How do I generate an app-specific password?</a></div>`,
         '<p id="password-help" class="help">Use one made only for this connector. Never use your main Apple Account password.</p></section>',
         permissions(auth.scopes),
+        // A completed consent replaces this client's earlier grant for the account (see issueCode).
+        `<p class="help">${REPLACES}</p>`,
         '<p class="help">Keep this connection for up to 180 days. iCloud may require reconnection sooner, for example if the app-specific password is revoked.</p>',
         '<p class="privacy">Your password is stored encrypted and used only to talk to iCloud.</p>',
         '<div class="actions"><button class="primary" name="decision" value="allow">Connect and allow</button>',
@@ -149,7 +152,7 @@ export async function postBrowser(context: Context, runtime: AuthRuntime) {
     if (discovery === 'unavailable') { return failure(context, runtime, 503, UNAVAILABLE); }
     const credentials: UpstreamCredentials = { accountId, appleId, appPassword, principalUrl: discovery.principalUrl, calendarHomeUrl: discovery.calendarHomeUrl, issuedAt: now() };
     let code: string;
-    try { code = await store(runtime, auth, credentials, scopes); } catch (error) {
+    try { code = await store(runtime, auth, credentials, scopes, flow.flowId); } catch (error) {
         // Fixed pages for the expected outcomes after discovery: a concurrent reconnect or a
         // session check that now fails (invalid_grant), or a temporary store/upstream error.
         if (!(error instanceof OAuthError)) { throw error; }
@@ -157,8 +160,11 @@ export async function postBrowser(context: Context, runtime: AuthRuntime) {
     }
     return redirect(context, runtime, auth, { code });
 }
-/** Stores the iCloud-proven credential and issues the authorization code for the scopes the user granted. */
-async function store(runtime: AuthRuntime, auth: Authorization, credentials: UpstreamCredentials, scopes: string[]): Promise<string> {
+/**
+ * Stores the iCloud-proven credential and issues the authorization code for the scopes the user granted.
+ * The code issue replaces this client's earlier consent for the account unless `flowId` is the same flow.
+ */
+async function store(runtime: AuthRuntime, auth: Authorization, credentials: UpstreamCredentials, scopes: string[], flowId: string): Promise<string> {
     const { accountId } = credentials;
     const record = await runtime.store.get('connection', accountId);
     if (record && (record.kind !== 'connection' || record.accountId !== accountId)) { throw new OAuthError('temporarily_unavailable'); }
@@ -169,5 +175,5 @@ async function store(runtime: AuthRuntime, auth: Authorization, credentials: Ups
     // unchanged connection. Anything else is a fresh, iCloud-proven replacement, which ends every
     // earlier grant for the account.
     const connection = previous && identicalActive(runtime, previous, credentials) ? previous : await runtime.engine.connectOrReconnect({ accountId, credentials, expiresAt: now() + 180 * 86400, ...(previous ? { expectedCredentialGeneration: previous.credentialGeneration } : {}) });
-    return runtime.engine.issueCode({ client: auth.client, connectionId: connection.id, redirectUri: auth.redirectUri, resource: auth.resource, scopes, challenge: auth.challenge });
+    return runtime.engine.issueCode({ client: auth.client, connectionId: connection.id, redirectUri: auth.redirectUri, resource: auth.resource, scopes, challenge: auth.challenge, flowId });
 }

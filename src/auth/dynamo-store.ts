@@ -16,6 +16,8 @@ const SK = 'STATE';
 const safeId = (value: unknown): value is string => typeof value === 'string' && /^[A-Za-z0-9_-]{1,128}$/.test(value);
 const integer = (value: unknown): value is number => Number.isSafeInteger(value) && (value as number) >= 0;
 const text = (value: unknown): value is string => typeof value === 'string' && value.length > 0 && value.length <= 4096;
+/** A SHA-256 digest or a random id: 43 base64url characters. */
+const digestText = (value: unknown): value is string => typeof value === 'string' && /^[A-Za-z0-9_-]{43}$/.test(value);
 function object(value: unknown): value is Record<string, unknown> { return value !== null && typeof value === 'object' && !Array.isArray(value); }
 function sealed(value: unknown): boolean {
     return object(value) && Object.keys(value).sort().join(',') === 'ciphertext,keyId,nonce,tag' && safeId(value.keyId) && typeof value.nonce === 'string' && /^[A-Za-z0-9_-]{16}$/.test(value.nonce) && typeof value.tag === 'string' && /^[A-Za-z0-9_-]{22}$/.test(value.tag) && typeof value.ciphertext === 'string' && /^[A-Za-z0-9_-]{1,32768}$/.test(value.ciphertext);
@@ -32,12 +34,15 @@ function record(value: unknown): value is AuthRecord {
         common.push('clientId', 'connectionId', 'resource', 'scopes');
         if (!text(value.clientId) || !safeId(value.connectionId) || !text(value.resource) || !Array.isArray(value.scopes) || value.scopes.length < 1 || value.scopes.length > 16 || value.scopes.some(scope => typeof scope !== 'string' || !SCOPES.includes(scope))) { return false; }
         if (value.kind === 'code') {
-            fields = ['credentialGeneration', 'redirectUri', 'challenge', 'consumedGrantId'];
-            if (!integer(value.credentialGeneration) || !text(value.redirectUri) || typeof value.challenge !== 'string' || !/^[A-Za-z0-9_-]{43}$/.test(value.challenge) || (value.consumedGrantId !== undefined && !safeId(value.consumedGrantId))) { return false; }
+            fields = ['credentialGeneration', 'redirectUri', 'challenge', 'consumedGrantId', 'flow'];
+            if (!integer(value.credentialGeneration) || !text(value.redirectUri) || typeof value.challenge !== 'string' || !/^[A-Za-z0-9_-]{43}$/.test(value.challenge) || (value.consumedGrantId !== undefined && !safeId(value.consumedGrantId)) || (value.flow !== undefined && !digestText(value.flow))) { return false; }
         } else {
             fields = ['credentialGeneration', 'status', 'tokenVersion', 'refreshGeneration', 'refreshHash', 'previousRefreshHash', 'receiptUntil', 'receipt', 'receiptBinding'];
             if (!integer(value.credentialGeneration) || (typeof value.status !== 'string' || !['active', 'revoked'].includes(value.status)) || !integer(value.tokenVersion) || !integer(value.refreshGeneration) || typeof value.refreshHash !== 'string' || !/^[A-Za-z0-9_-]{43}$/.test(value.refreshHash) || (value.previousRefreshHash !== undefined && (typeof value.previousRefreshHash !== 'string' || !/^[A-Za-z0-9_-]{43}$/.test(value.previousRefreshHash))) || (value.receiptUntil !== undefined && !integer(value.receiptUntil)) || (value.receipt !== undefined && !sealed(value.receipt)) || (value.receiptBinding !== undefined && !text(value.receiptBinding))) { return false; }
         }
+    } else if (value.kind === 'consent') {
+        fields = ['clientId', 'flow', 'grantId'];
+        if (!text(value.clientId) || !digestText(value.flow) || (value.grantId !== undefined && !digestText(value.grantId))) { return false; }
     } else if (value.kind === 'throttle') {
         fields = ['windowStart', 'failures'];
         if (value.accountId !== value.id || !integer(value.windowStart) || !integer(value.failures) || (value.failures as number) > 1000) { return false; }
@@ -45,7 +50,7 @@ function record(value: unknown): value is AuthRecord {
     return Object.keys(value).every(key => value[key] !== undefined && [...common, ...fields].includes(key)) && Buffer.byteLength(JSON.stringify(value)) <= 65536;
 }
 function key(kind: AuthRecord['kind'], id: string): { pk: string; sk: string } {
-    if (!['connection', 'grant', 'code', 'throttle'].includes(kind) || !safeId(id)) { throw new Error('Invalid auth record key'); }
+    if (!['connection', 'grant', 'code', 'consent', 'throttle'].includes(kind) || !safeId(id)) { throw new Error('Invalid auth record key'); }
     return { pk: `caldav-mcp#${kind}#${id}`, sk: SK };
 }
 function conditionalConflict(error: unknown, count: number): boolean {

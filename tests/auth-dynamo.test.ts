@@ -1,7 +1,7 @@
 import { describe, expect, test } from 'bun:test';
 import { GetCommand, TransactWriteCommand } from '@aws-sdk/lib-dynamodb';
 import { DynamoAtomicStore } from '../src/auth/dynamo-store';
-import type { AtomicWrite, AuthorizationCode, Connection, LoginThrottle } from '../src/auth/contracts';
+import type { AtomicWrite, AuthorizationCode, Connection, Consent, LoginThrottle } from '../src/auth/contracts';
 import { AuthCrypto, connectionAAD } from '../src/auth/crypto';
 const connection = (id = 'conn', revision = 0): Connection => ({ kind: 'connection', id, revision, expiresAt: 2000000000, accountId: 'account', credentialGeneration: 0, status: 'active', credentials: { keyId: 'v1', nonce: 'a'.repeat(16), tag: 'a'.repeat(22), ciphertext: 'abc' } });
 const write = (): AtomicWrite => ({ operationId: 'a'.repeat(43), conditions: [{ kind: 'connection', id: 'conn', revision: null }], puts: [connection()] });
@@ -159,6 +159,21 @@ describe('caldav-mcp record kinds and limits', () => {
             await expect(store.transact({ operationId: 'b'.repeat(43), conditions: [{ kind: 'code', id: 'c'.repeat(43), revision: null }], puts: [code(scopes)] })).rejects.toThrow('Invalid auth record');
         }
         expect(calls).toHaveLength(1);
+    });
+    test('consent records and code flows use the namespace, round-trip and are strictly validated', async () => {
+        const id = 'k'.repeat(43);
+        const consent = (overrides: Record<string, unknown> = {}): Consent => ({ kind: 'consent', id, revision: 0, expiresAt: 2000000000, accountId, clientId: 'https://client.example/metadata.json', flow: 'f'.repeat(43), ...overrides }) as Consent;
+        const { store, calls } = fixture(async command => command instanceof GetCommand ? { Item: { ...consent({ grantId: 'g'.repeat(43) }), pk: `caldav-mcp#consent#${id}`, sk: 'STATE' } } : {});
+        expect(await store.get('consent', id)).toEqual(consent({ grantId: 'g'.repeat(43) }));
+        expect(calls[0]?.input).toMatchObject({ Key: { pk: `caldav-mcp#consent#${id}`, sk: 'STATE' } });
+        expect(await store.transact({ operationId: 'b'.repeat(43), conditions: [{ kind: 'consent', id, revision: null }], puts: [consent()] })).toBe(true);
+        expect(await store.transact({ operationId: 'b'.repeat(43), conditions: [{ kind: 'consent', id, revision: 0 }], puts: [consent({ revision: 1, grantId: 'g'.repeat(43) })] })).toBe(true);
+        expect(await store.transact({ operationId: 'b'.repeat(43), conditions: [{ kind: 'code', id: 'c'.repeat(43), revision: null }], puts: [{ ...code(['calendar:read']), flow: 'f'.repeat(43) }] })).toBe(true);
+        for (const bad of [consent({ flow: 'short' }), consent({ flow: undefined }), consent({ grantId: '' }), consent({ grantId: 'g'.repeat(44) }), consent({ clientId: '' }), consent({ clientId: 'x'.repeat(4097) }), consent({ scopes: ['calendar:read'] }), consent({ extra: true })]) {
+            await expect(store.transact({ operationId: 'b'.repeat(43), conditions: [{ kind: 'consent', id, revision: null }], puts: [bad] })).rejects.toThrow();
+        }
+        await expect(store.transact({ operationId: 'b'.repeat(43), conditions: [{ kind: 'code', id: 'c'.repeat(43), revision: null }], puts: [{ ...code(['calendar:read']), flow: 'short' }] })).rejects.toThrow('Invalid auth record');
+        expect(calls).toHaveLength(4);
     });
     test('check-only transactions (refresh receipt authorization) are sent as condition checks', async () => {
         const { store, calls } = fixture();

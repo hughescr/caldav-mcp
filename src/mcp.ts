@@ -20,7 +20,7 @@ const DOWNLOAD_TOOL = 'get_event_attachment_download';
 /** Every listed scope must be granted. The tuple type keeps a tool from ever having an empty, always-passing list. */
 type RequiredScopes = readonly [string, ...string[]];
 const READ: RequiredScopes = ['calendar:read'];
-const requiredScope: Record<ToolName, RequiredScopes> = {
+export const requiredScope: Readonly<Record<ToolName, RequiredScopes>> = {
     list_calendars: READ, list_events: READ, search_events: READ, get_event: READ, get_event_attachment_download: READ,
 };
 /** Scopes of `required` missing from `granted`, in the order `required` lists them. */

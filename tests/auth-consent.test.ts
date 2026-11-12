@@ -79,6 +79,17 @@ describe('consent page rows', () => {
         expect(html).toContain('<button class="primary" name="decision" value="allow">Connect and allow</button>');
         expect(html).toContain('How do I generate an app-specific password?');
     });
+
+    test('a muted line right under the permission rows says the choice replaces what the client was allowed before', async () => {
+        for (const [scope, closing] of [[EVERY, '</fieldset>'], ['calendar:read', '</section>']] as const) {
+            const { html, response } = await start(setup({ scope }));
+            const line = '<p class="help">Your choice replaces what this client was allowed before.</p>';
+            expect(html, scope).toContain(`${closing}${line}<p class="help">Keep this connection for up to 180 days.`);
+            expect(html.split(line), scope).toHaveLength(2);
+            expect(response.headers.get('content-security-policy'), scope).toContain(`style-src ${PAGE_STYLE_SOURCE};`);
+            expect(html, scope).not.toContain('style=');
+        }
+    });
 });
 
 describe('granting', () => {
@@ -211,7 +222,7 @@ describe('tools refuse a token without the scope they need', () => {
         expect(env.caldav.count('listCalendars')).toBe(0);
     });
 
-    test('narrowing a grant away from read on refresh refuses the new and the earlier access token at once', async () => {
+    test('narrowing a grant away from read on refresh refuses the new and the earlier access token on their next verification', async () => {
         const env = setup({ scope: 'calendar:read calendar:write' });
         const tokens = await grant(env);
         const narrowed = await (await refresh(env, tokens.refresh_token, 'calendar:write')).json() as { access_token: string; scope: string };
@@ -219,7 +230,7 @@ describe('tools refuse a token without the scope they need', () => {
         const reply = await (await callTool(env, narrowed.access_token, 'list_calendars')).json();
         expect(reply.result.structuredContent.error.code).toBe('insufficient_scope');
         expect(reply.result.structuredContent.error.message).toStartWith(READ_MESSAGE);
-        // Access tokens read the grant's current scopes, so the narrowing also applies to the token issued before it.
+        // Each verification reads the grant's current scopes, so the narrowing also applies to the token issued before it.
         expect((await (await callTool(env, tokens.access_token, 'list_calendars')).json()).result.structuredContent.error.code).toBe('insufficient_scope');
         expect(env.caldav.count('listCalendars')).toBe(0);
     });

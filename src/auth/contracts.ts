@@ -25,7 +25,9 @@ export interface UpstreamCredentials {
 }
 /**
  * A grant is valid only while `credentialGeneration` equals its connection's: any replacement of
- * the stored credential ends every grant issued before it. `expiresAt` never exceeds the expiry of
+ * the stored credential ends every grant issued before it. It is also valid only while its client's
+ * consent record for the account names it (see Consent): a new consent by the same client ends it.
+ * `expiresAt` never exceeds the expiry of
  * the connection generation it was issued for, so a generation number reused after the connection
  * record is deleted can never match a live grant.
  */
@@ -36,16 +38,33 @@ export interface Grant extends BaseRecord {
     previousRefreshHash?: string; receiptUntil?: number; receipt?: Sealed;
     receiptBinding?: string;
 }
+/**
+ * `flow` is the consent flow that issued the code; it can be exchanged only while that flow is the
+ * client's current consent. Codes issued before consent records existed have none and are refused.
+ */
 export interface AuthorizationCode extends BaseRecord {
     kind: 'code'; clientId: string; connectionId: string; accountId: string;
     credentialGeneration: number; redirectUri: string; resource: string; scopes: string[];
-    challenge: string; consumedGrantId?: string;
+    challenge: string; consumedGrantId?: string; flow?: string;
+}
+/**
+ * The latest completed consent of one client for one account; id = consentId(accountId, clientId).
+ * While it exists, the only valid grant of that client for that account is `grantId`, and only codes
+ * of `flow` can be exchanged. A new consent flow replaces `flow` and drops `grantId` at code issue, so
+ * every earlier grant and outstanding code of that client ends at that moment; each exchange of a code
+ * of the current flow names its new grant here, so the later completed exchange wins. `expiresAt`
+ * never falls below the expiry of the connection generation it was written under, so the record
+ * outlives every grant it can refuse. Grants that predate consent records are valid only while no
+ * record exists for their client.
+ */
+export interface Consent extends BaseRecord {
+    kind: 'consent'; accountId: string; clientId: string; flow: string; grantId?: string;
 }
 /** Fixed-window count of upstream-rejected logins for one allowlisted account; id = accountId. */
 export interface LoginThrottle extends BaseRecord {
     kind: 'throttle'; accountId: string; windowStart: number; failures: number;
 }
-export type AuthRecord = Connection | Grant | AuthorizationCode | LoginThrottle;
+export type AuthRecord = Connection | Grant | AuthorizationCode | Consent | LoginThrottle;
 export interface Condition { kind: AuthRecord['kind']; id: string; revision: number | null }
 export interface AtomicWrite { conditions: Condition[]; puts: AuthRecord[]; operationId: string }
 export interface AtomicStore {
