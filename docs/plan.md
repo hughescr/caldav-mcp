@@ -1,6 +1,6 @@
 # caldav-mcp: assessment and development plan
 
-Status: the phase 0 probe is written. The owner has run its read-only mode and its `--write` mode against their own iCloud account, locally, on 2026-11-11, several times as the probe grew. The invite and Lambda runs are outstanding. The phase 1 skeleton was deployed on 2026-11-11 (version 0.1.1, https://caldav-mcp.rungie.com). The owner connected it from a Claude client and reports that it worked; this was not checked from server logs. Version 0.2.0 was released on 2026-11-12. It adds phase 2 (`list_events`, `search_events`, `get_event`) to `list_calendars`. The attachment download tool is designed but not built. The auth and credential-storage code and the probe each had one independent review by a second Claude agent (same model family; no cross-family reviewer was available). The findings were fixed, except the items listed under "Accepted limitations".
+Status: the phase 0 probe is written. The owner has run its read-only mode and its `--write` mode against their own iCloud account, locally, on 2026-11-11, several times as the probe grew. The invite and Lambda runs are outstanding. The phase 1 skeleton was deployed on 2026-11-11 (version 0.1.1, https://caldav-mcp.rungie.com). The owner connected it from a Claude client and reports that it worked; this was not checked from server logs. Version 0.2.1 was released and deployed on 2026-11-12, and its deploy verification passed. It adds phase 2 (`list_events`, `search_events`, `get_event`) to `list_calendars`. The attachment download tool is designed but not built. The auth and credential-storage code and the probe each had one independent review by a second Claude agent (same model family; no cross-family reviewer was available). The findings were fixed, except the items listed under "Accepted limitations".
 
 ## Goal
 
@@ -272,7 +272,7 @@ Additional controls:
 `list_calendars`, `list_events`, `search_events`, `get_event`,
 `get_event_attachment_download`, `create_event`, `update_event`, `delete_event`.
 
-Released in version 0.2.0 (2026-11-12): `list_calendars` (first released in 0.1.1), `list_events`,
+Released in version 0.2.1 (2026-11-12): `list_calendars` (first released in 0.1.1), `list_events`,
 `search_events` and `get_event`. All four need the scope `calendar:read`. Designed, not built:
 `get_event_attachment_download`. Not started: the three write tools.
 
@@ -427,8 +427,8 @@ phases, which are not built.
 |---|---|---|---|
 | 0 | Probe script, run locally and from a Lambda with a real account. Tests: requests from AWS addresses, discovery, server-side expansion, text search, sync-collection, shared and subscribed calendars, time-zone handling on round trip, whether invitations are sent. | Results recorded in `docs/`. | Probe written. Local read-only and `--write` runs done (one account, 2026-11-11). Invite and Lambda runs outstanding. |
 | 1 | Skeleton from wildduck-mcp: OAuth, keyring, store, deployment, CI, adapted login page, allowlist, `list_calendars` only. | Deployed and connected from Claude. | Done 2026-11-11. Deployed (version 0.1.1, https://caldav-mcp.rungie.com) and connected from a Claude client, by the owner's report; not checked from server logs. |
-| 2 | Read path: time model, parsing, occurrences from iCloud's expansion, `list_events`, `search_events`, `get_event`. | The read path passes a corpus of awkward events under Node and Bun. Occurrences come from iCloud's expansion and are passed through as it returns them. | Released in version 0.2.0 (2026-11-12). |
-| 2b | Attachment download: `get_event_attachment_download` for inline and managed attachments, with short-lived staged copies. | An agent can download every attachment that iCloud holds for an event, including managed ones. The "server holds no calendar data" statement is then replaced by "except attachment copies staged for about one day". | Designed, not built. Next after the phase 2 release. |
+| 2 | Read path: time model, parsing, occurrences from iCloud's expansion, `list_events`, `search_events`, `get_event`. | The read path passes a corpus of awkward events under Node and Bun. Occurrences come from iCloud's expansion and are passed through as it returns them. | Released in version 0.2.1 (2026-11-12). |
+| 2b | Attachment download: `get_event_attachment_download` for inline and managed attachments, with short-lived staged copies. | An agent can download every attachment that iCloud holds for an event, including managed ones. The "server holds no calendar data" statement is then replaced by "except attachment copies staged for about one day". | Designed, not built. Next. |
 | 3 | Writes for single events: create, update, delete, all-day, alarms. | Conflict and retry tests pass; verified in Calendar.app. | Not started. |
 | 4 | Recurring writes with the three edit scopes. | Verified in Calendar.app across a daylight-saving change. | Not started. |
 | 5 | Optional: attendees and invitations, a free-time finder. | Depends on phase 0 results. | Not started. |
