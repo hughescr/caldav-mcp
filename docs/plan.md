@@ -1,6 +1,6 @@
 # caldav-mcp: assessment and development plan
 
-Status: the phase 0 probe is written. The owner has run its read-only mode and its `--write` mode against their own iCloud account, locally, on 2026-11-11, several times as the probe grew. The invite and Lambda runs are outstanding. The phase 1 skeleton was deployed on 2026-11-11 (version 0.1.1, https://caldav-mcp.rungie.com). The owner connected it from a Claude client and reports that it worked; this was not checked from server logs. Version 0.2.0 was released on 2026-11-12. It adds phase 2 (`list_events`, `search_events`, `get_event`) to `list_calendars`. The attachment download tool is designed but not built. The auth and credential-storage code and the probe each had one independent review by a second Claude agent (same model family; no cross-family reviewer was available). The findings were fixed, except the items listed under "Accepted limitations".
+Status: the phase 0 probe is written. The owner has run its read-only mode and its `--write` mode against their own iCloud account, locally, on 2026-11-11, several times as the probe grew. The invite and Lambda runs are outstanding. The phase 1 skeleton was deployed on 2026-11-11 (version 0.1.1, https://caldav-mcp.rungie.com). The owner connected it from a Claude client and reports that it worked; this was not checked from server logs. Version 0.2.0 was released on 2026-11-12. It adds phase 2 (`list_events`, `search_events`, `get_event`) to `list_calendars`. The attachment download tool (phase 2b, `get_event_attachment_download`) is built and tested against fakes, and not released. The auth and credential-storage code and the probe each had one independent review by a second Claude agent (same model family; no cross-family reviewer was available). The findings were fixed, except the items listed under "Accepted limitations".
 
 ## Goal
 
@@ -17,12 +17,11 @@ It mirrors the security and deployment strategy of
 - **Other CalDAV providers.** iCloud only for now, by the owner's decision of 2026-11-11.
   Named providers with fixed hosts would fit the current security model. An arbitrary server
   URL would replace the fixed-host rule with a weaker control.
-- **Push notifications and caching.** The server holds no calendar data. Each tool call
-  reads iCloud when it needs to. This stays true for the next release. It will change when
-  the attachment download tool ships: the server will then hold copies of attachments that
-  an agent asked to download, for about one day, and nothing else. sync-collection is
-  unused for now: it returns the whole collection and ignores limits, and the server has
-  no cache to update.
+- **Push notifications and caching.** No calendar data is retained except attachment copies
+  staged in a private bucket for about one day, when an agent asks to download an
+  attachment. Each tool call reads iCloud when it needs to. sync-collection is unused for
+  now: it returns the whole collection and ignores limits, and the server has no cache to
+  update.
 
 ## What iCloud provides
 
@@ -168,9 +167,9 @@ Measured by the probe on one account, 2026-11-11.
   or the account's id. A plain `GET` with no `Authorization` header and no cookies returned
   status 200 and the exact bytes for the one attachment the probe uploaded, so the URL
   works like a bearer link. The response had no `Content-Length`, ignored `Range` and did not
-  redirect. The server therefore plans to download managed attachments without credentials
-  and never to send the CalDAV credentials to that host. The size limit then rests on the
-  `SIZE` parameter of the `ATTACH` and a hard cap on the streamed body.
+  redirect. The server therefore downloads managed attachments without credentials and never
+  sends the CalDAV credentials to that host. The size limit rests on a hard 20 MiB cap on the
+  streamed body, with the `SIZE` parameter of the `ATTACH` as a further upper bound.
 
 ## Architecture
 
@@ -273,8 +272,8 @@ Additional controls:
 `get_event_attachment_download`, `create_event`, `update_event`, `delete_event`.
 
 Released in version 0.2.0 (2026-11-12): `list_calendars` (first released in 0.1.1), `list_events`,
-`search_events` and `get_event`. All four need the scope `calendar:read`. Designed, not built:
-`get_event_attachment_download`. Not started: the three write tools.
+`search_events` and `get_event`. Built, not released: `get_event_attachment_download`. All
+five need the scope `calendar:read`. Not started: the three write tools.
 
 - Date ranges are required and capped at 366 days, within the years 1900 to 2100. Each
   boundary must carry an explicit offset or `Z`. The range is half-open: the start is
@@ -313,16 +312,28 @@ Released in version 0.2.0 (2026-11-12): `list_calendars` (first released in 0.1.
 - All calendar text (titles, notes, locations, attendee names, time zone names, file names
   and the raw iCalendar text) is untrusted data.
 
-The planned `get_event_attachment_download` returns a short-lived link to a copy of one
-attachment, not the bytes in the tool result. It will fetch inline attachments from the
-event itself and managed attachments from `gateway.icloud.com` without credentials (see
-"Managed attachments" above). It will accept a managed attachment only on exactly that host
-with `https`, the default port, no user info, a `MANAGED-ID` on the `ATTACH` and a declared
-`SIZE` of at most 20 MiB. An attachment link that points into the account's own CalDAV
-paths, to an `.ics` file or to a collection is never fetched, because the server holds the
-account credentials and the link text comes from whoever sent the invitation. An
-attachment link that points anywhere else is reported as an external link and is not
-fetched. Copies are kept for about one day.
+`get_event_attachment_download` takes `calendar_id`, `resource_href`, an `attachment_ref`
+from `get_event`, and optional `recurrence_id` and `expected_version`. It reads the event
+from iCloud again and selects the attachment itself; it never takes a URL from the client.
+It returns a short-lived link to a copy of the attachment, not the bytes in the tool
+result:
+
+- An inline attachment (base64 in the event) is decoded from the event and staged.
+- A managed attachment is fetched from `gateway.icloud.com` without credentials (see
+  "Managed attachments" above) and staged. The rules are in one reviewed module,
+  `src/caldav/managed-attachment-policy.ts`: `https`, exactly that host, the default port,
+  no user info or fragment, a `MANAGED-ID` on the `ATTACH`, and no path under the
+  account's calendar home, no `.ics` path and no collection path. Redirects are refused, not
+  followed. Owner decision OD9 allows credentials to go to an Apple download host that asks
+  for a login (401 with a Basic challenge), but only to a host on a separate list. That list
+  is empty, because no host has been seen to need a login.
+- Any other link is not fetched, so the server cannot be used to reach other hosts. Its URL
+  is returned as an external link with `fetched_by_server: false`. A `MANAGED-ID` link that
+  the policy refuses is treated the same way.
+
+A staged copy is at most 20 MiB. It is written under a new random key in a private S3
+bucket and served with a presigned link that lasts at most five minutes, always as a file
+download. S3 deletes copies about a day after they are written.
 
 ### Libraries
 
@@ -332,6 +343,7 @@ fetched. Copies are kept for about one day.
 | Parse and edit iCalendar | `ical.js` | Reads use only `ICAL.parse`, which returns plain jCal arrays. It registers no time zones by default. |
 | Recurrence expansion | iCloud, through `calendar-query` with `expand`. | iCloud applies `RECURRENCE-ID` overrides and `EXDATE`s. The server does not merge them. |
 | Zone conversion | built-in `Temporal` | Used only to add `utc` and `offset` for IANA zone names. Range boundaries and event spans use integer arithmetic. |
+| Attachment staging | `@aws-sdk/client-s3` and `@aws-sdk/s3-request-presigner`, pinned at 3.1166.0 | One `PutObject` per download and a locally signed GET link. The client is created on the first download. |
 
 The server does not use `tsdav` 2.5.0. It sends extra requests per calendar and a
 `.well-known` lookup. It also reports 403, 5xx and parse failures as the same error, so
@@ -428,7 +440,7 @@ phases, which are not built.
 | 0 | Probe script, run locally and from a Lambda with a real account. Tests: requests from AWS addresses, discovery, server-side expansion, text search, sync-collection, shared and subscribed calendars, time-zone handling on round trip, whether invitations are sent. | Results recorded in `docs/`. | Probe written. Local read-only and `--write` runs done (one account, 2026-11-11). Invite and Lambda runs outstanding. |
 | 1 | Skeleton from wildduck-mcp: OAuth, keyring, store, deployment, CI, adapted login page, allowlist, `list_calendars` only. | Deployed and connected from Claude. | Done 2026-11-11. Deployed (version 0.1.1, https://caldav-mcp.rungie.com) and connected from a Claude client, by the owner's report; not checked from server logs. |
 | 2 | Read path: time model, parsing, occurrences from iCloud's expansion, `list_events`, `search_events`, `get_event`. | The read path passes a corpus of awkward events under Node and Bun. Occurrences come from iCloud's expansion and are passed through as it returns them. | Released in version 0.2.0 (2026-11-12). |
-| 2b | Attachment download: `get_event_attachment_download` for inline and managed attachments, with short-lived staged copies. | An agent can download every attachment that iCloud holds for an event, including managed ones. The "server holds no calendar data" statement is then replaced by "except attachment copies staged for about one day". | Designed, not built. Next after the phase 2 release. |
+| 2b | Attachment download: `get_event_attachment_download` for inline and managed attachments, with short-lived staged copies. | An agent can download every attachment that iCloud holds for an event, including managed ones. The server keeps no calendar data except attachment copies staged for about one day. | Built, not released. Tested against fakes only; a real inline and managed download is still to be checked after the bootstrap update and deploy. |
 | 3 | Writes for single events: create, update, delete, all-day, alarms. | Conflict and retry tests pass; verified in Calendar.app. | Not started. |
 | 4 | Recurring writes with the three edit scopes. | Verified in Calendar.app across a daylight-saving change. | Not started. |
 | 5 | Optional: attendees and invitations, a free-time finder. | Depends on phase 0 results. | Not started. |
@@ -466,3 +478,9 @@ No decisions are open.
   links. A managed attachment link works without credentials, so anyone who sees it can
   download that file. The raw text may also contain malicious instructions, like all
   calendar text.
+- A download link from `get_event_attachment_download` works for anyone who holds it until
+  it expires, at most five minutes after it was issued. Revoking a grant does not revoke a
+  link already issued. Staged copies are deleted by an S3 lifecycle rule about a day after
+  they are written; S3 does not promise the exact time.
+- An external attachment link is returned as stored on the event and was not checked. It
+  can point anywhere the event's author chose.
