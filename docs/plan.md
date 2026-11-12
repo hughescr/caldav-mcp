@@ -467,8 +467,9 @@ released (single-occurrence scopes and series moves are the next build).
   compares the text about to be sent with an expectation derived from the request; any
   difference, or any added `ATTENDEE`, `ORGANIZER`, `ATTACH` or non-display alarm, stops the
   write with nothing sent.
-- Invitations: iCloud emails guests at once when an event with attendees is changed or
-  deleted, and `SCHEDULE-AGENT` cannot suppress it (probe, 2026-11-12). The write tools take no
+- Invitations: iCloud emails guests at once when the time or description of an event with
+  attendees changes or the event is deleted (an alarm-only or `TRANSP`-only change sent none),
+  and `SCHEDULE-AGENT` cannot suppress it (probe, 2026-11-12). The write tools take no
   attendee or organizer input. Changing or deleting an event that has any `ATTENDEE` or
   `ORGANIZER` needs `calendar:invite` (else `attendees_present`), keeps those lines exactly as
   stored, and the result says `guests_may_be_emailed`.

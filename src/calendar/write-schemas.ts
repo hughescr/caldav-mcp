@@ -13,7 +13,7 @@ export const WRITE_INVALID_INPUT_MESSAGE = 'Invalid arguments for this write too
 const FIXED = { error: WRITE_INVALID_INPUT_MESSAGE } as const;
 
 /** Fixed note carried by every write result on an event with guests (addendum 1). */
-export const GUEST_NOTICE = 'This event has guests (attendees or an organizer). iCloud emails them at once when such an event is changed or deleted (an update or a cancellation), and this cannot be suppressed.';
+export const GUEST_NOTICE = 'This event has guests (attendees or an organizer), so iCloud may have emailed them at once: measured, a change of time or description sends an update and a deletion sends a cancellation (an alarm-only or busy/free-only change sent none). This cannot be suppressed.';
 
 // ---- Shared inputs ----
 
