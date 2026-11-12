@@ -6,7 +6,7 @@
 import { z } from 'zod';
 import {
     ATTENDEE_TEXT_MAX, DISPLAY_NAME_MAX, ETAG_MAX, ETAG_MIN, FILENAME_MAX, FULL_DESCRIPTION_MAX, FULL_LOCATION_MAX, FULL_TITLE_MAX, MAX_ATTACHMENTS, MAX_ATTENDEES, MAX_DISCOVERED_CALENDARS,
-    MAX_DOWNLOAD_BYTES, MAX_EVENTS, MAX_RAW_BYTES, MAX_SELECTED_CALENDARS, MAX_UNREADABLE, MIME_MAX, QUERY_MAX, SLIM_DESCRIPTION_MAX, SLIM_LOCATION_MAX, SLIM_TITLE_MAX, UID_MAX,
+    MAX_DOWNLOAD_BYTES, MAX_EVENTS, MAX_RAW_BYTES, MAX_SELECTED_CALENDARS, MAX_UNREADABLE, MIME_MAX, OCCURRENCE_ID_MAX, QUERY_MAX, SLIM_DESCRIPTION_MAX, SLIM_LOCATION_MAX, SLIM_TITLE_MAX, UID_MAX,
 } from './limits';
 import { isCanonicalPath } from './model';
 import { isValidDateText, isValidInstantText, isValidLocalText, isValidOffsetText, parseOccurrenceId, parseRange, parseRangeBoundary } from './time-core';
@@ -29,7 +29,7 @@ export const instantSchema = z.string(FIXED).refine(isValidInstantText, FIXED).d
 const offsetSchema = z.string(FIXED).refine(isValidOffsetText, FIXED).describe('UTC offset as +HH:mm or +HH:mm:ss.');
 export const rangeBoundarySchema = z.string(FIXED).refine(text => parseRangeBoundary(text) !== null, FIXED)
     .describe('RFC 3339 timestamp with an explicit offset or Z, e.g. 2026-03-08T00:00:00-08:00. A timezone is required.');
-export const occurrenceIdSchema = z.string(FIXED).refine(text => parseOccurrenceId(text) !== null, FIXED)
+export const occurrenceIdSchema = z.string(FIXED).max(OCCURRENCE_ID_MAX, FIXED).refine(text => parseOccurrenceId(text) !== null, FIXED)
     .describe('Opaque occurrence token from a list or search result. Pass it back unchanged.');
 export const attachmentRefSchema = z.string(FIXED).regex(/^a1_[A-Za-z0-9_-]{43}$/u, FIXED)
     .describe('Opaque attachment reference from get_event. An identifier, not an authorization capability.');

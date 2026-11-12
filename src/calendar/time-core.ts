@@ -6,7 +6,7 @@
  * Every clock regex bounds hours to [01]\d|2[0-3] and minutes/seconds to [0-5]\d, because Temporal
  * silently clamps second 60 to 59 and would otherwise accept it.
  */
-import { MAX_INPUT_YEAR, MAX_RANGE_DAYS, MAX_TRANSPORT_DAYS, MIN_INPUT_YEAR, MOVED_PAD_DAYS, TRANSPORT_PAD_HOURS } from './limits';
+import { MAX_INPUT_YEAR, MAX_RANGE_DAYS, MAX_TOKEN_TZID_BYTES, MAX_TRANSPORT_DAYS, MIN_INPUT_YEAR, MOVED_PAD_DAYS, OCCURRENCE_ID_MAX, TRANSPORT_PAD_HOURS } from './limits';
 import { IcalError, type EventTime, type Interval, type OccurrenceId, type StoredTime, type TransportWindow } from './model';
 
 const NS_PER_SECOND = 1_000_000_000n;
@@ -20,6 +20,7 @@ const UTC_RE = new RegExp(`^(\\d{4})-(\\d{2})-(\\d{2})T(${HOUR}):(${MINUTE_SECON
 const BOUNDARY_RE = new RegExp(`^(\\d{4})-(\\d{2})-(\\d{2})T(${HOUR}):(${MINUTE_SECOND}):(${MINUTE_SECOND})(?:\\.(\\d{1,9}))?(?:Z|([+-])(${HOUR}):(${MINUTE_SECOND}))$`, 'u');
 const OFFSET_RE = new RegExp(`^[+-]${HOUR}:${MINUTE_SECOND}(?::${MINUTE_SECOND})?$`, 'u');
 const ID_RE = new RegExp(`^occ1_(\\d{4})(\\d{2})(\\d{2})T(${HOUR})(${MINUTE_SECOND})(${MINUTE_SECOND})Z$`, 'u');
+const STORED_ID_RE = new RegExp(`^occ2_(\\d{4})(\\d{2})(\\d{2})T(${HOUR})(${MINUTE_SECOND})(${MINUTE_SECOND})_([A-Za-z0-9_-]+)$`, 'u');
 const RID_JCAL_RE = new RegExp(`^(\\d{4})-(\\d{2})-(\\d{2})T(${HOUR}):(${MINUTE_SECOND}):(${MINUTE_SECOND})Z$`, 'u');
 /** IANA-like grammar. Stops Temporal from parsing ISO strings or offsets handed in as a zone name. */
 const IANA_GRAMMAR_RE = /^[A-Za-z][A-Za-z0-9._+-]*(?:\/[A-Za-z0-9._+-]+)*$/u;
@@ -493,14 +494,42 @@ export function occurrenceIdFromJcal(value: string, hasParameters: boolean): Occ
     return `occ1_${match[1]}${match[2]}${match[3]}T${match[4]}${match[5]}${match[6]}Z`;
 }
 
+/** Strict, and a leading BOM is kept as text, so decoding is the exact inverse of the issuer's encoding. */
+const UTF8 = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true });
+
+/** A TZID an `occ2_` token can carry: non-empty, well-formed, no control characters, at most MAX_TOKEN_TZID_BYTES in UTF-8. */
+function tokenTzid(tzid: string): boolean {
+    if (tzid === '' || !tzid.isWellFormed() || Buffer.byteLength(tzid, 'utf8') > MAX_TOKEN_TZID_BYTES) { return false; }
+    for (let index = 0; index < tzid.length; index++) {
+        const code = tzid.charCodeAt(index);
+        if (code < 0x20 || code === 0x7F) { return false; }
+    }
+    return true;
+}
+
 /**
- * Token for an expanded RECURRENCE-ID property (jCal type, value, any parameters besides the VALUE that jCal folds into the
- * type). iCloud emits equivalent forms for the same all-day occurrence, so each maps to the one token of its server form:
- * a Z date-time as given, `VALUE=DATE` as midnight Z, a floating date-time as its wall digits Z. A TZID or any other
- * parameter, or an invalid literal, is null.
+ * `occ2_` token for a TZID-form RECURRENCE-ID: the local digits and the exact TZID text, base64url-encoded without padding.
+ * It is an identity by text, so it needs no zone and works for an unrecognized zone or a repeated hour. Null for a TZID the
+ * token cannot carry.
  */
-export function occurrenceIdFromRecurrenceId(type: string, value: string, hasParameters: boolean): OccurrenceId | null {
-    if (hasParameters) { return null; }
+function storedOccurrenceId(local: RegExpExecArray, tzid: string): OccurrenceId | null {
+    if (!validDate(Number(local[1]), Number(local[2]), Number(local[3])) || !tokenTzid(tzid)) { return null; }
+    return `occ2_${local[1]}${local[2]}${local[3]}T${local[4]}${local[5]}${local[6]}_${Buffer.from(tzid, 'utf8').toString('base64url')}`;
+}
+
+/**
+ * Token for an expanded RECURRENCE-ID property (jCal type, value, and the parameters besides the VALUE that jCal folds into
+ * the type). iCloud emits equivalent forms for the same all-day occurrence, so each parameterless form maps to the one
+ * `occ1_` token of its server form: a Z date-time as given, `VALUE=DATE` as midnight Z, a floating date-time as its wall
+ * digits Z. A local date-time whose only parameter is a single TZID (the stored form iCloud uses for an overridden instance
+ * of a TZID series, probe Run 7) maps to an `occ2_` token of its text. Any other parameter, or an invalid literal, is null.
+ */
+export function occurrenceIdFromRecurrenceId(type: string, value: string, params: ReadonlyMap<string, readonly string[]>): OccurrenceId | null {
+    if (params.size > 0) {
+        const tzids = params.get('tzid');
+        const local = type === 'date-time' && params.size === 1 && tzids?.length === 1 ? LOCAL_RE.exec(value) : null;
+        return local === null || tzids?.[0] === undefined ? null : storedOccurrenceId(local, tzids[0]);
+    }
     if (type === 'date') {
         const date = DATE_RE.exec(value);
         if (date === null || !validDate(Number(date[1]), Number(date[2]), Number(date[3]))) { return null; }
@@ -515,19 +544,52 @@ export function occurrenceIdFromRecurrenceId(type: string, value: string, hasPar
     return occurrenceIdFromJcal(value, false);
 }
 
-export interface ParsedOccurrenceId {
-    /** Server form, `YYYYMMDDTHHmmssZ`. Internal. */
-    serverForm: string;
-    /** The same digits as a Local literal. */
-    local: string;
-    /** The token read as an instant on the server axis. */
-    ns: bigint;
-}
+export type ParsedOccurrenceId =
+    | {
+        kind: 'server';
+        id: OccurrenceId;
+        /** Server form, `YYYYMMDDTHHmmssZ`. Internal. */
+        serverForm: string;
+        /** The same digits as a Local literal. */
+        local: string;
+        /** The token read as an instant on the server axis. */
+        ns: bigint;
+    }
+    | {
+        kind: 'stored';
+        id: OccurrenceId;
+        /** The RECURRENCE-ID's local text, as a Local literal. */
+        local: string;
+        /** The RECURRENCE-ID's exact TZID text. */
+        tzid: string;
+        /** The local digits on the synthetic UTC civil axis, never converted through the zone. */
+        ns: bigint;
+    };
+
+/**
+ * Parses a client-supplied token strictly: `occ1_` with valid civil digits, or `occ2_` with valid civil digits and the
+ * canonical unpadded base64url of a TZID the issuer could have encoded (UTF-8, no controls, within the byte bound), at most
+ * OCCURRENCE_ID_MAX characters. Exactly the tokens the server issues parse; anything else is null.
+ */
 export function parseOccurrenceId(token: string): ParsedOccurrenceId | null {
-    const match = ID_RE.exec(token);
-    if (match === null || !validDate(Number(match[1]), Number(match[2]), Number(match[3]))) { return null; }
-    const local = `${match[1]}-${match[2]}-${match[3]}T${match[4]}:${match[5]}:${match[6]}`;
-    return { serverForm: `${match[1]}${match[2]}${match[3]}T${match[4]}${match[5]}${match[6]}Z`, local, ns: localNs(local) };
+    if (token.length > OCCURRENCE_ID_MAX) { return null; }
+    const server = ID_RE.exec(token);
+    if (server !== null) {
+        if (!validDate(Number(server[1]), Number(server[2]), Number(server[3]))) { return null; }
+        const local = `${server[1]}-${server[2]}-${server[3]}T${server[4]}:${server[5]}:${server[6]}`;
+        return { kind: 'server', id: `occ1_${token.slice(5)}`, serverForm: `${server[1]}${server[2]}${server[3]}T${server[4]}${server[5]}${server[6]}Z`, local, ns: localNs(local) };
+    }
+    const stored = STORED_ID_RE.exec(token);
+    const encoded = stored?.[7];
+    if (stored === null || encoded === undefined || !validDate(Number(stored[1]), Number(stored[2]), Number(stored[3]))) { return null; }
+    const bytes = Buffer.from(encoded, 'base64url');
+    // Buffer decoding is lenient, so only the one canonical spelling of the bytes is accepted.
+    if (bytes.toString('base64url') !== encoded) { return null; }
+    let tzid: string;
+    try { tzid = UTF8.decode(bytes); } catch { return null; }
+    if (!tokenTzid(tzid)) { return null; }
+    const local = `${stored[1]}-${stored[2]}-${stored[3]}T${stored[4]}:${stored[5]}:${stored[6]}`;
+    return { kind: 'stored', id: `occ2_${token.slice(5)}`, local, tzid, ns: localNs(local) };
 }
 
 /**
@@ -540,9 +602,9 @@ export function occurrenceServerForm(stored: StoredTime): string | null {
 }
 
 /**
- * One bounded transport window for a non-null occurrence token, without expanding recurrence: the original slot (the token on
- * the server axis with the master's nominal span) unioned with the actual intervals of any overrides that map to it or cannot
- * be matched, padded 24 h. iCloud returns a moved occurrence only when the window covers both its original slot and its new
+ * One bounded transport window for a non-null occurrence token, without expanding recurrence: the original slot (the token's
+ * `ns` with the master's nominal span; for an `occ2_` token its local digits read as UTC, which the 24 h pad covers for any
+ * real zone offset) unioned with the actual intervals of any overrides that map to it or cannot be matched, padded 24 h. iCloud returns a moved occurrence only when the window covers both its original slot and its new
  * time (probe Run 5), so the override interval is never used alone. Over MAX_TRANSPORT_DAYS is IcalError('window_too_large').
  */
 export function occurrenceTransportWindow(input: { token: ParsedOccurrenceId; masterSpanSeconds: number; overrideIntervals?: readonly Interval[] }): TransportWindow {

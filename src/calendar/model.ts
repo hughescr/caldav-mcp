@@ -44,7 +44,12 @@ export interface Interval { startNs: bigint; endNs: bigint }
 /** REPORT time-range bounds in basic UTC seconds, e.g. 20260308T103000Z. */
 export interface TransportWindow { startUtc: string; endUtc: string }
 
-export type OccurrenceId = `occ1_${string}`;
+/**
+ * Opaque occurrence token. `occ1_YYYYMMDDTHHMMSSZ` names an occurrence whose expanded RECURRENCE-ID is a `…Z` date-time, a
+ * `VALUE=DATE` date or a floating date-time; `occ2_YYYYMMDDTHHMMSS_<base64url TZID>` one whose expanded RECURRENCE-ID is a
+ * TZID date-time (iCloud's form for a stored override of a TZID series), as text, with no zone conversion.
+ */
+export type OccurrenceId = `occ1_${string}` | `occ2_${string}`;
 
 /** The lexical rule behind the Path scalar. Canonical means a client may pass it back unchanged. */
 export function isCanonicalPath(value: string): boolean {
@@ -102,7 +107,10 @@ export interface AttachmentDescriptor {
 export interface RecurrenceIdInfo {
     raw: RawProperty;
     time: StoredTime;
-    /** Null unless the raw value is a Z date-time, a DATE or a floating date-time with no parameters (all map to the Z-form token). */
+    /**
+     * `occ1_` for a Z date-time, a DATE or a floating date-time with no parameters; `occ2_` for a local date-time whose only
+     * parameter is one TZID within MAX_TOKEN_TZID_BYTES; null for anything else.
+     */
     token: OccurrenceId | null;
 }
 
