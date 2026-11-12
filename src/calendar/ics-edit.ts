@@ -15,13 +15,19 @@
  *
  * The result carries a machine-checkable {@link EditReport}; {@link verifyUntouched} re-derives the line structure of both
  * texts with its own code and proves the untouched lines equal. `editResource` runs that check and a re-parse of the
- * output before returning, and never returns text that fails either.
+ * output before returning, and never returns text that fails either. Neither proves that the CHANGED lines say what was
+ * asked: that is `verifyEditOutcome` in `ics-verify.ts`, which the write path must run before every PUT.
+ *
+ * Every pass here is linear in the number of lines (2 MiB / 50,000-line resources): no per-line rescans of a span.
+ * Measured versus assumed: line handling is checked against the local parser only; iCloud's treatment of NEL, U+2028,
+ * U+2029 or a BOM inside stored TEXT, and of a backslash in a parameter value, is NOT measured. Such stored lines are kept
+ * byte for byte when untouched; a RECURRENCE-ID whose TZID holds a backslash fails the agreement check (`tree_mismatch`).
  */
 import { parseContentLine } from './attachments';
 import { foldLine, isWrittenComponent, isWrittenProperty, MAX_LINE_OCTETS, type WrittenComponent, type WrittenProperty } from './ics-write';
 import { parseOriginalResource } from './ical';
 import { MAX_ICS_NESTING } from './limits';
-import { IcalError, type EventComponent, type OriginalResource } from './model';
+import { BudgetError, IcalError, type EventComponent, type OriginalResource } from './model';
 
 // ---- Errors ----
 
@@ -56,12 +62,21 @@ export class IcsEditError extends Error {
 /** The master VEVENT, or the override whose unfolded RECURRENCE-ID logical line equals `recurrenceId` exactly. */
 export type ComponentSelector = { kind: 'master' } | { kind: 'override'; recurrenceId: string };
 
+/**
+ * `set`, `replace` and `remove` of LOCATION or DESCRIPTION edit the logical field, not one line: they also remove its fixed
+ * Apple companion (X-APPLE-STRUCTURED-LOCATION, X-ALT-DESC), reported as a `removed` change with reason `paired`. This holds
+ * when the property itself is absent: `remove DESCRIPTION` on an event with only X-ALT-DESC removes X-ALT-DESC (and
+ * `remove LOCATION` with only X-APPLE-STRUCTURED-LOCATION removes that), so a cleared field keeps no stale companion copy.
+ */
 export type ComponentEdit =
     /** Replace the property of that name in place, or add it when absent. More than one occurrence is an error. */
     | { op: 'set'; property: WrittenProperty }
     /** Replace the property of that name in place; it must occur exactly once. */
     | { op: 'replace'; property: WrittenProperty }
-    /** Remove the property of that name if present; more than one occurrence is an error. */
+    /**
+     * Remove the property of that name if present; more than one occurrence is an error. For LOCATION and DESCRIPTION the
+     * companion is removed too, also when the property itself is absent (clearing the field; see above).
+     */
     | { op: 'remove'; name: string }
     /** Remove every occurrence of a multi-valued property (`EXDATE`, `RDATE`). */
     | { op: 'remove_all'; name: string }
@@ -535,10 +550,13 @@ function applyResourceEdits(planner: Planner, edits: readonly ResourceEdit[]): v
 
 function emit(planner: Planner): EditResult {
     const { tree } = planner;
+    // Gaps strictly inside a deleted range. Ranges are disjoint (every line is claimed once), so marking them is linear.
+    const insideDeleted = new Uint8Array(tree.lines.length + 1);
+    for (const range of planner.deletedRanges) {
+        for (let gap = range.begin + 1; gap <= range.end; gap++) { insideDeleted[gap] = 1; }
+    }
     for (const insertion of planner.insertions) {
-        for (const range of planner.deletedRanges) {
-            if (range.begin < insertion.gap && insertion.gap <= range.end) { throw new IcsEditError('conflicting_edits'); }
-        }
+        if (insideDeleted[insertion.gap] === 1) { throw new IcsEditError('conflicting_edits'); }
     }
     const byGap = new Map<number, Insertion[]>();
     for (const insertion of planner.insertions) {
@@ -595,7 +613,8 @@ function emit(planner: Planner): EditResult {
 /**
  * Applies a plan to the original stored text. Throws {@link IcsEditError}; never returns partially edited text. The output
  * is checked with {@link verifyUntouched} and re-parsed with `parseOriginalResource` (VTIMEZONE count unchanged, VEVENT
- * count as planned) before it is returned; the caller still verifies planned property values on its own re-parse.
+ * count as planned) before it is returned. Those checks prove preservation, not intent: the caller must still run
+ * `verifyEditOutcome` (`ics-verify.ts`) with an expectation derived from the request before sending the text.
  */
 export function editResource(original: string, plan: EditPlan): EditResult {
     if (typeof plan !== 'object' || plan === null) { throw new IcsEditError('edit_not_allowed'); }
@@ -621,7 +640,9 @@ export function editResource(original: string, plan: EditPlan): EditResult {
     try {
         parsed = parseOriginalResource(result.text, {});
     } catch (error) {
-        throw new IcsEditError(error instanceof IcalError && error.reason === 'resource_too_large' ? 'output_too_large' : 'output_invalid');
+        // Over 2 MiB (IcalError) or over the per-resource line or property cap (BudgetError): too large for the read path.
+        const tooLarge = (error instanceof IcalError && error.reason === 'resource_too_large') || error instanceof BudgetError;
+        throw new IcsEditError(tooLarge ? 'output_too_large' : 'output_invalid');
     }
     const added = resourceEdits.filter(edit => edit.op === 'add_component').length;
     const eventCount = (resource: OriginalResource): number => (resource.master === null ? 0 : 1) + resource.overrides.length;
@@ -644,13 +665,25 @@ export type VerifyFailure =
 
 export type VerifyResult = { ok: true } | { ok: false; reason: VerifyFailure; line: number | null };
 
+/** Counts the scope checks' inner steps, so tests can prove the verification is linear in the number of lines. */
+export interface VerifyMeter { steps: number }
+export interface VerifyOptions { meter?: VerifyMeter | undefined }
+
 /**
- * Proves, without the editor's tree or planner, that every original logical line the report does not list as removed is in
- * the output, in order, with identical physical lines; that the output uses CRLF only; that every written line is folded
- * at 75 octets on code-point boundaries (copies must equal their source exactly); and that removals and writes stay inside
- * the edited component, whole removed VEVENTs or whole added VEVENTs.
+ * A PRESERVATION check only. Proves, without the editor's tree or planner, that every original logical line the report
+ * does not list as removed is in the output, in order, with identical physical lines; that the output uses CRLF only; that
+ * every written line is folded at 75 octets on code-point boundaries (copies must equal their source exactly); and that
+ * removals and writes stay inside the edited component, whole removed VEVENTs or whole added VEVENTs.
+ *
+ * It trusts the report for WHAT changed: a written line is accepted whatever it says, so an emit that wrote
+ * `ATTENDEE:mailto:…` where `SUMMARY:new` was planned passes here. Intent is checked by `verifyEditOutcome`
+ * (`ics-verify.ts`) against an expectation derived from the request, never from this report.
+ *
+ * Linear: membership of whole spans uses prefix counts, removed components are marked once. `options.meter` counts the
+ * steps of those scope checks for tests.
  */
-export function verifyUntouched(before: string, after: string, report: EditReport): VerifyResult {
+export function verifyUntouched(before: string, after: string, report: EditReport, options: VerifyOptions = {}): VerifyResult {
+    const meter = options.meter ?? { steps: 0 };
     const fail = (reason: VerifyFailure, line: number | null = null): VerifyResult => ({ ok: false, reason, line });
     if (typeof before !== 'string' || typeof after !== 'string') { return fail('report_invalid'); }
     if (!after.endsWith('\r\n') || /\r(?!\n)|(?<!\r)\n/u.test(after)) { return fail('line_endings'); }
@@ -724,41 +757,61 @@ export function verifyUntouched(before: string, after: string, report: EditRepor
     const oldShape = nesting(oldLines);
     const newShape = nesting(newLines);
     if (oldShape === null || newShape === null) { return fail('scope_violation'); }
-    const allIn = (set: ReadonlySet<number>, begin: number, end: number): boolean => {
-        for (let line = begin; line <= end; line++) {
-            if (!set.has(line)) { return false; }
-        }
-        return true;
+    // Prefix counts make every "is this whole span listed" question O(1), so the scope checks are linear in the line count.
+    // (Scanning the span for each of its lines was quadratic: one 49,000-line VALARM cost billions of lookups.)
+    const removedBefore = prefixCounts(oldLines.length, report.removed, meter);
+    const writtenBefore = prefixCounts(newLines.length, report.written, meter);
+    const allIn = (counts: Int32Array, begin: number, end: number): boolean => {
+        meter.steps++;
+        return begin >= 0 && end >= begin && end + 1 < counts.length && (counts[end + 1] ?? 0) - (counts[begin] ?? 0) === end - begin + 1;
     };
     const target = report.target;
     if (target !== null && (typeof target !== 'object' || !oldShape.isTopLevelEvent(target.begin) || oldShape.endOf.get(target.begin) !== target.end)) {
         return fail('scope_violation');
     }
+    // Per original line, whether it lies inside a whole removed VEVENT: marked once per span, never searched per line.
+    const inRemovedComponent = new Uint8Array(oldLines.length);
     for (const span of report.removedComponents) {
-        if (typeof span !== 'object' || span === null || !oldShape.isTopLevelEvent(span.begin) || oldShape.endOf.get(span.begin) !== span.end || !allIn(removed, span.begin, span.end)) {
+        if (typeof span !== 'object' || span === null || !oldShape.isTopLevelEvent(span.begin) || oldShape.endOf.get(span.begin) !== span.end || !allIn(removedBefore, span.begin, span.end)) {
             return fail('scope_violation', typeof span === 'object' && span !== null ? span.begin : null);
         }
+        // Spans are distinct top-level components, so they never overlap and the marking is linear overall.
+        for (let line = span.begin; line <= span.end; line++) { meter.steps++; inRemovedComponent[line] = 1; }
     }
     for (const index of report.removed) {
-        if (report.removedComponents.some(span => span.begin <= index && index <= span.end)) { continue; }
+        meter.steps++;
+        if (inRemovedComponent[index] === 1) { continue; }
         // Inside the target: a direct property, or a line of a nested VALARM that is removed whole.
         if (target === null || oldShape.top[index] !== target.begin || index === target.begin || index === target.end) { return fail('scope_violation', index); }
         const nested = oldShape.nested[index] ?? -1;
         if (nested === -1) { continue; }
         const nestedEnd = oldShape.endOf.get(nested);
-        if (oldShape.nameOf.get(nested) !== 'VALARM' || nestedEnd === undefined || !allIn(removed, nested, nestedEnd)) { return fail('scope_violation', index); }
+        if (oldShape.nameOf.get(nested) !== 'VALARM' || nestedEnd === undefined || !allIn(removedBefore, nested, nestedEnd)) { return fail('scope_violation', index); }
     }
     const targetBegin = target === null ? undefined : keptMap.get(target.begin);
     if (target !== null && (targetBegin === undefined || newShape.endOf.get(targetBegin) !== keptMap.get(target.end))) { return fail('scope_violation'); }
     for (const index of report.written) {
+        meter.steps++;
         const top = newShape.top[index] ?? -1;
         // Inside the target's span; its own BEGIN and END are kept lines, never written.
         if (targetBegin !== undefined && top === targetBegin) { continue; }
         // Elsewhere only as part of a whole top-level VEVENT the editor wrote.
         const end = newShape.endOf.get(top);
-        if (top === -1 || !newShape.isTopLevelEvent(top) || end === undefined || !allIn(written, top, end)) { return fail('scope_violation', index); }
+        if (top === -1 || !newShape.isTopLevelEvent(top) || end === undefined || !allIn(writtenBefore, top, end)) { return fail('scope_violation', index); }
     }
     return { ok: true };
+}
+
+/** `counts[i]` = how many of the ascending, in-range `indices` are below `i`; length `size + 1`. */
+function prefixCounts(size: number, indices: readonly number[], meter: VerifyMeter): Int32Array {
+    const marks = new Uint8Array(size);
+    for (const index of indices) { marks[index] = 1; }
+    const counts = new Int32Array(size + 1);
+    for (let line = 0; line < size; line++) {
+        meter.steps++;
+        counts[line + 1] = (counts[line] ?? 0) + (marks[line] ?? 0);
+    }
+    return counts;
 }
 
 interface Nesting {

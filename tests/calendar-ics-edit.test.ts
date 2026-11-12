@@ -713,3 +713,198 @@ describe('seeded fuzz: random edits never change an untouched logical line', () 
         }
     });
 });
+
+// ---- Security review findings ----
+
+const simple = (...extra: string[]): string => crlf(['BEGIN:VCALENDAR', 'VERSION:2.0', 'BEGIN:VEVENT', 'UID:u1', 'DTSTART:20270111T100000Z', 'DTEND:20270111T110000Z', ...extra, 'END:VEVENT', 'END:VCALENDAR']);
+
+describe('an override this writer generated can be edited again (finding 1)', () => {
+    const series = (tzid: string): string => crlf([
+        'BEGIN:VCALENDAR', 'VERSION:2.0', 'BEGIN:VEVENT', 'UID:u1',
+        timeProperty('DTSTART', { kind: 'zoned', local: '20261201T100000', tzid }).line,
+        timeProperty('DTEND', { kind: 'zoned', local: '20261201T103000', tzid }).line,
+        'RRULE:FREQ=WEEKLY', 'SUMMARY:s', 'END:VEVENT', 'END:VCALENDAR',
+    ]);
+
+    test('quoted, spaced and non-ASCII zones: add the override, describe it, edit it, remove it', () => {
+        for (const tzid of ['America/New_York', 'Pacific Standard Time', 'A,B', 'A;B', 'a/b:c;d,e', 'Zürich/東京']) {
+            const original = series(tzid);
+            const master = describeEvents(original)[0] as EventOutline;
+            const uid = master.properties.find(line => line.name === 'uid')?.index ?? -1;
+            const rid = timeProperty('RECURRENCE-ID', { kind: 'zoned', local: '20261208T100000', tzid });
+            const added = editResource(original, { resource: [{ op: 'add_component', items: [
+                { copy_line: uid }, rid, timeProperty('DTSTART', { kind: 'zoned', local: '20261208T110000', tzid }), textProperty('SUMMARY', 'moved'),
+            ] }] }).text;
+            const outline = describeEvents(added);
+            expect<unknown>([tzid, outline.map(event => event.recurrenceId)]).toEqual([tzid, [null, rid.line]]);
+            const parsed = parse(added).overrides[0];
+            expect<unknown>([tzid, parsed?.recurrenceId?.raw.params.get('tzid')]).toEqual([tzid, [tzid]]);
+            const edited = editResource(added, { target: { kind: 'override', recurrenceId: rid.line }, edits: [{ op: 'set', property: textProperty('SUMMARY', 'again') }] }).text;
+            expect<unknown>([tzid, valueOf(parse(edited).overrides[0], 'summary')]).toEqual([tzid, 'again']);
+            const removed = editResource(edited, { resource: [{ op: 'remove_component', target: { kind: 'override', recurrenceId: rid.line } }] }).text;
+            expect(removed).toBe(original);
+        }
+    });
+
+    test('a backslash zone never reaches the editor: the writer refuses it before a RECURRENCE-ID exists', () => {
+        for (const tzid of [String.raw`A\nB`, String.raw`A\,B`, String.raw`A\;B`, String.raw`A\\B`]) {
+            expect<unknown>([tzid, (() => { try { timeProperty('RECURRENCE-ID', { kind: 'zoned', local: '20261208T100000', tzid }); return null; } catch (error) { return (error as { reason?: string }).reason; } })()]).toEqual([tzid, 'zone_not_representable']);
+        }
+        // Stored text with such a RECURRENCE-ID (not written by this server) stays unsupported rather than mis-addressed.
+        const stored = crlf(['BEGIN:VCALENDAR', 'VERSION:2.0', 'BEGIN:VEVENT', 'UID:u1', String.raw`RECURRENCE-ID;TZID=A\nB:20261208T100000`, String.raw`DTSTART;TZID=A\nB:20261208T100000`, 'END:VEVENT', 'END:VCALENDAR']);
+        expect(reasonOf(() => describeEvents(stored))).toBe('tree_mismatch');
+    });
+});
+
+describe('verification is linear in the resource size (finding 2)', () => {
+    const alarmLines = (count: number): string[] => Array.from({ length: count }, (_, index) => `X-LINE-${String(index)}:v`);
+    const withAlarm = (count: number): string => simple('RRULE:FREQ=DAILY', 'BEGIN:VALARM', 'ACTION:DISPLAY', 'TRIGGER:-PT5M', ...alarmLines(count), 'END:VALARM');
+    const addOverrideCopying = (text: string): EditPlan => {
+        const master = describeEvents(text)[0] as EventOutline;
+        return { resource: [{ op: 'add_component', items: [
+            { copy_line: master.properties.find(line => line.name === 'uid')?.index ?? -1 },
+            timeProperty('RECURRENCE-ID', { kind: 'utc', utc: '20270112T100000Z' }),
+            timeProperty('DTSTART', { kind: 'utc', utc: '20270112T100000Z' }),
+            { copy_component: master.alarms[0]?.begin ?? -1 },
+        ] }] };
+    };
+    const stepsOf = (before: string, plan: EditPlan): { steps: number; lines: number } => {
+        const result = editResource(before, plan);
+        const meter = { steps: 0 };
+        expect<unknown>(verifyUntouched(before, result.text, result.report, { meter })).toEqual({ ok: true });
+        return { steps: meter.steps, lines: result.text.split('\r\n').length + before.split('\r\n').length };
+    };
+
+    test('remove_alarms over 1k, 10k and 40k alarm lines: scope checks cost O(lines)', () => {
+        const removeAlarms: EditPlan = { target: { kind: 'master' }, edits: [{ op: 'remove_alarms' }] };
+        for (const count of [1000, 10_000, 40_000]) {
+            const { steps, lines: total } = stepsOf(withAlarm(count), removeAlarms);
+            // The quadratic version re-scanned the whole alarm for each of its lines: about count² steps.
+            expect<unknown>([count, steps <= 4 * total]).toEqual([count, true]);
+        }
+    });
+
+    test('a large copied alarm in an added override: 1k, 10k and 24k lines (the output must stay within 50,000 lines)', () => {
+        for (const count of [1000, 10_000, 24_000]) {
+            const before = withAlarm(count);
+            const { steps, lines: total } = stepsOf(before, addOverrideCopying(before));
+            expect<unknown>([count, steps <= 4 * total]).toEqual([count, true]);
+        }
+    });
+
+    test('wall-clock bound for whole edits of a 40k-line alarm (generous: CI is about 3x slower than a laptop)', () => {
+        const before = withAlarm(40_000);
+        let started = performance.now();
+        editResource(before, { target: { kind: 'master' }, edits: [{ op: 'remove_alarms' }] });
+        expect<unknown>(performance.now() - started).toBeLessThan(2000);
+        // Copying it doubles the output past the 50,000-line read cap: refused as too large, after the linear verification.
+        started = performance.now();
+        expect(reasonOf(() => editResource(before, addOverrideCopying(before)))).toBe('output_too_large');
+        expect<unknown>(performance.now() - started).toBeLessThan(2000);
+    });
+
+    test('many removed overrides and many EXDATE lines stay linear too', () => {
+        const overrides = Array.from({ length: 1500 }, (_, index) => {
+            const day = new Date(Date.UTC(2027, 0, 12) + index * 86_400_000).toISOString().slice(0, 10).replaceAll('-', '');
+            return ['BEGIN:VEVENT', 'UID:u1', `RECURRENCE-ID:${day}T100000Z`, `DTSTART:${day}T110000Z`, 'END:VEVENT'];
+        });
+        const exdates = Array.from({ length: 8000 }, (_, index) => `EXDATE:${new Date(Date.UTC(1990, 0, 1) + index * 86_400_000).toISOString().slice(0, 10).replaceAll('-', '')}T100000Z`);
+        const before = crlf(['BEGIN:VCALENDAR', 'VERSION:2.0', 'BEGIN:VEVENT', 'UID:u1', 'DTSTART:20270111T100000Z', 'RRULE:FREQ=DAILY', ...exdates, 'END:VEVENT', ...overrides.flat(), 'END:VCALENDAR']);
+        const rids = overrides.map(lines => lines[2] as string);
+        const plan: EditPlan = {
+            target: { kind: 'master' },
+            edits: [{ op: 'remove_all', name: 'EXDATE' }, { op: 'set', property: sequenceProperty(1) }],
+            resource: rids.slice(0, 1000).map(recurrenceId => ({ op: 'remove_component', target: { kind: 'override', recurrenceId } })),
+        };
+        const started = performance.now();
+        const { steps, lines: total } = stepsOf(before, plan);
+        expect<unknown>(steps <= 4 * total).toBe(true);
+        expect<unknown>(performance.now() - started).toBeLessThan(4000);
+    });
+});
+
+describe('paired companions clear the logical field (finding 5)', () => {
+    test('remove DESCRIPTION when only X-ALT-DESC is present removes the companion, reported as paired', () => {
+        const result = editResource(simple('SUMMARY:s', 'X-ALT-DESC;FMTTYPE=text/html:<p>old</p>'), { target: { kind: 'master' }, edits: [{ op: 'remove', name: 'DESCRIPTION' }] });
+        expect(result.text).toBe(simple('SUMMARY:s'));
+        expect<unknown>(result.report.changes).toEqual([{ action: 'removed', name: 'X-ALT-DESC', reason: 'paired', original: 7, output: null }]);
+    });
+
+    test('remove LOCATION when only X-APPLE-STRUCTURED-LOCATION is present removes the companion, reported as paired', () => {
+        const result = editResource(simple('X-APPLE-STRUCTURED-LOCATION;VALUE=URI;X-TITLE=Here:geo:1,2', 'SUMMARY:s'), { target: { kind: 'master' }, edits: [{ op: 'remove', name: 'LOCATION' }] });
+        expect(result.text).toBe(simple('SUMMARY:s'));
+        expect<unknown>(result.report.changes).toEqual([{ action: 'removed', name: 'X-APPLE-STRUCTURED-LOCATION', reason: 'paired', original: 6, output: null }]);
+    });
+
+    test('with both present each is reported once, the companion as paired; with neither nothing changes', () => {
+        const result = editResource(simple('LOCATION:l', 'X-APPLE-STRUCTURED-LOCATION;VALUE=URI:geo:1,2', 'DESCRIPTION:d', 'X-ALT-DESC:a'), {
+            target: { kind: 'master' }, edits: [{ op: 'remove', name: 'LOCATION' }, { op: 'remove', name: 'DESCRIPTION' }],
+        });
+        expect(result.text).toBe(simple());
+        expect<unknown>(result.report.changes.map(change => [change.name, change.reason])).toEqual([
+            ['LOCATION', 'requested'], ['X-APPLE-STRUCTURED-LOCATION', 'paired'], ['DESCRIPTION', 'requested'], ['X-ALT-DESC', 'paired'],
+        ]);
+        const none = editResource(simple('SUMMARY:s'), { target: { kind: 'master' }, edits: [{ op: 'remove', name: 'LOCATION' }, { op: 'remove', name: 'DESCRIPTION' }] });
+        expect(none.text).toBe(simple('SUMMARY:s'));
+        expect<unknown>(none.report.changes).toEqual([]);
+    });
+
+    test('set DESCRIPTION when only X-ALT-DESC is present adds the text and removes the companion', () => {
+        const result = editResource(simple('X-ALT-DESC:a'), { target: { kind: 'master' }, edits: [{ op: 'set', property: textProperty('DESCRIPTION', 'd') }] });
+        expect(result.text).toBe(simple('DESCRIPTION:d'));
+        expect<unknown>(result.report.changes.map(change => [change.action, change.name, change.reason])).toEqual([['added', 'DESCRIPTION', 'requested'], ['removed', 'X-ALT-DESC', 'paired']]);
+    });
+});
+
+describe('names that only resemble the edited one are never selected (finding 6)', () => {
+    const setSummary: EditPlan = { target: { kind: 'master' }, edits: [{ op: 'set', property: textProperty('SUMMARY', 'new') }] };
+    const replaceSummary: EditPlan = { target: { kind: 'master' }, edits: [{ op: 'replace', property: textProperty('SUMMARY', 'new') }] };
+    const removeSummary: EditPlan = { target: { kind: 'master' }, edits: [{ op: 'remove', name: 'SUMMARY' }] };
+
+    test('grouped names and prefix collisions', () => {
+        for (const lookalike of ['a.SUMMARY:grouped', 'A.summary:grouped', 'SUMMARY-X:suffix', 'X-SUMMARY:prefix', 'SUMMARYX:joined', 'X-APPLE-SUMMARY:x']) {
+            const text = simple(lookalike);
+            expect<unknown>([lookalike, reasonOf(() => editResource(text, replaceSummary))]).toEqual([lookalike, 'property_absent']);
+            expect<unknown>([lookalike, editResource(text, setSummary).text]).toEqual([lookalike, simple(lookalike, 'SUMMARY:new')]);
+            expect<unknown>([lookalike, editResource(text, removeSummary).text]).toEqual([lookalike, text]);
+        }
+    });
+
+    test('lower-case component markers still delimit components: an alarm SUMMARY is never the event SUMMARY', () => {
+        const text = crlf(['begin:vcalendar', 'VERSION:2.0', 'begin:vevent', 'UID:u1', 'DTSTART:20270111T100000Z', 'Begin:Valarm', 'ACTION:DISPLAY', 'TRIGGER:-PT5M', 'SUMMARY:alarm', 'end:valarm', 'end:vevent', 'end:vcalendar']);
+        expect(reasonOf(() => editResource(text, replaceSummary))).toBe('property_absent');
+        expect(editResource(text, setSummary).text).toBe(crlf(['begin:vcalendar', 'VERSION:2.0', 'begin:vevent', 'UID:u1', 'DTSTART:20270111T100000Z', 'SUMMARY:new', 'Begin:Valarm', 'ACTION:DISPLAY', 'TRIGGER:-PT5M', 'SUMMARY:alarm', 'end:valarm', 'end:vevent', 'end:vcalendar']));
+        expect(editResource(text, removeSummary).text).toBe(text);
+        expect<unknown>(describeEvents(text).map(event => [event.begin, event.end, event.alarms])).toEqual([[2, 10, [{ begin: 5, end: 9 }]]]);
+    });
+
+    test('a lower-case summary IS the SUMMARY (names are case-insensitive)', () => {
+        expect(editResource(simple('summary:old'), setSummary).text).toBe(simple('SUMMARY:new'));
+    });
+});
+
+describe('stored escape pairs split at every fold boundary survive untouched (finding 6)', () => {
+    test('\\\\, \\n, \\, and \\; split between the two characters of the pair, or around them', () => {
+        const value = String.raw`a\\b\nc\,d\;e\Nf`;
+        const decoded = 'a\\b\nc,d;e\nf';
+        const logicalLine = `SUMMARY:${value}`;
+        for (let cut = 1; cut < logicalLine.length; cut++) {
+            for (const continuation of [' ', '\t']) {
+                const folded = [logicalLine.slice(0, cut), `${continuation}${logicalLine.slice(cut)}`];
+                const text = crlf(['BEGIN:VCALENDAR', 'VERSION:2.0', 'BEGIN:VEVENT', 'UID:u1', 'DTSTART:20270111T100000Z', ...folded, 'END:VEVENT', 'END:VCALENDAR']);
+                expect<unknown>([cut, valueOf(masterOf(parse(text)), 'summary')]).toEqual([cut, decoded]);
+                const result = editResource(text, { target: { kind: 'master' }, edits: [{ op: 'set', property: sequenceProperty(1) }] });
+                expect<unknown>([cut, result.text]).toEqual([cut, crlf(['BEGIN:VCALENDAR', 'VERSION:2.0', 'BEGIN:VEVENT', 'UID:u1', 'DTSTART:20270111T100000Z', ...folded, 'SEQUENCE:1', 'END:VEVENT', 'END:VCALENDAR'])]);
+                expect<unknown>([cut, valueOf(masterOf(parse(result.text)), 'summary')]).toEqual([cut, decoded]);
+            }
+        }
+    });
+
+    test('a written replacement folded through an escape pair decodes to the client text', () => {
+        for (let pad = 0; pad <= 70; pad++) {
+            const wanted = `${'x'.repeat(pad)}\\;,\n${'y'.repeat(70)}`;
+            const result = editResource(FIXTURE, { target: { kind: 'master' }, edits: [{ op: 'set', property: textProperty('SUMMARY', wanted) }] });
+            expect<unknown>([pad, valueOf(masterOf(parse(result.text)), 'summary')]).toEqual([pad, wanted]);
+        }
+    });
+});

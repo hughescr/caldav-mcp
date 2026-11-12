@@ -720,4 +720,156 @@ describe('RRULE strict lexical grammar', () => {
         expect<unknown>(padded.length).toBe(513);
         expect(reasonOf(() => parseRrule(padded, 'utc'))).toBe('rrule_too_long');
     });
+
+    test('a rule ending in any line terminator is refused, never matched up to the terminator', () => {
+        for (const terminator of ['\n', '\r\n', '\r', ' ', ' ', '\u0085', '\n\n', ' ', '\t']) {
+            for (const rule of ['FREQ=DAILY', 'FREQ=DAILY;COUNT=2', 'FREQ=WEEKLY;BYDAY=MO']) {
+                expect<unknown>([rule, terminator, reasonOf(() => parseRrule(`${rule}${terminator}`, 'utc'))]).toEqual([rule, terminator, 'rrule_syntax']);
+                expect<unknown>([rule, terminator, reasonOf(() => parseRrule(`${terminator}${rule}`, 'utc'))]).toEqual([rule, terminator, 'rrule_syntax']);
+            }
+        }
+        // Inside a value, a terminator after a valid prefix of each sub-grammar is refused as well.
+        for (const rule of ['FREQ=DAILY;COUNT=2\n', 'FREQ=DAILY;UNTIL=20270101T000000Z\n', 'FREQ=WEEKLY;BYDAY=MO\n,TU', 'FREQ=DAILY;INTERVAL=2\r']) {
+            expect<unknown>([rule, reasonOf(() => parseRrule(rule, 'utc'))]).toEqual([rule, 'rrule_syntax']);
+        }
+        for (const offset of ['PT15M\n', 'PT15M\r\n', 'P1W\n', 'P1D\r']) { expect<unknown>([offset, reasonOf(() => parseAlarmOffset(offset))]).toEqual([offset, 'trigger_invalid']); }
+        for (const time of [{ kind: 'utc', utc: '20261201T140000Z\n' }, { kind: 'date', date: '20261201\n' }, { kind: 'zoned', local: '20261201T140000\n', tzid: 'UTC' }] as IcsTime[]) {
+            expect(reasonOf(() => timeProperty('DTSTART', time))).toBe('time_invalid');
+        }
+        expect(reasonOf(() => buildCreateResource({ ...BASE, uid: 'abc\n' }))).toBe('uid_invalid');
+    });
+
+    test('numeric values are compared by decoded meaning: canonical text decodes like the client text', () => {
+        const decoded = (rule: string): unknown => {
+            const text = crlf(['BEGIN:VCALENDAR', 'VERSION:2.0', 'BEGIN:VEVENT', 'UID:u', 'DTSTART:20261201T100000Z', `RRULE:${rule}`, 'END:VEVENT', 'END:VCALENDAR']);
+            return one(master(text), 'rrule').values;
+        };
+        for (const [input, canonical] of [
+            ['FREQ=DAILY;INTERVAL=007', 'FREQ=DAILY;INTERVAL=7'],
+            ['FREQ=DAILY;COUNT=00010', 'FREQ=DAILY;COUNT=10'],
+            ['FREQ=YEARLY;BYMONTHDAY=+31,-01,05', 'FREQ=YEARLY;BYMONTHDAY=+31,-1,5'],
+            ['FREQ=YEARLY;BYSETPOS=001;BYYEARDAY=-066', 'FREQ=YEARLY;BYSETPOS=1;BYYEARDAY=-66'],
+        ] as const) {
+            const written = rruleProperty(input, 'utc').line;
+            expect(written).toBe(`RRULE:${canonical}`);
+            expect<unknown>(decoded(written.slice('RRULE:'.length))).toEqual(decoded(input));
+        }
+        // ical.js refuses a zero-padded BYDAY ordinal; the canonical text is what it reads.
+        expect(rruleProperty('FREQ=MONTHLY;BYDAY=+02MO,-01FR', 'utc').line).toBe('RRULE:FREQ=MONTHLY;BYDAY=+2MO,-1FR');
+        expect<unknown>(decoded('FREQ=MONTHLY;BYDAY=+2MO,-1FR')).toEqual([{ freq: 'MONTHLY', byday: ['+2MO', '-1FR'] }]);
+        expect<unknown>(decoded('FREQ=DAILY;INTERVAL=8')).not.toEqual(decoded('FREQ=DAILY;INTERVAL=7'));
+    });
+});
+
+// ---- Parameter backslashes (security review finding 1) ----
+
+describe('a parameter value is lexically representable only without a backslash', () => {
+    // ical.js un-escapes TZID as TEXT, so `A\nB` would read back with a real LF, `A\,B` as `A,B`, `A\\B` as `A\B`. iCloud's
+    // treatment of a parameter backslash is not measured; the writer refuses every backslash instead of guessing an escape.
+    const BACKSLASHED = [String.raw`A\nB`, String.raw`A\NB`, String.raw`A\,B`, String.raw`A\;B`, String.raw`A\\B`, String.raw`A\B`, '\\', String.raw`America\/New_York`, String.raw`Zone\:x`, String.raw`"A\"`];
+
+    test('every backslash sequence is refused in DTSTART, DTEND and RECURRENCE-ID, and through create', () => {
+        for (const tzid of BACKSLASHED) {
+            for (const name of ['DTSTART', 'DTEND', 'RECURRENCE-ID', 'EXDATE'] as const) {
+                expect<unknown>([tzid, name, reasonOf(() => timeProperty(name, { kind: 'zoned', local: '20261201T100000', tzid }))]).toEqual([tzid, name, 'zone_not_representable']);
+            }
+            expect<unknown>([tzid, reasonOf(() => quoteParameterValue(tzid))]).toEqual([tzid, 'zone_not_representable']);
+            expect<unknown>([tzid, fieldOf(() => buildCreateResource({ ...BASE, start: { kind: 'zoned', local: '20261201T100000', tzid }, end: BASE.end }))]).toEqual([tzid, 'start']);
+            expect<unknown>([tzid, fieldOf(() => buildCreateResource({ ...BASE, start: BASE.start, end: { kind: 'zoned', local: '20261201T103000', tzid } }))]).toEqual([tzid, 'end']);
+        }
+    });
+
+    test('accepted values round-trip exactly through parseOriginalResource: spaces, slashes, colons, commas, semicolons, non-ASCII', () => {
+        const zones = ['America/New_York', 'Pacific Standard Time', ' leading and trailing ', 'GMT+05:30 India', 'Etc/GMT-14', 'A,B', 'A;B', 'a/b:c;d,e', 'Zürich/Ünïcode', '東京/大阪', 'Ελλάδα', '😀 emoji zone', "O'Brien/Time", 'x'.repeat(128)];
+        for (const tzid of zones) {
+            const text = buildCreateResource({
+                ...BASE,
+                start: { kind: 'zoned', local: '20261201T100000', tzid },
+                end: { kind: 'zoned', local: '20261201T103000', tzid },
+            });
+            const event = master(text);
+            expect<unknown>([tzid, event.start]).toEqual([tzid, { kind: 'zoned', local: '2026-12-01T10:00:00', tzid }]);
+            expect<unknown>([tzid, event.end]).toEqual([tzid, { kind: 'zoned', local: '2026-12-01T10:30:00', tzid }]);
+            const rid = timeProperty('RECURRENCE-ID', { kind: 'zoned', local: '20261208T100000', tzid });
+            const series = crlf(['BEGIN:VCALENDAR', 'VERSION:2.0', 'BEGIN:VEVENT', 'UID:u', rid.line, timeProperty('DTSTART', { kind: 'zoned', local: '20261208T100000', tzid }).line, 'END:VEVENT', 'END:VCALENDAR']);
+            const override = parseOriginalResource(series, {}).overrides[0];
+            expect<unknown>([tzid, override?.recurrenceId?.raw.params.get('tzid')]).toEqual([tzid, [tzid]]);
+        }
+    });
+});
+
+// ---- Floating times for a new override (security review finding 4) ----
+
+describe('floating DTSTART/DTEND only for a new override copied from a floating series', () => {
+    const floating = { kind: 'floating', local: '20261208T100000' } as const;
+
+    test('timeProperty refuses floating DTSTART/DTEND by default and writes them with the override option', () => {
+        expect(reasonOf(() => timeProperty('DTSTART', floating))).toBe('time_form_not_allowed');
+        expect(reasonOf(() => timeProperty('DTEND', floating))).toBe('time_form_not_allowed');
+        expect(timeProperty('DTSTART', floating, 'start', { overrideCopy: true }).line).toBe('DTSTART:20261208T100000');
+        expect(timeProperty('DTEND', { kind: 'floating', local: '20261208T110000' }, 'end', { overrideCopy: true }).line).toBe('DTEND:20261208T110000');
+        expect(isWrittenProperty(timeProperty('DTSTART', floating, 'start', { overrideCopy: true }))).toBe(true);
+        // The option never relaxes the stamps or the digits.
+        for (const name of ['DTSTAMP', 'CREATED', 'LAST-MODIFIED'] as const) {
+            expect(reasonOf(() => timeProperty(name, floating, name, { overrideCopy: true }))).toBe('time_form_not_allowed');
+        }
+        expect(reasonOf(() => timeProperty('DTSTART', { kind: 'floating', local: '20261208T100000Z' }, 'start', { overrideCopy: true }))).toBe('time_invalid');
+        expect(reasonOf(() => timeProperty('DTSTART', { kind: 'floating', local: '20261208' }, 'start', { overrideCopy: true }))).toBe('time_invalid');
+        expect(reasonOf(() => timeProperty('DTSTART', floating, 'start', { overrideCopy: false }))).toBe('time_form_not_allowed');
+    });
+
+    test('create input stays refused when floating, whatever the start and end', () => {
+        expect(fieldOf(() => buildCreateResource({ ...BASE, start: floating, end: { kind: 'floating', local: '20261208T110000' } }))).toBe('start');
+        expect(fieldOf(() => buildCreateResource({ ...BASE, start: BASE.start, end: { kind: 'floating', local: '20261208T110000' } }))).toBe('end');
+        expect(reasonOf(() => buildCreateResource({ ...BASE, start: floating, end: { kind: 'floating', local: '20261208T110000' } }))).toBe('time_form_not_allowed');
+    });
+
+    test('a floating override round-trips as floating', () => {
+        const series = crlf(['BEGIN:VCALENDAR', 'VERSION:2.0', 'BEGIN:VEVENT', 'UID:u',
+            timeProperty('RECURRENCE-ID', floating).line,
+            timeProperty('DTSTART', { kind: 'floating', local: '20261208T113000' }, 'start', { overrideCopy: true }).line,
+            timeProperty('DTEND', { kind: 'floating', local: '20261208T120000' }, 'end', { overrideCopy: true }).line,
+            'END:VEVENT', 'END:VCALENDAR']);
+        const override = parseOriginalResource(series, {}).overrides[0];
+        expect<unknown>(override?.start).toEqual({ kind: 'floating', local: '2026-12-08T11:30:00' });
+        expect<unknown>(override?.end).toEqual({ kind: 'floating', local: '2026-12-08T12:00:00' });
+    });
+});
+
+// ---- Escapes across fold boundaries (security review finding 6) ----
+
+describe('escape pairs split at every fold boundary still round-trip', () => {
+    test('a written SUMMARY with \\\\, \\n, \\, and \\; straddling each cut decodes to the client text', () => {
+        for (const pair of ['\\', '\n', ',', ';']) {
+            for (let pad = 0; pad <= 80; pad++) {
+                // `SUMMARY:` is 8 octets; padding moves the escape across the 75-octet cut and the next one.
+                const value = `${'p'.repeat(pad)}${pair}${'q'.repeat(70)}${pair}end`;
+                const text = buildCreateResource({ ...BASE, title: value });
+                const physical = physicalLines(text);
+                assertFolded(physical);
+                expect<unknown>([pair, pad, one(master(text), 'summary').values]).toEqual([pair, pad, [value]]);
+            }
+        }
+    });
+
+    test('NEL, U+2028, U+2029 and a BOM in TEXT read back unchanged locally (iCloud behaviour not measured)', () => {
+        for (const character of ['\u0085', ' ', ' ', '﻿']) {
+            const value = `a${character}b${character}`;
+            const text = buildCreateResource({ ...BASE, title: value, description: `${character}x` });
+            expect<unknown>(physicalLines(text).filter(line => line.startsWith('SUMMARY'))).toEqual([`SUMMARY:${value}`]);
+            const event = master(text);
+            expect<unknown>(one(event, 'summary').values).toEqual([value]);
+            expect<unknown>(one(event, 'description').values).toEqual([`${character}x`]);
+        }
+    });
+
+    test('multi-octet text next to an escape at the cut', () => {
+        for (let pad = 0; pad <= 40; pad++) {
+            const value = `${'é'.repeat(pad)}\\,ü\n${'日'.repeat(30)};`;
+            const text = buildCreateResource({ ...BASE, title: value, description: value, location: value });
+            assertFolded(physicalLines(text));
+            const event = master(text);
+            for (const name of ['summary', 'location', 'description']) { expect<unknown>([pad, name, one(event, name).values]).toEqual([pad, name, [value]]); }
+        }
+    });
 });

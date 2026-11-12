@@ -5,11 +5,14 @@
  * Injection safety rests on four rules:
  * - property, parameter and component names are code constants; client text is never a name;
  * - client TEXT is escaped (`\\`, `\;`, `\,`, line breaks as `\n`) and refused when it holds C0 controls other than TAB,
- *   CR and LF, DEL or lone surrogates; TZID is the only client parameter value and can never hold DQUOTE or `^`;
+ *   CR and LF, DEL or lone surrogates; TZID is the only client parameter value and can never hold DQUOTE, `^` or `\`;
  * - time values are written only from validated digits, RRULE only after the strict grammar re-serialises it from parsed
  *   parts, and alarm offsets only after the exact duration grammar;
  * - every logical line is asserted free of CR and LF before it is folded at 75 octets on code-point boundaries, so no
  *   physical line ever splits a UTF-8 sequence (iCloud corrupts text folded inside one, probe Run 7).
+ *
+ * Measured versus assumed: round trips here are checked against the local parser only. iCloud's handling of NEL, U+2028,
+ * U+2029 and a BOM inside TEXT, and of a backslash in a parameter value (refused here), is NOT measured.
  *
  * Every exported function either returns a complete value or throws {@link IcsWriteError}; no other exception and no
  * partially built string ever escapes. Written properties and components are frozen and registered, so the span editor
@@ -100,6 +103,18 @@ function property(name: string, line: string): WrittenProperty {
     return written;
 }
 
+// ---- Grammar matching ----
+
+/**
+ * The match of an anchored grammar only when it spans the whole text. JavaScript's `$` without the `m` flag already matches
+ * only at the end of input (never before a trailing LF, unlike Perl or Python), but every grammar check here also compares
+ * the match length, so no regex flag or edit can make a prefix match pass.
+ */
+function wholeMatch(re: RegExp, text: string): RegExpExecArray | null {
+    const match = re.exec(text);
+    return match !== null && match.index === 0 && match[0].length === text.length ? match : null;
+}
+
 // ---- Lines and folding ----
 
 const NAME_RE = /^[A-Z][A-Z0-9-]*$/u;
@@ -108,7 +123,7 @@ const NAME_RE = /^[A-Z][A-Z0-9-]*$/u;
 function assertLogicalLine(line: string): void {
     if (typeof line !== 'string' || !line.isWellFormed() || /[\r\n]/u.test(line)) { throw new IcsWriteError('line_invalid'); }
     const nameEnd = line.search(/[;:]/u);
-    if (nameEnd < 1 || !NAME_RE.test(line.slice(0, nameEnd))) { throw new IcsWriteError('line_invalid'); }
+    if (nameEnd < 1 || wholeMatch(NAME_RE, line.slice(0, nameEnd)) === null) { throw new IcsWriteError('line_invalid'); }
 }
 
 function codePointOctets(codePoint: number): number {
@@ -157,7 +172,9 @@ const FORBIDDEN_TEXT_RE = /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/u;
 /**
  * RFC 5545 TEXT escaping (design 6.2): `\` to `\\`, `;` to `\;`, `,` to `\,`, each CRLF, CR or LF to `\n`; TAB is kept.
  * Lone surrogates, DEL and the other C0 controls are refused with `text_not_representable`. No Unicode normalisation:
- * bidi controls, C1 controls and U+2028/U+2029 pass through as text.
+ * bidi controls, C1 controls (NEL U+0085 included), U+2028/U+2029 and U+FEFF (BOM) pass through as text. The local parser
+ * (ical.js through `parseOriginalResource`) reads them back unchanged and never treats them as line breaks; iCloud's
+ * behaviour for NEL, U+2028, U+2029 and a BOM inside TEXT is NOT measured.
  */
 export function escapeText(value: string, field: string | null = null): string {
     if (typeof value !== 'string' || !value.isWellFormed() || FORBIDDEN_TEXT_RE.test(value)) { throw new IcsWriteError('text_not_representable', field); }
@@ -177,13 +194,20 @@ export function textProperty(name: TextPropertyName, value: string, field: strin
 
 // ---- Parameter values ----
 
-// Every C0 control (TAB included), DEL, DQUOTE and the RFC 6868 caret.
+// Every C0 control (TAB included), DEL, DQUOTE, the RFC 6868 caret and the backslash.
 // oxlint-disable-next-line no-control-regex -- matching control characters is the point
-const FORBIDDEN_PARAMETER_RE = /[\u0000-\u001F\u007F"^]/u;
+const FORBIDDEN_PARAMETER_RE = /[\u0000-\u001F\u007F"^\\]/u;
 
 /**
- * The TZID parameter value as written (design 4.1, 6.2): 1–128 UTF-16 units of well-formed text without C0, DEL, DQUOTE or
- * `^`, DQUOTE-quoted when it holds `;`, `:` or `,`. A DQUOTE can never appear inside, so a value can never close its quote.
+ * The TZID parameter value as written (design 4.1, 6.2): 1–128 UTF-16 units of well-formed text without C0, DEL, DQUOTE,
+ * `^` or `\`, DQUOTE-quoted when it holds `;`, `:` or `,`. A DQUOTE can never appear inside, so a value can never close its
+ * quote.
+ *
+ * The backslash is refused because this project's parser does not read it back as written: ical.js un-escapes TZID like
+ * TEXT, so `A\nB` reads as A, LF, B and `A\,B`, `A\;B`, `A\\B` as `A,B`, `A;B`, `A\B`. A RECURRENCE-ID written with such a
+ * zone would no longer match its own line text, and the editor's agreement check (`tree_mismatch`) would refuse every later
+ * edit. This is lexical representability, not zone recognition; no escaping (doubling) is attempted, since iCloud's own
+ * treatment of a backslash in a parameter value is NOT measured (only the local parser's behaviour is known).
  */
 export function quoteParameterValue(value: string, field: string | null = null): string {
     if (typeof value !== 'string' || value === '' || value.length > MAX_ZONE_LENGTH || !value.isWellFormed() || FORBIDDEN_PARAMETER_RE.test(value)) {
@@ -197,7 +221,8 @@ export function quoteParameterValue(value: string, field: string | null = null):
 /**
  * A validated time in basic iCalendar digits. Normalisation from the client's five input forms happens elsewhere
  * (`write-time.ts`); an offset arrives here already as the UTC instant. `floating` exists only for values copied in a
- * floating master's form (EXDATE, RECURRENCE-ID); a client time is never floating.
+ * floating master's form (EXDATE, RECURRENCE-ID, and a new override's DTSTART/DTEND copied from iCloud's expanded
+ * occurrence, see {@link TimePropertyOptions}); a client time is never floating.
  */
 export type IcsTime =
     | { kind: 'utc'; utc: string }
@@ -210,17 +235,19 @@ export type TimePropertyName = 'DTSTART' | 'DTEND' | 'EXDATE' | 'RECURRENCE-ID' 
 
 const STAMP_PROPERTIES: ReadonlySet<string> = new Set(['DTSTAMP', 'CREATED', 'LAST-MODIFIED']);
 const FLOATING_ALLOWED: ReadonlySet<string> = new Set(['EXDATE', 'RECURRENCE-ID']);
+/** Floating only with {@link TimePropertyOptions.overrideCopy}. */
+const FLOATING_FOR_OVERRIDE: ReadonlySet<string> = new Set(['DTSTART', 'DTEND']);
 
 const BASIC_DATE_RE = /^(\d{4})(\d{2})(\d{2})$/u;
 const BASIC_LOCAL_RE = /^(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})$/u;
 
 function validBasicDate(text: string): boolean {
-    const match = BASIC_DATE_RE.exec(text);
+    const match = wholeMatch(BASIC_DATE_RE, text);
     return match !== null && isValidDateText(`${match[1]}-${match[2]}-${match[3]}`);
 }
 
 function validBasicLocal(text: string): boolean {
-    const match = BASIC_LOCAL_RE.exec(text);
+    const match = wholeMatch(BASIC_LOCAL_RE, text);
     return match !== null && isValidLocalText(`${match[1]}-${match[2]}-${match[3]}T${match[4]}:${match[5]}:${match[6]}`);
 }
 
@@ -249,13 +276,24 @@ function timeParts(time: IcsTime, field: string | null): { parameters: string; v
     }
 }
 
+export interface TimePropertyOptions {
+    /**
+     * Set only while building a NEW override of a floating-time series: its DTSTART/DTEND are copied from iCloud's expanded
+     * occurrence, which is floating like the master (design 3.3). Allows `floating` for DTSTART and DTEND; nothing else
+     * changes. Never set for client input: `buildCreateResource` does not pass it and refuses floating times itself.
+     */
+    readonly overrideCopy?: boolean | undefined;
+}
+
 /**
- * A DATE or DATE-TIME property. Server stamps (`DTSTAMP`, `CREATED`, `LAST-MODIFIED`) must be UTC; floating is allowed only
- * for `EXDATE` and `RECURRENCE-ID` in a floating master's form. The form is checked before the digits.
+ * A DATE or DATE-TIME property. Server stamps (`DTSTAMP`, `CREATED`, `LAST-MODIFIED`) must be UTC; floating is allowed for
+ * `EXDATE` and `RECURRENCE-ID` in a floating master's form, and for `DTSTART`/`DTEND` only with `overrideCopy`. The form is
+ * checked before the digits.
  */
-export function timeProperty(name: TimePropertyName, time: IcsTime, field: string | null = name): WrittenProperty {
+export function timeProperty(name: TimePropertyName, time: IcsTime, field: string | null = name, options: TimePropertyOptions = {}): WrittenProperty {
     const kind = typeof time === 'object' && time !== null ? time.kind : undefined;
-    if ((STAMP_PROPERTIES.has(name) && kind !== 'utc') || (kind === 'floating' && !FLOATING_ALLOWED.has(name))) {
+    const floatingAllowed = FLOATING_ALLOWED.has(name) || (options.overrideCopy === true && FLOATING_FOR_OVERRIDE.has(name));
+    if ((STAMP_PROPERTIES.has(name) && kind !== 'utc') || (kind === 'floating' && !floatingAllowed)) {
         throw new IcsWriteError('time_form_not_allowed', field);
     }
     const { parameters, value } = timeParts(time, field);
@@ -268,7 +306,7 @@ const UID_RE = /^[A-Za-z0-9._~@+=-]+$/u;
 
 /** A UID from the server's deterministic generator: 1–255 characters of `[A-Za-z0-9._~@+=-]`, no escaping ever needed. */
 export function uidProperty(uid: string, field: string | null = 'UID'): WrittenProperty {
-    if (typeof uid !== 'string' || uid.length > MAX_UID_LENGTH || !UID_RE.test(uid)) { throw new IcsWriteError('uid_invalid', field); }
+    if (typeof uid !== 'string' || uid.length > MAX_UID_LENGTH || wholeMatch(UID_RE, uid) === null) { throw new IcsWriteError('uid_invalid', field); }
     return property('UID', `UID:${uid}`);
 }
 
@@ -303,7 +341,7 @@ const ALARM_OFFSET_RE = /^P(?:(\d{1,4})W|(\d{1,4})D(?:T(?:(\d{1,4})H)?(?:(\d{1,4
  */
 export function parseAlarmOffset(text: string, field: string | null = 'TRIGGER'): string {
     if (typeof text !== 'string') { throw new IcsWriteError('trigger_invalid', field); }
-    const match = ALARM_OFFSET_RE.exec(text);
+    const match = wholeMatch(ALARM_OFFSET_RE, text);
     if (match === null) { throw new IcsWriteError('trigger_invalid', field); }
     const afterT = text.indexOf('T');
     if (afterT !== -1 && !/\d/u.test(text.slice(afterT + 1))) { throw new IcsWriteError('trigger_invalid', field); }
@@ -356,7 +394,7 @@ const RRULE_KEYS: ReadonlySet<string> = new Set<RruleKey>([
 
 /** Canonical decimal text of one bounded number, or null. A `+` sign is kept as written; `-0` and `+0` are never valid. */
 function boundedNumber(text: string, rule: NumberRule): string | null {
-    const match = (rule.signed ? /^([+-]?)(\d+)$/u : /^()(\d+)$/u).exec(text);
+    const match = wholeMatch(rule.signed ? /^([+-]?)(\d+)$/u : /^()(\d+)$/u, text);
     if (match === null) { return null; }
     const digits = match[2] ?? '';
     if (digits.length > rule.digits) { return null; }
@@ -372,7 +410,7 @@ function listItems(value: string): string[] | null {
 }
 
 function byDay(item: string): string | null {
-    const match = /^(?:([+-]?)(\d{1,2}))?([A-Z]{2})$/u.exec(item);
+    const match = wholeMatch(/^(?:([+-]?)(\d{1,2}))?([A-Z]{2})$/u, item);
     if (match === null || !WEEKDAYS.has(match[3] ?? '')) { return null; }
     if (match[2] === undefined) { return match[3] ?? null; }
     const ordinal = Number(match[2]);
@@ -389,10 +427,10 @@ const UNTIL_SHAPES: Readonly<Record<StartForm, RegExp>> = {
 
 /** UNTIL form follows the start (RFC 5545: UTC when DTSTART is UTC or zoned, a DATE for a DATE start, floating digits for floating). */
 function untilValue(value: string, startForm: StartForm, field: string | null): string {
-    if (!/^\d{8}(?:T\d{6}Z?)?$/u.test(value)) { throw new IcsWriteError('rrule_value', field); }
+    if (wholeMatch(/^\d{8}(?:T\d{6}Z?)?$/u, value) === null) { throw new IcsWriteError('rrule_value', field); }
     const shape = UNTIL_SHAPES[startForm];
     if (shape === undefined) { throw new IcsWriteError('rrule_until_form', field); }
-    if (!shape.test(value)) { throw new IcsWriteError('rrule_until_form', field); }
+    if (wholeMatch(shape, value) === null) { throw new IcsWriteError('rrule_until_form', field); }
     const valid = value.length === 8 ? validBasicDate(value) : value.endsWith('Z') ? validBasicUtc(value) : validBasicLocal(value);
     if (!valid) { throw new IcsWriteError('rrule_value', field); }
     return value;
@@ -421,11 +459,11 @@ export function parseRrule(text: string, startForm: StartForm, field: string | n
     if (typeof text !== 'string') { throw new IcsWriteError('rrule_syntax', field); }
     if (text.length > MAX_RRULE_LENGTH) { throw new IcsWriteError('rrule_too_long', field); }
     // ASCII only before upper-casing, so no locale or special casing (U+0131, U+0130, ß) can manufacture a keyword.
-    if (!/^[A-Za-z0-9,;=+-]+$/u.test(text)) { throw new IcsWriteError('rrule_syntax', field); }
+    if (wholeMatch(/^[A-Za-z0-9,;=+-]+$/u, text) === null) { throw new IcsWriteError('rrule_syntax', field); }
     const seen = new Set<string>();
     const parts: RrulePart[] = [];
     for (const part of text.toUpperCase().split(';')) {
-        const match = /^([A-Z]+)=([^=]*)$/u.exec(part);
+        const match = wholeMatch(/^([A-Z]+)=([^=]*)$/u, part);
         if (match === null) { throw new IcsWriteError('rrule_syntax', field); }
         const key = match[1] ?? '';
         if (!RRULE_KEYS.has(key)) { throw new IcsWriteError('rrule_unknown_part', field); }
