@@ -3,6 +3,7 @@ import { accountIdFor } from '../src/account';
 import { connectionAAD } from '../src/auth/crypto';
 import { TemporaryUnavailable, type Sealed, type UpstreamCredentials } from '../src/auth/contracts';
 import { CalDavError } from '../src/caldav/contracts';
+import { PAGE_STYLE_SOURCE } from '../src/auth/page-style';
 import { FAKE_DISCOVERY } from './helpers/fake-caldav';
 import { ACCOUNT_ID, APPLE_ID, OTHER_APPLE_ID, PASSWORD, callTool, connect, everything, issuer, setup, start, submit, tokenRequest, type Env } from './helpers/http-env';
 
@@ -31,22 +32,24 @@ describe('single-page login and consent', () => {
     test('one page shows client, identity, redirect, scopes and both credential fields with safe autocomplete', async () => {
         const env = setup({ scope: 'calendar:read calendar:write' });
         const { html, response } = await start(env);
-        expect(response.headers.get('content-security-policy')).toBe("default-src 'none'; form-action 'self' http://127.0.0.1:5678; frame-ancestors 'none'; base-uri 'none'");
+        expect(response.headers.get('content-security-policy')).toBe(`default-src 'none'; style-src ${PAGE_STYLE_SOURCE}; form-action 'self' http://127.0.0.1:5678; frame-ancestors 'none'; base-uri 'none'`);
         expect(response.headers.get('cache-control')).toBe('no-store');
-        expect(html).toContain('&lt;Client&gt; (Registered OAuth client)');
-        expect(html).toContain('Redirect destination: 127.0.0.1');
-        expect(html).toContain('<li>calendar:read');
-        expect(html).toContain('<li>calendar:write');
+        expect(html).toContain('<strong>&lt;Client&gt;</strong> (Registered OAuth client)');
+        expect(html).toContain('Redirect destination · <span class="host">127.0.0.1</span>');
+        expect(html).toContain('<li class="permission"><span>Read your calendars and events<small>calendar:read</small></span></li>');
+        expect(html).toContain('<small>calendar:write</small>');
+        expect(html).not.toMatch(/<li[^>]*>(?:(?!<\/li>)[^])*<input/);
         expect(html).toContain('<form method="post" action="/auth/connect">');
-        expect(html).toMatch(/<input name="apple_id" type="email" autocomplete="username"[^>]* required/);
-        expect(html).toMatch(/<input name="app_password" type="password" autocomplete="off"[^>]* maxlength="256" required/);
-        expect(html).toContain('Use an app-specific password created only for this connector, never your main Apple Account password.');
-        expect(html).toContain('<button name="decision" value="allow">Connect and allow</button>');
-        expect(html).toContain('<button name="decision" value="cancel" formnovalidate>Cancel</button>');
+        expect(html).toMatch(/<input id="apple" name="apple_id" type="email" autocomplete="username"[^>]* required/);
+        expect(html).toMatch(/<input id="password" name="app_password" type="password" autocomplete="off"[^>]* maxlength="256"[^>]* required/);
+        expect(html).toContain('Never use your main Apple Account password.');
+        expect(html).toContain('Your password is stored encrypted and used only to talk to iCloud.');
+        expect(html).toContain('<button class="primary" name="decision" value="allow">Connect and allow</button>');
+        expect(html).toContain('<button class="secondary" name="decision" value="cancel" formnovalidate>Cancel</button>');
         expect(html.indexOf('value="allow"')).toBeLessThan(html.indexOf('value="cancel"'));
         expect(html).not.toContain('totp');
         expect(html).not.toContain('allow_invite');
-        expect(html).not.toMatch(/<script|<link|<img|<style|\ssrc=|\shref=/);
+        expect(html).not.toMatch(/<script|<link|<img/);
     });
 
     test('the flow cookie is a sealed, Secure, HttpOnly, SameSite=Lax value holding only deadline, csrf, flowId and binding', async () => {
@@ -302,7 +305,8 @@ describe('duplicate delivery and reconnect', () => {
     test('the invite checkbox is required exactly when calendar:invite is requested', async () => {
         const env = setup({ scope: 'calendar:invite' });
         const form = await start(env);
-        expect(form.html).toContain('<label><input type="checkbox" name="allow_invite" value="yes" required>');
+        expect(form.html).toContain('<label class="permission"><input type="checkbox" name="allow_invite" value="yes" required><span><em>Sensitive</em>Allow saving events that can send invitations to other people</span></label>');
+        expect(form.html.match(/type="checkbox"/g)).toHaveLength(1);
         for (const value of [undefined, 'no', '']) {
             expect((await submit(env, form, value === undefined ? {} : { extra: { allow_invite: value } })).status).toBe(400);
         }

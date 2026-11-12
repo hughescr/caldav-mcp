@@ -149,7 +149,7 @@ test('published Claude CIMD reaches login while extra JWT grant capabilities rem
     const params = new URLSearchParams(env.params); params.set('client_id', metadata.client_id); params.set('redirect_uri', metadata.redirect_uris[0] ?? '');
     const begin = await env.app.request('/authorize?' + params);
     expect(begin.status).toBe(200); const html = await begin.text();
-    expect(html).toContain('Connect your iCloud calendar'); expect(html).toContain('Claude (claude.ai)');
+    expect(html).toContain('Connect your iCloud calendar'); expect(html).toContain('<strong>Claude</strong> (claude.ai)');
     expect(begin.headers.get('set-cookie')).toContain('__Host-caldav-flow=');
     expect(env.caldav.count()).toBe(0); expect(fetches).toBe(1);
     const fields = new URLSearchParams({ client_id: metadata.client_id, resource: issuer + '/mcp', grant_type: 'urn:ietf:params:oauth:grant-type:jwt-bearer', assertion: 'eyJhbGciOiJSUzI1NiJ9.eyJpc3MiOiJmaXh0dXJlIiwic3ViIjoiZml4dHVyZSJ9.c2lnbmF0dXJl' });

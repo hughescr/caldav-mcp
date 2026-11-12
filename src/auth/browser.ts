@@ -7,6 +7,7 @@ import { AUTH_FIELDS, authorization, form, required, unique, type Authorization 
 import { connectionAAD, digest, equal, randomId } from './crypto';
 import { OAuthError, type Connection, type Sealed, type UpstreamCredentials } from './contracts';
 import { LoginThrottle, type LoginReservation } from './throttle';
+import { PAGE_STYLE, PAGE_STYLE_SOURCE } from './page-style';
 const COOKIE = '__Host-caldav-flow';
 /** The flow cookie never carries credentials: the password exists only in the connect POST and the sealed store record. */
 interface Flow { deadline: number; csrf: string; flowId: string; binding: string }
@@ -37,34 +38,36 @@ function read(context: Context, runtime: AuthRuntime): Flow {
     } catch { throw new OAuthError('invalid_request'); }
 }
 function page(context: Context, title: string, body: string, callbackOrigin?: string) {
-    context.header('Content-Security-Policy', `default-src 'none'; form-action 'self'${callbackOrigin ? ` ${callbackOrigin}` : ''}; frame-ancestors 'none'; base-uri 'none'`);
+    context.header('Content-Security-Policy', `default-src 'none'; style-src ${PAGE_STYLE_SOURCE}; form-action 'self'${callbackOrigin ? ` ${callbackOrigin}` : ''}; frame-ancestors 'none'; base-uri 'none'`);
     context.header('Referrer-Policy', 'same-origin');
-    return context.html(`<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>${escape(title)}</title><main><h1>${escape(title)}</h1>${body}</main></html>`);
+    return context.html(`<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${escape(title)} · caldav-mcp</title><style>${PAGE_STYLE}</style></head><body><main><header><div class="brand">caldav-mcp</div><h1>${escape(title)}</h1></header>${body}</main></body></html>`);
 }
 /** Terminal pages are static text: they never echo a submitted field, so they cannot reflect a password. */
+const FAILURE_HEADING = { 400: 'Sign-in failed', 429: 'Please wait', 503: 'Temporary failure · 503' } as const;
 function failure(context: Context, runtime: AuthRuntime, status: 400 | 429 | 503, message: string) {
     cookie(context, runtime);
     context.status(status);
-    return page(context, 'Connection not completed', `<p>${escape(message)}</p>`);
+    return page(context, 'Connection not completed', `<section class="terminal" aria-labelledby="result"><h2 id="result">${FAILURE_HEADING[status]}</h2><p>${escape(message)}</p></section>`);
 }
 function render(context: Context, runtime: AuthRuntime, auth: Authorization, flow: Flow) {
     cookie(context, runtime, flow);
     const hidden = [...Object.entries(auth.fields), ['csrf', flow.csrf]].map(([key, value]) => `<input type="hidden" name="${escape(key ?? '')}" value="${escape(value ?? '')}">`).join('');
     const identity = auth.client.clientId.startsWith('https://') ? new URL(auth.client.clientId).hostname : 'Registered OAuth client';
-    const scopes = auth.scopes.map(scope => `<li>${escape(scope)}: ${escape(SCOPE_TEXT[scope] ?? scope)}</li>`).join('');
-    const invite = auth.scopes.includes('calendar:invite') ? '<p><label><input type="checkbox" name="allow_invite" value="yes" required> Allow saving events that can send invitations to other people</label></p>' : '';
+    // Granted scopes are plain list rows, not inputs: there is no choice to make about them.
+    const scopes = auth.scopes.map(scope => `<li class="permission"><span>${escape(SCOPE_TEXT[scope] ?? scope)}<small>${escape(scope)}</small></span></li>`).join('');
+    const invite = auth.scopes.includes('calendar:invite') ? '<label class="permission"><input type="checkbox" name="allow_invite" value="yes" required><span><em>Sensitive</em>Allow saving events that can send invitations to other people</span></label>' : '';
     return page(context, 'Connect your iCloud calendar', [
-        `<p>${escape(auth.client.name)} (${escape(identity)}) requests access to your iCloud calendar.</p>`,
-        `<p>Redirect destination: ${escape(new URL(auth.redirectUri).hostname)}</p>`,
-        `<p>Requested permissions:</p><ul>${scopes}</ul>`,
-        '<p>Keep this connection for up to 180 days. iCloud may require reconnection sooner, for example if the app-specific password is revoked.</p>',
+        `<div class="request"><strong>${escape(auth.client.name)}</strong> (${escape(identity)}) requests access to your iCloud calendar<small>Redirect destination · <span class="host">${escape(new URL(auth.redirectUri).hostname)}</span></small></div>`,
         `<form method="post" action="/auth/connect">${hidden}`,
-        '<p><label>Apple ID <input name="apple_id" type="email" autocomplete="username" autocapitalize="none" spellcheck="false" maxlength="255" required></label></p>',
-        '<p><label>App-specific password <input name="app_password" type="password" autocomplete="off" autocapitalize="none" spellcheck="false" maxlength="256" required></label></p>',
-        '<p>Use an app-specific password created only for this connector, never your main Apple Account password.</p>',
-        invite,
-        '<button name="decision" value="allow">Connect and allow</button>',
-        '<button name="decision" value="cancel" formnovalidate>Cancel</button></form>',
+        '<section class="section"><h2>Sign in to iCloud</h2>',
+        '<label class="field" for="apple">Apple ID <input id="apple" name="apple_id" type="email" autocomplete="username" autocapitalize="none" spellcheck="false" maxlength="255" required></label>',
+        '<label class="field" for="password">App-specific password <input id="password" name="app_password" type="password" autocomplete="off" autocapitalize="none" spellcheck="false" maxlength="256" aria-describedby="password-help" required></label>',
+        '<p id="password-help" class="help">Create one at account.apple.com → Sign-In and Security → App-Specific Passwords, only for this connector. Never use your main Apple Account password.</p></section>',
+        `<section class="permissions"><h2>Requested permissions</h2><div class="rows"><ul>${scopes}</ul>${invite}</div></section>`,
+        '<p class="help">Keep this connection for up to 180 days. iCloud may require reconnection sooner, for example if the app-specific password is revoked.</p>',
+        '<p class="privacy">Your password is stored encrypted and used only to talk to iCloud.</p>',
+        '<div class="actions"><button class="primary" name="decision" value="allow">Connect and allow</button>',
+        '<button class="secondary" name="decision" value="cancel" formnovalidate>Cancel</button></div></form>',
     ].join(''), new URL(auth.redirectUri).origin);
 }
 function redirect(context: Context, runtime: AuthRuntime, auth: Authorization, values: Record<string, string>) {
