@@ -14,6 +14,7 @@ import {
 } from './limits';
 import type { EventTime } from './model';
 import { civilStartText } from './time-core';
+import { deleteEventResultSchema, writeEventResultSchema, type DeleteEventResult, type WriteEventResult } from './write-schemas';
 
 /**
  * What the sole result builder needs to measure the real serialized JSON-RPC response, not an estimate of it.
@@ -105,7 +106,7 @@ function errorResult(code: 'result_too_large' | 'upstream_error'): CallToolResul
 }
 
 /** Structured content, its full JSON text copy first (text-only clients see everything), then fixed notices. */
-function toolResult(payload: EventsOutput | GetEventOutput | DownloadOutput, notices: readonly string[]): CallToolResult {
+function toolResult(payload: EventsOutput | GetEventOutput | DownloadOutput | WriteEventResult | DeleteEventResult, notices: readonly string[]): CallToolResult {
     return {
         structuredContent: payload,
         content: [{ type: 'text', text: JSON.stringify(payload) }, ...notices.map(text => ({ type: 'text' as const, text }))],
@@ -293,6 +294,64 @@ export function shapeEventDetail(result: DetailReadResult, options: DetailShapeO
 
     const shaped = build(state);
     return getEventOutputSchema.safeParse(shaped.structuredContent).success ? shaped : errorResult('upstream_error');
+}
+
+// ---- create_event / update_event / delete_event ----
+
+interface EventTextState { attendees: number; description: number; location: number; title: number }
+
+function withEventCut(event: FullEvent, state: EventTextState): FullEvent {
+    const cut: FullEvent = { ...event, attendees: event.attendees.slice(0, state.attendees) };
+    if (cut.attendees.length < event.attendees.length) { cut.attendees_truncated = true; }
+    for (const [field, flag] of [['description', 'description_truncated'], ['location', 'location_truncated'], ['title', 'title_truncated']] as const) {
+        const value = event[field];
+        if (value !== null && state[field] < value.length) {
+            cut[field] = unitPrefix(value, state[field]);
+            cut[flag] = true;
+        }
+    }
+    return cut;
+}
+
+/**
+ * The write result with its event shortened like get_event's (attendee suffix, then description, location, title
+ * prefixes) until the whole response fits 96 KiB. The outcome fields are never cut: if even a fully shortened event
+ * cannot fit, the event is left out and the result says `readback: "unavailable"`, so an applied write is never reported
+ * as a failure.
+ */
+export function shapeWriteResult(result: WriteEventResult, options: DetailShapeOptions): CallToolResult {
+    if (!writeEventResultSchema.safeParse(result).success) { return errorResult('upstream_error'); }
+    const { wire } = options;
+    const source = result.event;
+    const build = (event: FullEvent | null): CallToolResult => toolResult(event === null
+        ? { ...result, readback: 'unavailable', stored_differs_from_request: null, event: null }
+        : { ...result, event }, []);
+    if (source === null) { return fits(build(null), wire) ? build(null) : errorResult('upstream_error'); }
+    const state: EventTextState = { attendees: source.attendees.length, description: source.description?.length ?? 0, location: source.location?.length ?? 0, title: source.title?.length ?? 0 };
+    const attempt = (candidate: EventTextState): boolean => fits(build(withEventCut(source, candidate)), wire);
+    if (!attempt(state)) {
+        let fitted = false;
+        for (const key of ['attendees', 'description', 'location', 'title'] as const) {
+            const full = state[key];
+            if (full === 0) { continue; }
+            if (attempt({ ...state, [key]: 0 })) {
+                state[key] = largestFitting(0, full - 1, amount => attempt({ ...state, [key]: amount }));
+                fitted = true;
+                break;
+            }
+            state[key] = 0;
+        }
+        if (!fitted && !attempt(state)) { return fits(build(null), wire) ? build(null) : errorResult('upstream_error'); }
+    }
+    const shaped = build(withEventCut(source, state));
+    return writeEventResultSchema.safeParse(shaped.structuredContent).success ? shaped : errorResult('upstream_error');
+}
+
+/** The delete result: fixed fields and identifiers only; validated, never cut. */
+export function shapeDeleteResult(result: DeleteEventResult, options: DetailShapeOptions): CallToolResult {
+    if (!deleteEventResultSchema.safeParse(result).success) { return errorResult('upstream_error'); }
+    const shaped = toolResult(result, []);
+    return fits(shaped, options.wire) ? shaped : errorResult('upstream_error');
 }
 
 // ---- get_event_attachment_download ----

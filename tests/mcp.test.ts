@@ -60,6 +60,9 @@ function fixture() {
         search_events: async () => { calls++; return emptyRead; },
         get_event: async () => { calls++; return detailRead; },
         get_event_attachment_download: async () => { calls++; return stagedDownload; },
+        create_event: async () => { calls++; throw new CalendarError('temporarily_unavailable'); },
+        update_event: async () => { calls++; throw new CalendarError('temporarily_unavailable'); },
+        delete_event: async () => { calls++; throw new CalendarError('temporarily_unavailable'); },
     };
     const rpc = async (method: string, params?: Record<string, unknown>, scopes = ['calendar:read'], headers: Record<string, string> = {}) => {
         const authInfo: AuthInfo = { token: 'synthetic-oauth-token', clientId: 'verified-client', scopes, resource: new URL('https://service.example/mcp') };
@@ -120,12 +123,19 @@ test('browser preflight permits the required modern SDK method/name headers with
     for (const header of ['authorization', 'content-type', 'mcp-protocol-version', 'mcp-method', 'mcp-name']) { expect(allowed).toContain(header); }
 });
 
-test('the server is caldav-mcp and lists exactly five read-only calendar tools', async () => {
+test('the server is caldav-mcp and lists five read-only and three write calendar tools', async () => {
     const f = fixture();
     const init = await f.rpc('initialize', { protocolVersion: '2025-11-25', capabilities: {}, clientInfo: { name: 'test', version: '0' } });
     expect(init.result.serverInfo.name).toBe('caldav-mcp');
-    const reply = await f.rpc('tools/list');
-    expect(reply.result.tools.map((tool: { name: string }) => tool.name)).toEqual(['list_calendars', 'list_events', 'search_events', 'get_event', 'get_event_attachment_download']);
+    const all = (await f.rpc('tools/list')).result.tools;
+    expect(all.map((tool: { name: string }) => tool.name)).toEqual(['list_calendars', 'list_events', 'search_events', 'get_event', 'get_event_attachment_download', 'create_event', 'update_event', 'delete_event']);
+    const writes = all.slice(5);
+    expect(writes.map((tool: { annotations: unknown }) => tool.annotations)).toEqual([
+        { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+        { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: true },
+        { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: true },
+    ]);
+    const reply = { result: { tools: all.slice(0, 5) } };
     for (const item of reply.result.tools) {
         expect(item.annotations).toEqual({ readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true });
         expect(item.inputSchema.additionalProperties).toBe(false);
@@ -479,8 +489,8 @@ test('real SDK HTTP transport advertises object roots without wrapping and enfor
             expect(tool.outputSchema.type).toBe('object');
             expect(tool.outputSchema.anyOf).toBeUndefined();
             expect(tool.outputSchema.oneOf).toBeUndefined();
-            // The download result is small and fixed; its wire shape is covered by its own tests.
-            if (tool.name === 'get_event_attachment_download') { continue; }
+            // The download result is small and fixed, and the write results have their own wire tests (mcp-write.test.ts).
+            if (!['list_events', 'search_events', 'get_event'].includes(tool.name)) { continue; }
             const args = tool.name === 'get_event' ? { calendar_id: '/1/calendars/home/', resource_href: row.resource_href, include_raw: true } : { range, limit: 100, ...(tool.name === 'search_events' ? { query: 'x' } : {}) };
             const wire = await rpc('tools/call', { name: tool.name, arguments: args });
             expect(Buffer.byteLength(wire)).toBeLessThanOrEqual(MAX_WIRE_BYTES);

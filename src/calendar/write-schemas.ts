@@ -125,7 +125,7 @@ const guestFields = {
 export const writeEventResultSchema = z.strictObject({
     write_outcome: z.enum(['applied', 'desired_state_present'])
         .describe('applied: this call saved the change. desired_state_present: the event already holds the requested values (for example a retry after a lost response); this call saved nothing and does not claim who did.'),
-    readback: z.enum(['ok', 'unavailable']).describe('unavailable: the change was saved but could not be read back; event is null.'),
+    readback: z.enum(['ok', 'unavailable']).describe('ok: event is the stored event read back after the write. unavailable: the write outcome stands, but the event could not be read back or shown within the response limit; event is null. Use get_event to see it.'),
     calendar_id: pathSchema,
     resource_href: pathSchema,
     expected_version: etagSchema.nullable().describe('The stored ETag, from the read-back, else from the save answer; null when neither gave one. Pass it to the next update or delete.'),
