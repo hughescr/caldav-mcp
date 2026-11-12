@@ -36,7 +36,7 @@ import { BudgetError, IcalError, isCanonicalPath, type EventComponent, type Orig
 import { calendarStatus, originalEventView, readCalendarMembership, readStoredResource, ReadError, type ReadDeps, type UnauthorizedReporter } from './read';
 import type { ToolErrorCode } from './schemas';
 import { formatInstant } from './time-core';
-import { differingFields, holdsRequest, normaliseLine, storedComponent, storedEvents, type ComponentRequest, type FieldLine } from './write-compare';
+import { differingFields, holdsExpectation, normaliseLine, storedDifferences, storedEvents, type ComponentRequest, type FieldLine, type StoredExpectation } from './write-compare';
 import {
     GUEST_NOTICE, STORED_FIELDS, type CreateEventArgs, type DeleteEventArgs, type DeleteEventResult, type StoredField, type UpdateChanges, type UpdateEventArgs, type WriteErrorField,
     type WriteErrorReason, type WriteEventResult,
@@ -285,7 +285,8 @@ interface ResultContext {
     href: string;
     summary: CalendarSummary;
     zoneDropped: readonly ('start' | 'end')[];
-    requests: readonly ComponentRequest[];
+    /** What the stored resource must hold; compared with the resource as read back, never with a frozen component set. */
+    stored: StoredExpectation;
     guests: boolean;
     removedCompanions?: readonly Companion[] | undefined;
     overridesChanged?: number | undefined;
@@ -296,10 +297,11 @@ function orderedFields(fields: Iterable<StoredField>): StoredField[] {
     return STORED_FIELDS.filter(field => set.has(field));
 }
 
-function storedDiffers(text: string, requests: readonly ComponentRequest[]): StoredField[] {
-    const events = storedEvents(text);
-    return orderedFields(requests.flatMap(request => differingFields(events === null ? undefined : storedComponent(events, request.rid), request)));
+function storedDiffers(text: string, expectation: StoredExpectation): StoredField[] {
+    return orderedFields(storedDifferences(storedEvents(text), expectation));
 }
+
+const holds = (resource: CalendarResource, expectation: StoredExpectation): boolean => holdsExpectation(storedEvents(resource.calendarData), expectation);
 
 /** The result with the stored event as get_event shows it, or with `readback: "unavailable"` when that cannot be built. */
 function eventResult(context: ResultContext, outcome: WriteEventResult['write_outcome'], resource: CalendarResource | null, answerEtag: StrongEtag | null): WriteEventResult {
@@ -318,7 +320,7 @@ function eventResult(context: ResultContext, outcome: WriteEventResult['write_ou
         try {
             const original = parseOriginalResource(resource.calendarData, { work: context.deps.budget.newResourceWork() });
             const view = originalEventView(context.calendarId, context.summary, resource, original);
-            return { ...base, readback: 'ok', expected_version: resource.etag, stored_differs_from_request: storedDiffers(resource.calendarData, context.requests), calendars: view.calendars, event: view.event };
+            return { ...base, readback: 'ok', expected_version: resource.etag, stored_differs_from_request: storedDiffers(resource.calendarData, context.stored), calendars: view.calendars, event: view.event };
         } catch {
             // The change stands; only its presentation failed.
         }
@@ -424,9 +426,9 @@ export async function createEvent(deps: WriteDeps, input: CreateEventArgs): Prom
 
     const request: ComponentRequest = { rid: null, fields: fields.map(fieldLine), triggers: alarm.triggers };
     const { summary, reporter } = await membership(deps, calendarId);
-    const context: ResultContext = { deps, calendarId, href, summary, zoneDropped: span.zoneDropped, requests: [request], guests: false };
+    const context: ResultContext = { deps, calendarId, href, summary, zoneDropped: span.zoneDropped, stored: { kind: 'components', requests: [request] }, guests: false };
     /** The stored resource is this create: one VEVENT, our UID, exactly the requested lines, nothing else but stamps. */
-    const holds = (resource: CalendarResource): { holds: boolean; differs: StoredField[] } => {
+    const isThisCreate = (resource: CalendarResource): { holds: boolean; differs: StoredField[] } => {
         const events = storedEvents(resource.calendarData);
         const [event, ...more] = events ?? [];
         const differs = orderedFields(differingFields(event?.rid === null ? event : undefined, request));
@@ -450,7 +452,7 @@ export async function createEvent(deps: WriteDeps, input: CreateEventArgs): Prom
     }
     const after = await reread(deps, reporter, calendarId, href);
     if (after.kind === 'found') {
-        const check = holds(after.resource);
+        const check = isThisCreate(after.resource);
         if (check.holds) { return eventResult(context, 'desired_state_present', after.resource, null); }
         if (answer === 'precondition') { throw new WriteError('calendar_changed', { reason: 'existing_resource_differs', differs: orderedFields(check.differs) }); }
         throw new WriteError('outcome_unknown');
@@ -583,15 +585,18 @@ export async function updateEvent(deps: WriteDeps, input: UpdateEventArgs): Prom
         const form: StartForm | undefined = plan.span?.start.kind ?? master?.start.kind;
         try { rrule = rruleProperty(plan.recurrence.rrule, form ?? 'utc', 'rrule'); } catch (error) { throw builderError(error); }
     }
-    const requests = selected.map(target => componentRequest(target.rid, plan, rrule?.line ?? null));
+    // A single event: its master. A whole series: every VEVENT of the resource as it is when compared, not the set read now.
+    const stored: StoredExpectation = original.kind === 'series'
+        ? { kind: 'every_event', request: componentRequest(null, plan, rrule?.line ?? null) }
+        : { kind: 'components', requests: selected.map(target => componentRequest(target.rid, plan, rrule?.line ?? null)) };
     const context: ResultContext = {
-        deps, calendarId, href, summary, zoneDropped: plan.span?.zoneDropped ?? [], requests, guests,
+        deps, calendarId, href, summary, zoneDropped: plan.span?.zoneDropped ?? [], stored, guests,
         ...(original.kind === 'series' ? { overridesChanged: selected.length - 1 } : {}),
     };
 
     if (found.etag !== expected) {
         // Never a PUT with the newer ETag: either the event already says what was asked, or it changed (ORCH B1).
-        if (holdsRequest(storedEvents(found.calendarData), requests)) { return eventResult(context, 'desired_state_present', found, null); }
+        if (holds(found, stored)) { return eventResult(context, 'desired_state_present', found, null); }
         throw new WriteError('calendar_changed', { reason: 'version_mismatch' });
     }
 
@@ -641,7 +646,7 @@ export async function updateEvent(deps: WriteDeps, input: UpdateEventArgs): Prom
     const refused = refusal(answer, response);
     if (refused !== undefined) { throw refused; }
     const after = await reread(deps, reporter, calendarId, href);
-    const present = after.kind === 'found' && holdsRequest(storedEvents(after.resource.calendarData), requests);
+    const present = after.kind === 'found' && holds(after.resource, stored);
     if (answer === 'not_found') {
         if (after.kind === 'absent') { throw new WriteError('not_found'); }
         const upstream = upstreamOf(response);

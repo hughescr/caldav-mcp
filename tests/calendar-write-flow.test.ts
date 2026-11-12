@@ -413,6 +413,41 @@ describe('update_event', () => {
         expect<unknown>([result.write_outcome, result.overrides_changed, result.stored_differs_from_request, result.event?.view, result.event?.title]).toEqual(['applied', 1, [], 'series_master', 'Weekly sync (new format)']);
     });
 
+    test('edit_scope all compares with EVERY stored VEVENT: an override added by another client before a 412 is calendar_changed', async () => {
+        const masterOnly = SERIES.replace(/BEGIN:VEVENT\r\nUID:SERIES-1\r\nDTSTAMP:20261105T120000Z[\s\S]*?END:VEVENT\r\n/u, '');
+        const wrongOverride = 'BEGIN:VEVENT\r\nUID:SERIES-1\r\nDTSTAMP:20261106T120000Z\r\nRECURRENCE-ID;TZID=America/New_York:20261222T100000\r\nDTSTART;TZID=America/New_York:20261222T100000\r\nDTEND;TZID=America/New_York:20261222T103000\r\nSUMMARY:Wrong\r\nEND:VEVENT\r\n';
+        // The other client: master and every existing override say "Wanted", and a new override says "Wrong".
+        const theirs = (text: string): string => `${text.replaceAll(/SUMMARY:Weekly sync[^\r]*/gu, 'SUMMARY:Wanted').replace('END:VCALENDAR\r\n', '')}${wrongOverride}END:VCALENDAR\r\n`;
+        for (const original of [masterOnly, SERIES]) {
+            const h = harness();
+            const etag = h.fake.seed(WORK, SERIES_HREF, original);
+            h.fake.failNextWrite({ kind: 'concurrent', change: fake => { fake.externalEdit(WORK, SERIES_HREF, theirs); } });
+            const request = { calendar_id: WORK, resource_href: SERIES_HREF, expected_version: etag, edit_scope: 'all', changes: { title: 'Wanted' } };
+            expect(await failure(() => update(h, request))).toEqual({ code: 'calendar_changed', reason: 'precondition_failed' });
+            expect(h.fake.count('putEvent')).toBe(1);
+            // The same stored state found by a stale expected_version: never desired_state_present either.
+            expect(await failure(() => update(h, request))).toEqual({ code: 'calendar_changed', reason: 'version_mismatch' });
+            // After an uncertain send it is outcome_unknown.
+            const lost = harness();
+            const lostEtag = lost.fake.seed(WORK, SERIES_HREF, original);
+            lost.fake.putEvent = async () => { lost.fake.externalEdit(WORK, SERIES_HREF, theirs); return { kind: 'uncertain' }; };
+            expect(await failure(() => update(lost, { ...request, expected_version: lostEtag }))).toEqual({ code: 'outcome_unknown' });
+        }
+    });
+
+    test('edit_scope all after a 2xx: stored_differs_from_request covers every VEVENT read back, an override added since included', async () => {
+        const h = harness();
+        const etag = h.fake.seed(WORK, SERIES_HREF, SERIES);
+        const put = h.fake.putEvent.bind(h.fake);
+        h.fake.putEvent = async (...args) => {
+            const answer = await put(...args);
+            h.fake.externalEdit(WORK, SERIES_HREF, text => text.replace('END:VCALENDAR', 'BEGIN:VEVENT\r\nUID:SERIES-1\r\nDTSTAMP:20261106T120000Z\r\nRECURRENCE-ID;TZID=America/New_York:20261222T100000\r\nDTSTART;TZID=America/New_York:20261222T100000\r\nDTEND;TZID=America/New_York:20261222T103000\r\nSUMMARY:Wrong\r\nEND:VEVENT\r\nEND:VCALENDAR'));
+            return answer;
+        };
+        const result = await update(h, { calendar_id: WORK, resource_href: SERIES_HREF, expected_version: etag, edit_scope: 'all', changes: { title: 'Wanted' } });
+        expect<unknown>([result.write_outcome, result.readback, result.stored_differs_from_request]).toEqual(['applied', 'ok', ['title']]);
+    });
+
     test('series target rules: a scope is required; time and rule changes are not supported yet; occurrence-only resources are refused', async () => {
         const h = harness();
         const etag = h.fake.seed(WORK, SERIES_HREF, SERIES);

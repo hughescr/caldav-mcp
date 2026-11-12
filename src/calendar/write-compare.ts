@@ -138,12 +138,50 @@ export function storedComponent(events: readonly StoredEvent[], rid: string | nu
     return matches.length === 1 ? matches[0] : undefined;
 }
 
-/** Every requested field of every component as requested, and every required absence absent. */
-export function holdsRequest(events: readonly StoredEvent[] | null, requests: readonly ComponentRequest[]): boolean {
+/**
+ * What the stored resource must hold after a request:
+ * - `components`: each request in the component it names (the master, or the override with that RECURRENCE-ID line);
+ * - `every_event`: the same request in EVERY VEVENT of the resource as it is now (`edit_scope: "all"`), so a component another
+ *   client added since the original was read counts too. The `rid` of the request is ignored.
+ */
+export type StoredExpectation =
+    | { readonly kind: 'components'; readonly requests: readonly ComponentRequest[] }
+    | { readonly kind: 'every_event'; readonly request: ComponentRequest };
+
+function holdsIn(stored: StoredEvent, request: ComponentRequest): boolean {
+    return differingFields(stored, request).length === 0 && (request.absent ?? []).every(name => !stored.lines.some(line => line.name === name));
+}
+
+/**
+ * Every requested field as requested and every required absence absent. For `every_event` the component set must also be
+ * reconcilable: exactly one master and no two components with the same RECURRENCE-ID line; otherwise it does not hold.
+ */
+export function holdsExpectation(events: readonly StoredEvent[] | null, expectation: StoredExpectation): boolean {
     if (events === null) { return false; }
-    return requests.every(request => {
-        const stored = storedComponent(events, request.rid);
-        if (stored === undefined || differingFields(stored, request).length > 0) { return false; }
-        return (request.absent ?? []).every(name => !stored.lines.some(line => line.name === name));
-    });
+    if (expectation.kind === 'components') {
+        return expectation.requests.every(request => {
+            const stored = storedComponent(events, request.rid);
+            return stored !== undefined && holdsIn(stored, request);
+        });
+    }
+    const rids = events.map(event => event.rid);
+    if (rids.filter(rid => rid === null).length !== 1 || new Set(rids).size !== rids.length) { return false; }
+    return events.every(event => holdsIn(event, expectation.request));
+}
+
+/** The requested fields the stored resource does not hold as requested (unordered, without duplicates). */
+export function storedDifferences(events: readonly StoredEvent[] | null, expectation: StoredExpectation): StoredField[] {
+    const fields = new Set<StoredField>();
+    if (expectation.kind === 'components') {
+        for (const request of expectation.requests) {
+            for (const field of differingFields(events === null ? undefined : storedComponent(events, request.rid), request)) { fields.add(field); }
+        }
+    } else if (events === null || events.length === 0) {
+        for (const field of differingFields(undefined, expectation.request)) { fields.add(field); }
+    } else {
+        for (const event of events) {
+            for (const field of differingFields(event, expectation.request)) { fields.add(field); }
+        }
+    }
+    return [...fields];
 }
