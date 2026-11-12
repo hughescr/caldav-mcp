@@ -4,9 +4,9 @@ A small remote MCP server that lets Claude clients read Apple iCloud calendars o
 
 ## Status
 
-Version 0.1.1 is deployed and live at https://caldav-mcp.rungie.com (released on 2026-11-11). It has one tool, `list_calendars`. The owner connected it from a Claude client and reports that it worked. This was not checked independently from server logs.
+Version 0.2.0 was released on 2026-11-12 with four tools: `list_calendars`, `list_events`, `search_events` and `get_event`. Version 0.1.1 was released and deployed at https://caldav-mcp.rungie.com on 2026-11-11. The owner connected it from a Claude client and reported that `list_calendars` worked. This was not checked independently from server logs. The 0.2.0 tools were verified locally, end to end, against one real iCloud account on 2026-11-12: all 11 calendars answered, and a one-year query returned 210 events with 0 unreadable.
 
-The phase 2 read tools `list_events`, `search_events` and `get_event` are built on the `develop` branch. They are not released and not deployed. The attachment download tool is designed and not built. Writes are not started.
+The attachment download tool is designed and not built. Writes are not started.
 
 - The phase 0 probe is written. Its read-only mode and its `--write` mode have been run several times against one real iCloud account, locally, on 2026-11-11. The probe's invite mode and its Lambda run have not been done.
 - iCloud behaviour is confirmed only for what those local runs covered (one account). Invitations, the response to a wrong password and subscribed calendars are untested. Behaviour from AWS addresses is known only from the owner's report of one successful login from the deployed Lambda, for one account. There is no rate-limit or volume evidence. For the untested points the plan relies on other clients' published test results. [docs/plan.md](docs/plan.md) gives the status of each point, and [docs/probe.md](docs/probe.md) describes the probe.
@@ -16,7 +16,7 @@ Read next: [docs/plan.md](docs/plan.md) (goals, phases, open decisions, accepted
 
 ## Tools
 
-All tools need the scope `calendar:read` and only read. The three event tools are on `develop` only.
+All tools need the scope `calendar:read` and only read. The three event tools are released in version 0.2.0 (2026-11-12).
 
 - `list_calendars` returns each calendar that holds events: `id`, `displayName`, `components` and `color`, at most 200, with a `truncated` flag. The `id` is an opaque path that contains the account's numeric iCloud path. Pass it back unchanged.
 - `list_events` returns the events in a half-open time range (`range.start` included, `range.end` not). `calendar_ids` is optional (1 to 20 ids from `list_calendars`); omit it to read every calendar that holds events. Each result has a status per calendar, so one failing calendar does not fail the call. Recurring events are returned as separate occurrences, as iCloud expands them. Cancelled events are included, with `status` `CANCELLED`. Each event has `resource_href`, `recurrence_id` (null unless it is an occurrence), `expected_version` (the ETag), `start`, `end`, `title`, `location`, a shortened `description` and the attendee count.
