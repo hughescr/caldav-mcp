@@ -1,4 +1,4 @@
-import { describe, expect, test } from 'bun:test';
+import { describe, expect, jest, test } from 'bun:test';
 import { ProbeHttp, ProbeHttpError, type HttpMode } from '../scripts/probe/http';
 import { Taint } from '../scripts/probe/safe';
 
@@ -149,6 +149,37 @@ describe('write enforcement', () => {
         expect(await code(http.request({ method: 'MKCALENDAR', url: leftover }))).toBe('method_not_allowed');
         expect(sent.length).toBe(1);
     });
+});
+
+describe('401 headers latch before body consumption', () => {
+    for (const failure of ['error', 'timeout', 'over-cap'] as const) {
+        test(`a 401 with ${failure} body blocks every later ordinary fetch`, async () => {
+            jest.useFakeTimers();
+            try {
+                const { http, sent } = setup('read', () => new Response(failure === 'over-cap' ? 'x'.repeat(2048) : new ReadableStream({
+                    start(controller) {
+                        if (failure === 'error') {
+                            controller.error(new Error('broken body'));
+                        }
+                    },
+                }), { status: 401 }), { timeoutMs: 10 });
+                const result = code(http.request({ method: 'GET', url: HOME }));
+                for (let i = 0; i < 10; i++) {
+                    await Promise.resolve();
+                }
+                if (failure === 'timeout') {
+                    jest.advanceTimersByTime(10);
+                }
+                expect(await result).toBe(failure === 'error' ? 'network' : failure === 'timeout' ? 'timeout' : 'body_too_large');
+                expect(await code(http.request({ method: 'GET', url: HOME }))).toBe('unauthorized');
+                expect(http.credentialsRejected).toBe(true);
+                expect(http.rejectedOnFirstRequest).toBe(true);
+                expect(sent).toHaveLength(1);
+            } finally {
+                jest.useRealTimers();
+            }
+        });
+    }
 });
 
 describe('gentleness', () => {

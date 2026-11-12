@@ -7,12 +7,17 @@ import type { Evidence } from '../types';
 import { escapeXml, okProp, type Multistatus } from '../xml';
 
 const DAY = 86_400_000;
-const RUN_LEVEL_STOPS = new Set(['request_cap', 'deadline', 'interrupted', 'throttled_abort']);
+/** Errors that end the whole run's requests, not just one calendar's. */
+export const RUN_LEVEL_STOPS = new Set(['request_cap', 'deadline', 'interrupted', 'throttled_abort']);
 const KIND_ORDER = ['owned', 'shared-by-me', 'shared-with-me', 'subscribed'];
 
+/** The shared ±window: fixed on first use, so that every check queries exactly the same days. */
 export function windowRange(ctx: CheckContext): { start: number; end: number } {
-    const now = ctx.now();
-    return { start: now - ctx.limits.windowDays * DAY, end: now + ctx.limits.windowDays * DAY };
+    if (ctx.state.windowBounds === undefined) {
+        const now = ctx.now();
+        ctx.state.windowBounds = { start: now - ctx.limits.windowDays * DAY, end: now + ctx.limits.windowDays * DAY };
+    }
+    return ctx.state.windowBounds;
 }
 
 /** Calendar collections that may hold events, owned first, capped. */
@@ -24,8 +29,14 @@ export function eventCalendars(ctx: CheckContext): CalendarInfo[] {
 }
 
 export function toResources(ms: Multistatus | undefined, base: string): WindowResource[] {
+    if (ms === undefined) {
+        throw new CheckStop('inconclusive', prose`The multistatus response could not be read.`, { multistatusParsed: false });
+    }
     const resources: WindowResource[] = [];
-    for (const response of ms?.responses ?? []) {
+    for (const response of ms.responses) {
+        if ((response.status !== null && !isOk(response.status)) || [...response.props.values()].some((p) => p.status === null || !isOk(p.status))) {
+            throw new CheckStop('inconclusive', prose`The multistatus response contains a failed resource or property.`, { resourceStatusOk: false });
+        }
         const href = absolute(response.href, base);
         if (href === undefined || href === base) {
             continue;
@@ -38,9 +49,28 @@ export function toResources(ms: Multistatus | undefined, base: string): WindowRe
             ical,
             summaries: eventComponents(ical).map((e) => (prop(e, 'SUMMARY')?.value ?? '').toLowerCase()),
             recurring: isRecurring(ical),
+            calendarData: data === undefined ? null : data.node.text,
         });
     }
     return resources;
+}
+
+/** One calendar-query REPORT (Depth 1) on a calendar; the answer is read into resources. */
+export async function queryWindow(ctx: CheckContext, calendarHref: string, body: string): Promise<WindowData> {
+    const r = await dav(ctx, 'REPORT', calendarHref, { depth: '1', body });
+    return { status: r.res.status, resources: r.res.status === 207 ? toResources(r.ms, calendarHref) : [], bytes: Buffer.byteLength(r.res.body, 'utf8') };
+}
+
+/** The shared ±window queried with calendar-data/expand: once per calendar, on demand. */
+export async function ensureExpanded(ctx: CheckContext, calendarHref: string): Promise<WindowData> {
+    const known = ctx.state.expanded.get(calendarHref);
+    if (known !== undefined) {
+        return known;
+    }
+    const { start, end } = windowRange(ctx);
+    const data = await queryWindow(ctx, calendarHref, calendarQueryBody({ start, end, calendarData: 'expand' }));
+    ctx.state.expanded.set(calendarHref, data);
+    return data;
 }
 
 /** One ±window calendar-query per event calendar, shared by several checks. */
@@ -52,15 +82,17 @@ export async function ensureWindow(ctx: CheckContext): Promise<void> {
     const { start, end } = windowRange(ctx);
     for (const cal of eventCalendars(ctx)) {
         try {
-            const r = await dav(ctx, 'REPORT', cal.href, { depth: '1', body: calendarQueryBody({ start, end, calendarData: 'full' }) });
-            ctx.state.window.set(cal.href, { status: r.res.status, resources: r.res.status === 207 ? toResources(r.ms, cal.href) : [] });
+            ctx.state.window.set(cal.href, await queryWindow(ctx, cal.href, calendarQueryBody({ start, end, calendarData: 'full' })));
         } catch (error) {
             if (error instanceof CheckStop) {
-                ctx.state.window.set(cal.href, { status: typeof error.evidence.status === 'number' ? error.evidence.status : 0, resources: [] });
+                ctx.state.window.set(cal.href, { status: 0, resources: [], bytes: 0 });
+                if (error.evidence.multistatusParsed === false || error.evidence.resourceStatusOk === false) {
+                    continue;
+                }
                 break;
             }
             if (error instanceof ProbeHttpError) {
-                ctx.state.window.set(cal.href, { status: 0, resources: [] });
+                ctx.state.window.set(cal.href, { status: 0, resources: [], bytes: 0 });
                 // A per-request failure (timeout, oversized body) skips one calendar; a run-level stop ends the loop.
                 if (RUN_LEVEL_STOPS.has(error.code)) {
                     break;
@@ -166,12 +198,11 @@ export const expandReadCheck: CheckDef = {
             return { outcome: 'inconclusive', summary: prose`No recurring event was found in the ±window (run --write for a definitive test).`, evidence: { recurringResourcesInWindow: 0 } };
         }
         const recurring = new Set(pick[1].resources.filter((r) => r.recurring).map((r) => r.href));
-        const { start, end } = windowRange(ctx);
-        const r = await dav(ctx, 'REPORT', pick[0], { depth: '1', body: calendarQueryBody({ start, end, calendarData: 'expand' }) });
+        const expanded = await ensureExpanded(ctx, pick[0]);
         let instances = 0;
         let rrules = 0;
         let utcStarts = 0;
-        for (const resource of toResources(r.ms, pick[0])) {
+        for (const resource of expanded.resources) {
             if (!recurring.has(resource.href)) {
                 continue;
             }
@@ -187,9 +218,9 @@ export const expandReadCheck: CheckDef = {
                 }
             }
         }
-        const evidence: Evidence = { recurringResourcesInWindow: recurring.size, expandStatus: r.res.status, instancesWithRecurrenceId: instances, componentsStillWithRrule: rrules, instanceStartsInUtc: utcStarts };
-        if (r.res.status !== 207) {
-            return { outcome: isRefusal(r.res.status) ? 'refuted' : 'inconclusive', summary: prose`The expand query answered HTTP ${r.res.status}.`, evidence };
+        const evidence: Evidence = { recurringResourcesInWindow: recurring.size, expandStatus: expanded.status, instancesWithRecurrenceId: instances, componentsStillWithRrule: rrules, instanceStartsInUtc: utcStarts };
+        if (expanded.status !== 207) {
+            return { outcome: isRefusal(expanded.status) ? 'refuted' : 'inconclusive', summary: prose`The expand query answered HTTP ${expanded.status}.`, evidence };
         }
         if (rrules > 0) {
             return { outcome: 'refuted', summary: prose`Recurring events came back with RRULE, so expand was not applied.`, evidence };

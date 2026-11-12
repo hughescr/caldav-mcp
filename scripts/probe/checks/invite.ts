@@ -1,5 +1,5 @@
 import { CheckStop, isOk, isRefusal, type CheckDef } from '../context';
-import { eventComponents, getIcal } from '../dav';
+import { eventComponents, getIcal, requireSynthetic } from '../dav';
 import { props } from '../ical';
 import { fixed, prose, type Safe } from '../safe';
 import type { Evidence } from '../types';
@@ -46,12 +46,18 @@ export const inviteCheck: CheckDef = {
             return { outcome: isRefusal(put.status) ? 'refuted' : 'inconclusive', summary: prose`The event with an attendee was not accepted (HTTP ${put.status}). No invitation should have been sent.`, evidence };
         }
         const first = await getIcal(ctx, url);
+        if (first.status === 200) {
+            requireSynthetic(first.ical, first.url, temp.url, uid, first.status);
+        }
         const invitee = eventComponents(first.ical).flatMap((e) => props(e, 'ATTENDEE')).find((p) => p.value.toLowerCase() === `mailto:${attendee}`);
         const code = scheduleCode(invitee?.params['SCHEDULE-STATUS']);
         evidence.attendeeScheduleStatusPresent = code !== null;
         evidence.scheduleStatus = code;
         await ctx.sleep(3000);
         const second = await getIcal(ctx, url);
+        if (second.status === 200) {
+            requireSynthetic(second.ical, second.url, temp.url, uid, second.status);
+        }
         evidence.etagChangedAfterSave = first.etag !== null && second.etag !== null && first.etag !== second.etag;
         evidence.deleteStatus = await deleteEvent(ctx, url, second.etag ?? first.etag);
         const byHand = prose`Check the invitee’s mailbox by hand to confirm whether an invitation email arrived; deleting the event may also have sent a cancellation.`;

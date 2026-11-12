@@ -24,6 +24,15 @@ export function fixed(value: string): Safe {
     return value as Safe;
 }
 
+/** Explicit provenance, never a pattern exemption. Construct only from probe-authored values
+ * or values read after validating the synthetic resource URL and every VEVENT UID. */
+export class AuthoredValue {
+    constructor(readonly value: Safe) {}
+    toString(): string { return this.value; }
+    toJSON(): string { return this.value; }
+}
+
+const NAME_LISTS = new WeakSet<readonly Safe[]>();
 const OTHER = fixed('<other>');
 const NAME_SHAPE = /^[A-Za-z][A-Za-z0-9:_.-]{0,63}$/;
 
@@ -63,6 +72,9 @@ const KNOWN_NAMES = new Set([
     'x-wr-alarmuid', 'x-wr-calname', 'x-wr-timezone', 'x-apple-travel-advisory-behavior', 'x-apple-structured-location',
     'x-apple-default-alarm', 'x-apple-creator-identity', 'x-apple-creator-team-identity', 'x-apple-local-default-alarm',
     'x-lic-location', 'x-caldav-mcp-probe',
+    // ATTACH parameters (RFC 5545, RFC 8607) and the managed-attachment headers
+    'encoding', 'value', 'fmttype', 'size', 'filename', 'managed-id', 'x-apple-filename', 'cal-managed-id', 'content-range',
+    'content-disposition',
 ]);
 
 /**
@@ -83,18 +95,21 @@ export function safeName(value: string, taint?: Taint): Safe {
 }
 
 export function safeNames(values: Iterable<string>, taint?: Taint): Safe[] {
-    return [...new Set([...values].map((v) => safeName(v, taint)))].toSorted();
+    const names = [...new Set([...values].map((v) => safeName(v, taint)))].toSorted();
+    NAME_LISTS.add(names);
+    return names;
 }
 
 /**
  * Re-checks names already in evidence against everything seen by the end of the run (a
  * name recorded early, such as an Allow-header method, may only later turn out to match
- * a value from the account). Only arrays of strings hold names in evidence.
+ * a value from the account). Only lists constructed as server names are rechecked;
+ * fixed enums and synthetic dates must never be rewritten based on owner data.
  */
 export function recheckNames<T>(evidence: Record<string, T>, taint: Taint): Record<string, T> {
     const out: Record<string, T> = {};
     for (const [key, value] of Object.entries(evidence)) {
-        out[key] = Array.isArray(value)
+        out[key] = Array.isArray(value) && NAME_LISTS.has(value)
             ? ([...new Set(value.map((v: unknown) => (typeof v === 'string' && v !== OTHER && !KNOWN_NAMES.has(v.toLowerCase()) && taint.overlaps(v) ? OTHER : v)))].toSorted() as T)
             : value;
     }
@@ -102,8 +117,12 @@ export function recheckNames<T>(evidence: Record<string, T>, taint: Taint): Reco
 }
 
 /** Sorted, de-duplicated list of values that were already reduced to a safe form. */
-export function sortedSafe(values: Iterable<Safe>): Safe[] {
-    return [...new Set(values)].toSorted();
+export function sortedSafe<T extends Safe | AuthoredValue>(values: Iterable<T>): T[] {
+    const result = [...new Map([...values].map((value) => [String(value), value])).values()].toSorted((a, b) => String(a) < String(b) ? -1 : String(a) > String(b) ? 1 : 0);
+    if (Array.isArray(values) && NAME_LISTS.has(values)) {
+        NAME_LISTS.add(result as Safe[]);
+    }
+    return result;
 }
 
 const SAFE_SEGMENTS = new Set([
@@ -181,6 +200,7 @@ export function davTokens(header: string | null | undefined): { tokens: Safe[]; 
             otherCount++;
         }
     }
+    NAME_LISTS.add(tokens);
     return { tokens, otherCount };
 }
 
@@ -383,6 +403,9 @@ export function renderProse(sentence: Prose, taint?: Taint): { text: string; cou
 export function scrubValue<T>(value: T, taint: Taint): { value: T; count: number } {
     let count = 0;
     const visit = (input: unknown): unknown => {
+        if (input instanceof AuthoredValue) {
+            return input.value;
+        }
         if (typeof input === 'string') {
             const result = scrubString(input, taint);
             count += result.scrubbed ? 1 : 0;

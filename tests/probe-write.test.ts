@@ -8,8 +8,13 @@ function writesStayInProbeCalendars(fake: FakeICloud): void {
     const writes = fake.requests.filter((r) => WRITE_METHODS.has(r.method));
     expect(writes.length).toBeGreaterThan(0);
     for (const w of writes) {
-        expect(['PUT', 'DELETE', 'MKCALENDAR']).toContain(w.method);
+        expect(['PUT', 'DELETE', 'MKCALENDAR', 'POST']).toContain(w.method);
         expect(w.url.pathname).toMatch(/^\/10000000001\/calendars\/caldav-mcp-probe-[0-9a-f]{8}\//);
+        if (w.method === 'POST') {
+            // Only the managed-attachment actions, on an event the probe wrote.
+            expect(w.url.pathname).toMatch(/\.ics$/);
+            expect(w.url.search).toMatch(/^\?action=attachment-(?:add|remove&managed-id=[A-Za-z0-9._-]+)$/);
+        }
     }
 }
 

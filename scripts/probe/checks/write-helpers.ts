@@ -1,11 +1,12 @@
 import { CheckStop, isOk, isRefusal, type CheckContext, type CheckRecord, type TempCalendar } from '../context';
 import { NS, absolute, dav, propfindBody, xmlDoc, type DavResult } from '../dav';
-import { directChildOf, probeSegment } from '../http';
-import { buildIcal, icalUtc } from '../ical';
+import { probeSegment } from '../http';
+import { buildIcal, comps, icalUtc, parseIcal, prop } from '../ical';
 import { prose } from '../safe';
 import { PROBE_VERSION } from '../version';
-import { childrenNamed, okProp } from '../xml';
+import { childrenNamed, escapeXml, okProp } from '../xml';
 import type { Evidence, NotDeletedReason, NotDeletedReport } from '../types';
+import { LOS_ANGELES } from './zones';
 
 export const DAY = 86_400_000;
 export const HOUR = 3_600_000;
@@ -82,6 +83,20 @@ export interface TempCalendarCreation {
     declaresVevent: boolean;
     locationHeader: boolean;
     locationUsed: boolean;
+    /** A calendar-timezone was included in the (first) MKCALENDAR. */
+    calendarTimezoneSent: boolean;
+    /** The server refused that MKCALENDAR with a 4xx, and it was repeated without the property. */
+    calendarTimezoneRefused: boolean;
+    /** A PROPFIND returned some calendar-timezone property (the server may supply a default of its own). */
+    calendarTimezonePresent: boolean;
+    /** The calendar-timezone returned is the one the probe sent (it holds the America/Los_Angeles VTIMEZONE). */
+    calendarTimezoneKept: boolean;
+}
+
+/** The calendar-timezone the probe gives its primary temporary calendar: a known zone, so floating-time tests are deterministic. */
+function calendarTimezoneXml(): string {
+    const text = buildIcal(['BEGIN:VCALENDAR', 'VERSION:2.0', `PRODID:-//caldav-mcp//probe ${PROBE_VERSION}//EN`, ...LOS_ANGELES, 'END:VCALENDAR']);
+    return `<C:calendar-timezone>${escapeXml(text).replace(/\r\n/g, '&#13;\n')}</C:calendar-timezone>`;
 }
 
 const PROBE_NAME = /^caldav-mcp-probe-[0-9a-f]{8}$/;
@@ -90,39 +105,12 @@ function withSlash(url: string): string {
     return url.endsWith('/') ? url : `${url}/`;
 }
 
-/** Collection URLs listed in the home before any write (from the collections check). */
-function existingCollections(ctx: CheckContext): ReadonlySet<string> | undefined {
-    const calendars = ctx.state.calendars;
-    return calendars === undefined ? undefined : new Set(calendars.map((c) => withSlash(c.href)));
-}
-
 /**
- * Honours a MKCALENDAR Location that names a different URL. It is used (for the write checks
- * and for deletion) only when it passes the host rule, is a direct child of the home, was not
- * in the home listing taken before any write, and a PROPFIND shows our own display name there.
+ * MKCALENDAR for one temporary calendar. With `calendarTimezone`, the property is included
+ * once; if the server refuses that request (4xx), it is repeated without the property so the
+ * write checks can still run.
  */
-async function adoptLocation(ctx: CheckContext, temp: TempCalendar, home: string, location: string, requestUrl: string): Promise<boolean> {
-    const target = absolute(location, requestUrl);
-    if (target === undefined || withSlash(target) === temp.requestedUrl || directChildOf(target, home) === undefined) {
-        return false;
-    }
-    const existing = existingCollections(ctx);
-    if (existing === undefined || existing.has(withSlash(target))) {
-        return false;
-    }
-    const check = await dav(ctx, 'PROPFIND', target, { depth: '0', body: propfindBody(['D:resourcetype', 'D:displayname']) });
-    const response = check.ms?.responses[0];
-    const types = response === undefined ? [] : (okProp(response, 'resourcetype')?.node.children ?? []).map((c) => c.name);
-    if (check.res.status !== 207 || response === undefined || okProp(response, 'displayname')?.text !== temp.name || !types.includes('calendar') || types.includes('shared') || types.includes('shared-owner')) {
-        return false;
-    }
-    ctx.http.registerCreatedCollection(target, home, existing, temp.requestedUrl);
-    temp.url = target;
-    temp.deleteUrls = [target, temp.requestedUrl];
-    return true;
-}
-
-export async function createTempCalendar(ctx: CheckContext): Promise<TempCalendarCreation> {
+export async function createTempCalendar(ctx: CheckContext, options: { calendarTimezone?: boolean } = {}): Promise<TempCalendarCreation> {
     const home = ctx.state.homeUrl;
     if (home === undefined) {
         throw new CheckStop('skipped', prose`Skipped: no calendar home.`);
@@ -133,14 +121,28 @@ export async function createTempCalendar(ctx: CheckContext): Promise<TempCalenda
     const temp: TempCalendar = { name, url, requestedUrl: url, deleteUrls: [url], removalVerified: false, deleteStatus: null };
     // Recorded before the request, so the DELETE is sent even if the outcome is unknown.
     ctx.state.temp.push(temp);
-    const body = xmlDoc(`<C:mkcalendar ${NS}><D:set><D:prop><D:displayname>${name}</D:displayname><C:supported-calendar-component-set><C:comp name="VEVENT"/></C:supported-calendar-component-set></D:prop></D:set></C:mkcalendar>`);
-    const created = await dav(ctx, 'MKCALENDAR', url, { body });
+    const makeBody = (withTimezone: boolean): string => xmlDoc(`<C:mkcalendar ${NS}><D:set><D:prop><D:displayname>${name}</D:displayname><C:supported-calendar-component-set><C:comp name="VEVENT"/></C:supported-calendar-component-set>${withTimezone ? calendarTimezoneXml() : ''}</D:prop></D:set></C:mkcalendar>`);
+    const sent = options.calendarTimezone === true;
+    let created = await dav(ctx, 'MKCALENDAR', url, { body: makeBody(sent) });
+    const refused = sent && isRefusal(created.res.status);
+    if (refused) {
+        created = await dav(ctx, 'MKCALENDAR', url, { body: makeBody(false) });
+    }
     const location = created.res.headers.get('location');
-    const locationUsed = location !== null && isOk(created.res.status) && (await adoptLocation(ctx, temp, home, location, created.res.url));
-    const check = await dav(ctx, 'PROPFIND', temp.url, { depth: '0', body: propfindBody(['D:resourcetype', 'D:displayname', 'C:supported-calendar-component-set']) });
+    // A server-selected URL cannot establish ownership, even with a matching display name.
+    // Leave only the URL we requested registered for the finally-block's cleanup attempt.
+    if (location !== null && absolute(location, created.res.url) !== new URL(url).href) {
+        throw new CheckStop('inconclusive', prose`The server returned a different calendar location; no writes will follow. Check Calendar for manual cleanup.`, { status: created.res.status, locationHeader: true, locationUsed: false });
+    }
+    const locationUsed = false;
+    const check = await dav(ctx, 'PROPFIND', temp.url, { depth: '0', body: propfindBody(['D:resourcetype', 'D:displayname', 'C:supported-calendar-component-set', 'C:calendar-timezone']) });
     const response = check.ms?.responses[0];
     const types = response === undefined ? [] : (okProp(response, 'resourcetype')?.node.children ?? []).map((c) => c.name);
     const components = response === undefined ? [] : childrenNamed(okProp(response, 'supported-calendar-component-set')?.node, 'comp').map((c) => c.attrs.name ?? '');
+    const returned = response === undefined ? undefined : okProp(response, 'calendar-timezone');
+    const zones = returned === undefined ? [] : comps(parseIcal(returned.node.text) ?? { name: '', properties: [], components: [] }, 'VTIMEZONE');
+    const kept = sent && !refused && zones.some((z) => prop(z, 'TZID')?.value === 'America/Los_Angeles');
+    temp.calendarTimezoneKept = sent ? kept : null;
     return {
         temp,
         status: created.res.status,
@@ -149,6 +151,10 @@ export async function createTempCalendar(ctx: CheckContext): Promise<TempCalenda
         declaresVevent: components.includes('VEVENT'),
         locationHeader: location !== null,
         locationUsed,
+        calendarTimezoneSent: sent,
+        calendarTimezoneRefused: refused,
+        calendarTimezonePresent: returned !== undefined,
+        calendarTimezoneKept: kept,
     };
 }
 

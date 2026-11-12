@@ -9,12 +9,22 @@ import type { HTTP_ERROR_CODES } from './vocabulary';
  * mode, the 401 latch, pacing, a total request cap, a per-request timeout, a body cap,
  * and a stop after repeated throttling. Errors carry fixed codes only.
  *
- * 401 latch: after the first HTTP 401 from any request, nothing else is sent in this
+ * 401 latch: after the first HTTP 401 from an authenticated request, nothing else is sent in this
  * run. The one exception is a single essential DELETE per temporary calendar the probe
  * registered (so it can try once to remove what it created); if that DELETE is also
  * answered 401, even that stops. Repeated failed sign-ins can lock an Apple ID.
  */
 export type HttpMode = 'read' | 'write' | 'cleanup';
+export type AttachmentStep = 'anonymous' | 'authenticated' | 'redirect';
+
+/** Narrow write-only attachment destinations; no userinfo, fragments or non-default ports. */
+export function isAttachmentDestination(value: string, redirect = false): boolean {
+    try {
+        const url = new URL(value);
+        return url.protocol === 'https:' && url.port === '' && url.username === '' && url.password === '' && url.hash === ''
+            && (url.hostname.endsWith('.icloud.com') || (redirect && url.hostname.endsWith('.icloud-content.com')));
+    } catch { return false; }
+}
 
 export type HttpErrorCode = (typeof HTTP_ERROR_CODES)[number];
 
@@ -44,9 +54,9 @@ export interface HttpLimits {
 }
 
 /**
- * Most essential requests a --write run can need: for each of at most two temporary
- * calendars, at most two URLs (the requested one and a server-chosen Location), each with
- * up to two DELETE attempts and one verifying PROPFIND; plus one final listing of the home.
+ * Conservative cleanup reserve: at most two requested temporary-calendar URLs, each with
+ * up to two DELETE attempts and one verifying PROPFIND, with double headroom for those
+ * requests; plus one final listing of the home. Server-chosen Locations are never registered.
  */
 export const MAX_CLEANUP_REQUESTS = 2 * 2 * (2 + 1) + 1;
 
@@ -92,6 +102,11 @@ export interface ProbeRequest {
     paced?: boolean;
     /** Default true. The backend adapter sees each hop itself. */
     followRedirects?: boolean;
+    /**
+     * Read at most this many bytes of the body and stop (the answer is then `truncated`) instead of
+     * failing at the body cap. For attachment downloads, whose size the probe does not control.
+     */
+    maxBytes?: number;
 }
 
 export interface ProbeResponse {
@@ -102,6 +117,8 @@ export interface ProbeResponse {
     redirects: number;
     redirectStatuses: number[];
     elapsedMs: number;
+    /** The body was cut at `maxBytes`. */
+    truncated: boolean;
 }
 
 export interface HttpStats {
@@ -113,6 +130,8 @@ export interface HttpStats {
 }
 
 const READ_METHODS = new Set(['OPTIONS', 'PROPFIND', 'REPORT', 'GET']);
+/** The only POSTs ever sent: RFC 8607 managed-attachment actions on an event the probe wrote. */
+const ATTACHMENT_ACTION = /^\?action=(?:attachment-add|attachment-remove&managed-id=[A-Za-z0-9._-]{1,128})$/;
 const REDIRECTS = new Set([301, 302, 303, 307, 308]);
 const PROBE_COLLECTION = /^caldav-mcp-probe-[0-9a-f]{8}$/;
 const UNTAINTED_HEADERS = new Set([
@@ -156,6 +175,8 @@ export class ProbeHttp {
     private readonly collections: Registered[] = [];
     private requestCount = 0;
     private rejected = false;
+    /** One three-step experiment per exact synthetic ATTACH value; never used by the general sender. */
+    private readonly downloads = new Map<string, { steps: Set<AttachmentStep>; last?: ProbeResponse }>();
     private rejectedFirst = false;
     /** After the latch: groups that already had their one DELETE attempt. */
     private readonly latchDeletes = new Set<string>();
@@ -182,7 +203,7 @@ export class ProbeHttp {
         return this.options.mode;
     }
 
-    /** True once any response was HTTP 401. */
+    /** True once an authenticated response was HTTP 401 (anonymous attachment challenges do not reject credentials). */
     get credentialsRejected(): boolean {
         return this.rejected;
     }
@@ -192,7 +213,10 @@ export class ProbeHttp {
         return this.rejectedFirst;
     }
 
-    /** Allows MKCALENDAR, PUT and DELETE in one probe-named calendar directly under the home. */
+    /**
+     * Allows MKCALENDAR, PUT and DELETE in one probe-named calendar directly under the home, and
+     * POST of the two managed-attachment actions on an event directly inside it.
+     */
     registerProbeCollection(url: string, home: string): void {
         if (this.options.mode !== 'write') {
             throw new ProbeHttpError('method_not_allowed');
@@ -205,9 +229,8 @@ export class ProbeHttp {
     }
 
     /**
-     * Write mode: allows PUT and DELETE in a calendar the server says it created at its own
-     * URL (MKCALENDAR Location) for an already registered probe URL. The URL must be a direct
-     * child of the home that was not in the home listing taken before the run's writes.
+     * A Location can only identify the already registered requested URL. It can never
+     * extend write authority to a server-selected URL, regardless of the home baseline.
      */
     registerCreatedCollection(url: string, home: string, existing: ReadonlySet<string>, requested: string): void {
         if (this.options.mode !== 'write') {
@@ -215,10 +238,9 @@ export class ProbeHttp {
         }
         const target = directChildOf(url, home);
         const group = this.collections.find((c) => c.url.href === requested && c.group === requested);
-        if (target === undefined || group === undefined || existing.has(target.href) || this.collections.some((c) => c.url.href === target.href)) {
+        if (target === undefined || group === undefined || target.href !== group.url.href || existing.has(target.href)) {
             throw new ProbeHttpError('write_outside_probe_calendar');
         }
-        this.collections.push({ url: target, group: group.group });
     }
 
     /**
@@ -252,6 +274,14 @@ export class ProbeHttp {
 
     private isUnderCollection(url: string, allowSelf: boolean, allowChild: boolean): boolean {
         return this.matching(url, allowSelf, allowChild) !== undefined;
+    }
+
+    /** An `<name>.ics` resource directly inside a registered probe collection (the query string is ignored). */
+    private isEventInCollection(url: string): boolean {
+        const target = new URL(url);
+        return this.collections.some(({ url: collection }) => target.origin === collection.origin
+            && target.pathname.startsWith(collection.pathname)
+            && /^[^/]+\.ics$/.test(target.pathname.slice(collection.pathname.length)));
     }
 
     /** The 401 latch. Throws unless this is the one permitted post-401 DELETE of a probe calendar. */
@@ -291,6 +321,11 @@ export class ProbeHttp {
             allowed = this.isUnderCollection(url, false, true);
         } else if (method === 'DELETE') {
             allowed = this.isUnderCollection(url, true, true);
+        } else if (method === 'POST') {
+            if (!ATTACHMENT_ACTION.test(new URL(url).search)) {
+                throw new ProbeHttpError('method_not_allowed');
+            }
+            allowed = this.isEventInCollection(url);
         } else {
             throw new ProbeHttpError('method_not_allowed');
         }
@@ -340,31 +375,42 @@ export class ProbeHttp {
         return Math.max(1, Math.min(this.limits.timeoutMs, remaining - this.limits.deadlineReserveMs));
     }
 
-    private async readCapped(response: Response): Promise<string> {
+    /** The body as text; past `softLimit` bytes reading stops and the text is cut there (`truncated`). */
+    private async readCapped(response: Response, softLimit?: number): Promise<{ text: string; truncated: boolean }> {
         const reader = response.body?.getReader();
         if (reader === undefined) {
-            return '';
+            return { text: '', truncated: false };
         }
         const chunks: Uint8Array[] = [];
         let size = 0;
+        let truncated = false;
         for (;;) {
             const { done, value } = await reader.read();
             if (done) {
                 break;
             }
+            const retained = softLimit === undefined ? value : value.subarray(0, Math.max(0, softLimit - size));
+            chunks.push(retained);
             size += value.byteLength;
+            if (softLimit !== undefined && size > softLimit) {
+                truncated = true;
+                await reader.cancel().catch(() => undefined);
+                break;
+            }
             if (size > this.limits.maxBodyBytes) {
                 await reader.cancel().catch(() => undefined);
                 throw new ProbeHttpError('body_too_large');
             }
-            chunks.push(value);
         }
-        return new TextDecoder().decode(Buffer.concat(chunks));
+        const bytes = Buffer.concat(chunks);
+        return { text: new TextDecoder('utf-8', { ignoreBOM: true }).decode(truncated ? bytes.subarray(0, softLimit) : bytes), truncated };
     }
 
-    private async sendOnce(method: string, url: string, request: ProbeRequest, body: string | undefined): Promise<{ response: Response; text: string | undefined; elapsedMs: number }> {
+    private async sendOnce(method: string, url: string, request: ProbeRequest, body: string | undefined, attachment?: { anonymous: boolean }): Promise<{ response: Response; text: string | undefined; truncated: boolean; elapsedMs: number }> {
         const headers = new Headers(request.headers);
-        headers.set('authorization', this.authorization);
+        if (attachment?.anonymous !== true) {
+            headers.set('authorization', this.authorization);
+        }
         headers.set('user-agent', `caldav-mcp-probe/${PROBE_VERSION}`);
         if (body !== undefined && !headers.has('content-type')) {
             headers.set('content-type', 'application/xml; charset=utf-8');
@@ -377,22 +423,32 @@ export class ProbeHttp {
                 timedOut = true;
                 controller.abort();
                 reject(new ProbeHttpError('timeout'));
-            }, this.timeoutFor(request));
+            }, attachment === undefined ? this.timeoutFor(request) : Math.min(10_000, this.timeoutFor(request)));
         });
         const started = this.options.now();
         const work = (async () => {
             let response: Response;
             try {
-                response = await this.options.fetch(url, { method, headers, redirect: 'manual', signal: controller.signal, ...(body === undefined ? {} : { body }) });
+                response = await this.options.fetch(url, { method, headers, redirect: 'manual', signal: controller.signal, ...(attachment === undefined ? {} : { credentials: 'omit' }), ...(body === undefined ? {} : { body }) });
             } catch {
                 throw new ProbeHttpError(timedOut ? 'timeout' : 'network');
             }
+            // Receiving the status is enough: an unreadable body must never erase a rejected login.
+            if (response.status === 401 && attachment?.anonymous !== true) {
+                if (this.rejected) {
+                    this.latchDeleteRejected = true;
+                } else {
+                    this.rejected = true;
+                    this.rejectedFirst = this.requestCount === 1;
+                }
+            }
             if (REDIRECTS.has(response.status) && response.headers.has('location') && request.followRedirects !== false) {
                 await response.body?.cancel().catch(() => undefined);
-                return { response, text: undefined };
+                return { response, text: undefined, truncated: false };
             }
             try {
-                return { response, text: await this.readCapped(response) };
+                const read = await this.readCapped(response, request.maxBytes);
+                return { response, text: read.text, truncated: read.truncated };
             } catch (error) {
                 if (error instanceof ProbeHttpError) {
                     throw error;
@@ -410,15 +466,6 @@ export class ProbeHttp {
     }
 
     private record(method: string, response: Response, elapsedMs: number): void {
-        if (response.status === 401) {
-            if (this.rejected) {
-                // The one permitted cleanup DELETE was refused too: stop everything.
-                this.latchDeleteRejected = true;
-            } else {
-                this.rejected = true;
-                this.rejectedFirst = this.requestCount === 1;
-            }
-        }
         this.latencies.push({ method, ms: elapsedMs });
         const key = String(response.status);
         this.statuses[key] = (this.statuses[key] ?? 0) + 1;
@@ -453,7 +500,7 @@ export class ProbeHttp {
             this.checkPolicy(method, url);
             this.checkLatch(method, url, request, hop);
             await this.beforeSend(request);
-            const { response, text, elapsedMs } = await this.sendOnce(method, url, request, body);
+            const { response, text, truncated, elapsedMs } = await this.sendOnce(method, url, request, body);
             elapsedTotal += elapsedMs;
             this.record(method, response, elapsedMs);
             if (text === undefined) {
@@ -465,9 +512,48 @@ export class ProbeHttp {
                 }
                 continue;
             }
-            return { status: response.status, headers: response.headers, body: text, url, redirects: redirectStatuses.length, redirectStatuses, elapsedMs: elapsedTotal };
+            return { status: response.status, headers: response.headers, body: text, url, redirects: redirectStatuses.length, redirectStatuses, elapsedMs: elapsedTotal, truncated };
         }
         throw new ProbeHttpError('too_many_redirects');
+    }
+
+    /**
+     * A single bounded GET in the probe-authored attachment experiment. The caller must first
+     * verify the synthetic UID, MANAGED-ID, SIZE and FILENAME. `attachValue` is that exact ATTACH
+     * value, not a normalized URL. Only its anonymous 401/403 permits Basic, only its returned
+     * Location permits one anonymous redirect hop, and no step can be repeated. This never
+     * expands the host/credential policy of request() or the owner's attachment fetch.
+     */
+    async attachmentDownload(attachValue: string, url: string, step: AttachmentStep): Promise<ProbeResponse> {
+        if (this.mode !== 'write') { throw new ProbeHttpError('method_not_allowed'); }
+        if (!isAttachmentDestination(attachValue) || !isAttachmentDestination(url, step === 'redirect') || (step !== 'redirect' && url !== attachValue)) {
+            throw new ProbeHttpError('forbidden_host');
+        }
+        const state = this.downloads.get(attachValue) ?? { steps: new Set<AttachmentStep>() };
+        const previous = state.last;
+        if (state.steps.has(step) || (step === 'anonymous' && state.steps.size !== 0)
+            || (step === 'authenticated' && (state.steps.size !== 1 || !state.steps.has('anonymous') || ![401, 403].includes(previous?.status ?? 0)))) {
+            throw new ProbeHttpError('method_not_allowed');
+        }
+        if (step === 'redirect') {
+            let location: string | undefined;
+            try { location = previous?.headers.has('location') === true ? new URL(previous.headers.get('location') ?? '', previous.url).href : undefined; } catch { /* Refuse malformed Location. */ }
+            if (previous === undefined || previous.status < 300 || previous.status >= 400 || location !== url) {
+                throw new ProbeHttpError('forbidden_host');
+            }
+        }
+        const request: ProbeRequest = { method: 'GET', url, headers: { range: 'bytes=0-63' }, followRedirects: false, maxBytes: 64 * 1024 };
+        this.checkLatch('GET', url, request, 0);
+        // Consume before awaiting: concurrent calls cannot repeat a step or bypass the challenge.
+        state.steps.add(step);
+        delete state.last;
+        this.downloads.set(attachValue, state);
+        await this.beforeSend(request);
+        const { response, text, truncated, elapsedMs } = await this.sendOnce('GET', url, request, undefined, { anonymous: step !== 'authenticated' });
+        this.record('GET', response, elapsedMs);
+        const result: ProbeResponse = { status: response.status, headers: response.headers, body: text ?? '', url, redirects: 0, redirectStatuses: [], truncated, elapsedMs };
+        state.last = result;
+        return result;
     }
 
     stats(): HttpStats {

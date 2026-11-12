@@ -133,14 +133,20 @@ const STRUCTURAL = new Set([
     'EXDATE', 'RDATE', 'RECURRENCE-ID', 'DURATION', 'TRIGGER', 'TZID', 'TZOFFSETFROM',
     'TZOFFSETTO', 'TZNAME', 'PRIORITY', 'PERCENT-COMPLETE', 'REPEAT', 'FREEBUSY',
 ]);
-const TEXT_PARAMS = new Set(['CN', 'EMAIL', 'SENT-BY', 'DIR', 'DELEGATED-TO', 'DELEGATED-FROM', 'MEMBER', 'ALTREP']);
+const TEXT_PARAMS = new Set(['CN', 'EMAIL', 'SENT-BY', 'DIR', 'DELEGATED-TO', 'DELEGATED-FROM', 'MEMBER', 'ALTREP', 'FILENAME']);
+
+/** An inline attachment: its value is the file itself, base64 encoded (possibly megabytes), not text. */
+export function isInlineBinary(p: IcalProperty): boolean {
+    return p.params.ENCODING?.toUpperCase() === 'BASE64' || p.params.VALUE?.toUpperCase() === 'BINARY';
+}
 
 /** Every user-text value in a component tree, for the taint set. */
 export function textValues(component: IcalComponent): string[] {
     const values: string[] = [];
     const walk = (c: IcalComponent): void => {
         for (const p of c.properties) {
-            if (!STRUCTURAL.has(p.name)) {
+            // A base64 file would only make the taint set huge; it can never be a word that a report could echo.
+            if (!STRUCTURAL.has(p.name) && !(p.name === 'ATTACH' && isInlineBinary(p))) {
                 values.push(p.value);
                 values.push(p.value.replace(/^mailto:/i, ''));
             }

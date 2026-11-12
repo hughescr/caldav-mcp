@@ -1,5 +1,5 @@
 import { CheckStop, isOk, isRefusal, type CheckContext, type CheckDef } from '../context';
-import { absolute, calendarQueryBody, dav, eventComponents, getIcal } from '../dav';
+import { absolute, calendarQueryBody, dav, eventComponents, getIcal, requireSynthetic } from '../dav';
 import { icalUtc, prop } from '../ical';
 import { etagShape, prose, safeNames, tokenShape } from '../safe';
 import type { Evidence } from '../types';
@@ -17,10 +17,12 @@ export const mkcalendarCheck: CheckDef = {
     claim: 'MKCALENDAR creates a VEVENT calendar that a PROPFIND then shows.',
     needs: 'home',
     async run(ctx) {
-        const made = await createTempCalendar(ctx);
+        const made = await createTempCalendar(ctx, { calendarTimezone: true });
         const evidence: Evidence = {
             mkcalendarStatus: made.status, visibleAfterCreate: made.visible, displayNameKept: made.displayNameKept, declaresVevent: made.declaresVevent,
             locationHeader: made.locationHeader, locationUsed: made.locationUsed,
+            calendarTimezoneSent: made.calendarTimezoneSent, calendarTimezonePresent: made.calendarTimezonePresent, calendarTimezoneKept: made.calendarTimezoneKept,
+            calendarTimezoneRefused: made.calendarTimezoneRefused,
         };
         if (isOk(made.status) && made.visible) {
             ctx.state.primaryTemp = made.temp;
@@ -163,6 +165,9 @@ export const noEndCheck: CheckDef = {
         const evidence: Evidence = { status: put.status, preconditions: safeNames(put.errorElements, ctx.taint) };
         if (isOk(put.status)) {
             const stored = await getIcal(ctx, url);
+            if (stored.status === 200) {
+                requireSynthetic(stored.ical, stored.url, temp.url, uid, stored.status);
+            }
             const event = eventComponents(stored.ical)[0];
             evidence.serverAddedDtend = event !== undefined && prop(event, 'DTEND') !== undefined;
             evidence.serverAddedDuration = event !== undefined && prop(event, 'DURATION') !== undefined;
@@ -230,6 +235,12 @@ export const expandWriteCheck: CheckDef = {
         await createOrStop(ctx, url, body, evidence);
         const r = await dav(ctx, 'REPORT', temp.url, { depth: '1', body: calendarQueryBody({ start: baseDay(ctx), end: baseDay(ctx) + 45 * DAY, calendarData: 'expand' }) });
         const series = toResources(r.ms, temp.url).find((res) => res.href === url);
+        if (new URL(r.res.url).href !== new URL(temp.url).href) {
+            throw new CheckStop('inconclusive', prose`The expand response was outside the probe calendar.`, { status: r.res.status, provenanceVerified: false });
+        }
+        if (series !== undefined) {
+            requireSynthetic(series.ical, series.href, temp.url, uid, r.res.status);
+        }
         const events = eventComponents(series?.ical);
         const instances = events.filter((e) => prop(e, 'RECURRENCE-ID') !== undefined);
         const overrideId = icalUtc(start + 7 * DAY);

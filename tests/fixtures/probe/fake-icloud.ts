@@ -3,9 +3,14 @@
  * Its behaviour on every point the probe measures is configurable, so each check can be
  * driven to `confirmed`, `refuted` and `inconclusive`. All data is synthetic.
  */
-import { comps, parseIcal, prop, props, type IcalComponent } from '../../../scripts/probe/ical';
+import { comps, parseIcal, prop, props } from '../../../scripts/probe/ical';
 import { child, childrenNamed, descendants, escapeXml, parseXml, type XmlNode } from '../../../scripts/probe/xml';
+import {
+    embeddedZones, expandResource, limitRecurrenceSet, occurrences, overlaps, parseDt, pointOf, utc, zoneFromVtimezone, BUILTIN_ZONES,
+    type ExpandStyle, type TimeEnv, type ZoneRules,
+} from './fake-time';
 
+export { utc } from './fake-time';
 export const FAKE_NOW = Date.parse('2026-11-11T12:00:00Z');
 const DAY = 86_400_000;
 
@@ -45,6 +50,62 @@ export interface FakeBehaviour {
     weakEtags: boolean;
     /** The Depth value sync-collection accepts (RFC 6578: 0). */
     syncDepth: '0' | '1';
+    /** Form of expanded instances: everything in UTC, original forms kept, forms kept without VTIMEZONE, DATE turned into UTC. */
+    expandStyle: ExpandStyle;
+    /** An expanded instance of an event with DURATION keeps DURATION instead of getting a DTEND. */
+    expandKeepsDuration: boolean;
+    /** Where floating and DATE values sit on the time axis for time-range filtering and expansion. */
+    floatingInterpretation: 'utc' | 'calendar-timezone';
+    /** MKCALENDAR with a calendar-timezone property: stored, silently ignored, replaced by the server's own (Europe/Berlin), or refused with HTTP 400. */
+    calendarTimezone: 'stored' | 'ignored' | 'replaced' | 'refused';
+    /** A known TZID with an embedded VTIMEZONE: whose rules expansion uses. */
+    tzPolicy: 'embedded-first' | 'tzdb-first' | 'ignore';
+    /** A TZID the server does not know: use the embedded rules, treat it as America/New_York, or as UTC. */
+    unknownTzid: 'use-embedded' | 'as-new-york' | 'as-utc';
+    /** PUT of an unknown TZID's VTIMEZONE: kept as sent, refused with HTTP 400, or dropped on save. */
+    vtimezonePolicy: 'preserve' | 'refuse-unknown' | 'strip-unknown';
+    /** Whether an override counts for a time range by its own times or by the instance it replaces. */
+    overrideMatching: 'actual' | 'original-slot';
+    /** RECURRENCE-ID;RANGE=THISANDFUTURE moves later instances too, or only the one instance. */
+    thisAndFuture: 'applied' | 'ignored';
+    /** A TZID wall-clock time that occurs twice (the end of daylight time): the first occurrence (RFC 5545) or the second. */
+    repeatedHour: 'first' | 'second';
+    /** A TZID wall-clock time that does not exist (the start of daylight time): read with the offset before the gap (RFC 5545) or after it. */
+    skippedHour: 'before-gap' | 'after-gap';
+    /** Yearly on February 29: only leap years (RFC 5545), February 28, or March 1. */
+    feb29: 'skip' | 'clamp' | 'roll';
+    /** PUT of a VALUE=DATE event whose DTEND equals DTSTART. */
+    dateZeroLength: 'accept' | 'refuse' | 'rewrite';
+    /** PUT of RECURRENCE-ID;RANGE=...: kept, the parameter dropped on save, or refused with HTTP 400. */
+    rangeParam: 'keep' | 'strip' | 'refuse';
+    /** calendar-data/limit-recurrence-set: applied, ignored (everything returned), or refused with HTTP 400. */
+    limitRecurrenceSet: 'works' | 'ignored' | 'refused';
+    /** The calendar-data in a calendar-query: as stored, with LF line endings, or without X- properties. */
+    queryCalendarData: 'verbatim' | 'lf-line-endings' | 'dropped-x-properties';
+    /** Appended inside the quotes of the ETag a calendar-query returns (a different ETag than GET). */
+    reportEtagSuffix: string;
+    /** calendar-multiget returns at most this many resources (extra hrefs are silently dropped). */
+    multigetMaxHrefs: number;
+    /** calendar-multiget answers 404 for every Nth requested href (0: never). */
+    multigetHidesEvery: number;
+    /** POST ?action=attachment-add / -remove: works, refused with 403, answered 401, or not implemented (405). */
+    attachmentAdd: 'works' | 'forbidden' | 'unauthorized' | 'unsupported';
+    /** An accepted attachment-add carries the Cal-Managed-ID and Location headers. */
+    attachmentAddHeaders: boolean;
+    /** An accepted attachment-add returns the event when the request has `Prefer: return=representation`. */
+    attachmentAddRepresentation: boolean;
+    /** The ATTACH the fake writes has a SIZE parameter. */
+    attachmentSizeParam: boolean;
+    /** Which host the URL of a managed attachment names (the fake serves it on any host it is asked on). */
+    attachmentHost: 'partition' | 'root' | 'content' | 'other' | 'icloud-other';
+    /** Whether the initial attachment URL serves bytes anonymously (redirect targets always do). */
+    attachmentAnonymous: boolean;
+    /** GET of an attachment URL: served (with Range), served ignoring Range, redirected within the allowed hosts, redirected to icloud-content.com, or refused with 403 or 401. */
+    attachmentGet: 'ok' | 'ignores-range' | 'redirect-allowed' | 'redirect-content' | 'forbidden' | 'unauthorized';
+    /** PUT of an event with ATTACH: kept as sent, an inline one turned into a managed attachment, or every ATTACH dropped. */
+    attachmentPut: 'preserve' | 'inline-to-managed' | 'drop';
+    /** Transform a normal response for adversarial evidence/coverage tests (in-memory only). */
+    transformResponse?: (req: FakeRequest, response: Response) => Promise<Response>;
     /** Return a response to override normal handling. */
     hook?: (req: FakeRequest, count: number) => Response | undefined;
 }
@@ -74,6 +135,8 @@ interface FakeCalendar {
     events: Map<string, FakeEvent>;
     tombstones: Map<string, number>;
     rev: number;
+    /** The calendar-timezone property (iCalendar text), when one was stored. */
+    timezone?: string;
 }
 
 const DEFAULT_BEHAVIOUR: FakeBehaviour = {
@@ -95,7 +158,47 @@ const DEFAULT_BEHAVIOUR: FakeBehaviour = {
     principalChangesEachTime: false,
     weakEtags: false,
     syncDepth: '0',
+    expandStyle: 'utc-all',
+    expandKeepsDuration: false,
+    floatingInterpretation: 'utc',
+    calendarTimezone: 'stored',
+    tzPolicy: 'embedded-first',
+    unknownTzid: 'use-embedded',
+    vtimezonePolicy: 'preserve',
+    overrideMatching: 'actual',
+    thisAndFuture: 'ignored',
+    repeatedHour: 'first',
+    skippedHour: 'before-gap',
+    feb29: 'skip',
+    dateZeroLength: 'accept',
+    rangeParam: 'keep',
+    limitRecurrenceSet: 'works',
+    queryCalendarData: 'verbatim',
+    reportEtagSuffix: '',
+    multigetMaxHrefs: Infinity,
+    multigetHidesEvery: 0,
+    attachmentAdd: 'works',
+    attachmentAddHeaders: true,
+    attachmentAddRepresentation: true,
+    attachmentSizeParam: true,
+    attachmentHost: 'partition',
+    attachmentAnonymous: false,
+    attachmentGet: 'ok',
+    attachmentPut: 'preserve',
 };
+
+/** A file the fake serves at an attachment URL. */
+export interface FakeBlob { text: string; type: string }
+
+const ATTACHMENT_HOSTS = { 'icloud-other': 'p123-attachment.icloud.com', partition: 'p42-caldav.icloud.com', root: 'caldav.icloud.com', content: 'p42-content.icloud-content.com', other: 'files.example.invalid' } as const;
+
+/** A calendar-timezone the fake supplies itself in `replaced` mode. */
+const SERVER_DEFAULT_TIMEZONE = [
+    'BEGIN:VCALENDAR', 'VERSION:2.0', 'BEGIN:VTIMEZONE', 'TZID:Europe/Berlin',
+    'BEGIN:STANDARD', 'TZOFFSETFROM:+0200', 'TZOFFSETTO:+0100', 'DTSTART:19961027T030000', 'RRULE:FREQ=YEARLY;BYMONTH=10;BYDAY=-1SU', 'END:STANDARD',
+    'BEGIN:DAYLIGHT', 'TZOFFSETFROM:+0100', 'TZOFFSETTO:+0200', 'DTSTART:19960331T020000', 'RRULE:FREQ=YEARLY;BYMONTH=3;BYDAY=-1SU', 'END:DAYLIGHT',
+    'END:VTIMEZONE', 'END:VCALENDAR',
+].join('\r\n') + '\r\n';
 
 const NS = 'xmlns:d="DAV:" xmlns:cal="urn:ietf:params:xml:ns:caldav" xmlns:cs="http://calendarserver.org/ns/" xmlns:ic="http://apple.com/ns/ical/"';
 const PREFIX: Record<string, string> = {
@@ -134,110 +237,8 @@ function errorResponse(status: number, element: string, inner = ''): Response {
     return new Response(`<?xml version="1.0" encoding="UTF-8"?><d:error ${NS}><${element}>${inner}</${element}></d:error>`, { status, headers: { 'content-type': 'text/xml' } });
 }
 
-function parseDt(value: string | undefined): number | undefined {
-    const match = /^(\d{4})(\d{2})(\d{2})(?:T(\d{2})(\d{2})(\d{2})Z?)?$/.exec(value ?? '');
-    if (match === null) {
-        return undefined;
-    }
-    const [, y, mo, d, h, mi, s] = match;
-    return Date.UTC(Number(y), Number(mo) - 1, Number(d), Number(h ?? 0), Number(mi ?? 0), Number(s ?? 0));
-}
-
-function utc(ms: number): string {
-    return new Date(ms).toISOString().replace(/[-:]/g, '').replace(/\.\d{3}/, '');
-}
-
-function durationMs(value: string | undefined): number | undefined {
-    const match = /^P(?:(\d+)W)?(?:(\d+)D)?(?:T(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?)?$/.exec(value ?? '');
-    if (match === null) {
-        return undefined;
-    }
-    const [, w, d, h, m, s] = match.map((x) => Number(x ?? 0));
-    return ((((w ?? 0) * 7 + (d ?? 0)) * 24 + (h ?? 0)) * 60 + (m ?? 0)) * 60_000 + (s ?? 0) * 1000;
-}
-
-interface Occurrence { start: number; end: number; recurrenceId: number | null; component: IcalComponent }
-
-function bounds(event: IcalComponent): { start: number; end: number } | undefined {
-    const startProp = prop(event, 'DTSTART');
-    const start = parseDt(startProp?.value);
-    if (start === undefined) {
-        return undefined;
-    }
-    const isDate = startProp?.params.VALUE === 'DATE' || /^\d{8}$/.test(startProp?.value ?? '');
-    const end = parseDt(prop(event, 'DTEND')?.value) ?? (start + (durationMs(prop(event, 'DURATION')?.value) ?? (isDate ? DAY : 0)));
-    return { start, end };
-}
-
-function occurrences(resource: IcalComponent, limitEnd: number): Occurrence[] {
-    const events = [...comps(resource, 'VEVENT'), ...comps(resource, 'VTODO')];
-    const master = events.find((e) => prop(e, 'RECURRENCE-ID') === undefined);
-    const overrides = events.filter((e) => prop(e, 'RECURRENCE-ID') !== undefined);
-    const result: Occurrence[] = [];
-    const overridden = new Set(overrides.map((o) => parseDt(prop(o, 'RECURRENCE-ID')?.value)));
-    if (master !== undefined) {
-        const b = bounds(master);
-        const rule = prop(master, 'RRULE')?.value;
-        if (b !== undefined) {
-            if (rule === undefined) {
-                result.push({ start: b.start, end: b.end, recurrenceId: null, component: master });
-            } else {
-                const parts = Object.fromEntries(rule.split(';').map((p) => p.split('=') as [string, string]));
-                const step = (parts.FREQ === 'DAILY' ? DAY : 7 * DAY) * Number(parts.INTERVAL ?? 1);
-                const count = parts.COUNT === undefined ? Infinity : Number(parts.COUNT);
-                const until = parseDt(parts.UNTIL) ?? Infinity;
-                const exdates = new Set(props(master, 'EXDATE').flatMap((p) => p.value.split(',')).map((v) => parseDt(v)));
-                for (let i = 0, start = b.start; i < count && start <= until && start < limitEnd && i < 2000; i++, start += step) {
-                    if (exdates.has(start) || overridden.has(start)) {
-                        continue;
-                    }
-                    result.push({ start, end: start + (b.end - b.start), recurrenceId: start, component: master });
-                }
-            }
-        }
-    }
-    for (const o of overrides) {
-        const b = bounds(o);
-        if (b !== undefined) {
-            result.push({ start: b.start, end: b.end, recurrenceId: parseDt(prop(o, 'RECURRENCE-ID')?.value) ?? null, component: o });
-        }
-    }
-    return result;
-}
-
-function overlaps(o: { start: number; end: number }, start: number, end: number): boolean {
-    return o.end > o.start ? o.start < end && o.end > start : o.start >= start && o.start < end;
-}
-
 function unfoldedLines(ical: string): string[] {
     return ical.replace(/\r?\n[ \t]/g, '').split(/\r?\n/).filter((l) => l !== '');
-}
-
-function expandResource(ical: string, start: number, end: number): string {
-    const root = parseIcal(ical);
-    if (root === undefined) {
-        return ical;
-    }
-    const lines = ['BEGIN:VCALENDAR', 'VERSION:2.0', 'PRODID:-//fake//EN'];
-    const recurring = comps(root, 'VEVENT').some((e) => prop(e, 'RRULE') !== undefined);
-    for (const occ of occurrences(root, end)) {
-        if (!overlaps(occ, start, end)) {
-            continue;
-        }
-        lines.push('BEGIN:VEVENT');
-        for (const p of occ.component.properties) {
-            if (['RRULE', 'EXDATE', 'RDATE', 'DTSTART', 'DTEND', 'DURATION', 'RECURRENCE-ID'].includes(p.name)) {
-                continue;
-            }
-            lines.push(`${p.name}${Object.entries(p.params).map(([k, v]) => `;${k}=${v}`).join('')}:${p.value}`);
-        }
-        if (recurring && occ.recurrenceId !== null) {
-            lines.push(`RECURRENCE-ID:${utc(occ.recurrenceId)}`);
-        }
-        lines.push(`DTSTART:${utc(occ.start)}`, `DTEND:${utc(occ.end)}`, 'END:VEVENT');
-    }
-    lines.push('END:VCALENDAR');
-    return `${lines.join('\r\n')}\r\n`;
 }
 
 export class FakeICloud {
@@ -245,8 +246,11 @@ export class FakeICloud {
     readonly calendars = new Map<string, FakeCalendar>();
     readonly behaviour: FakeBehaviour;
     readonly host: string;
+    /** Files behind attachment URLs, by managed id. */
+    readonly blobs = new Map<string, FakeBlob>();
     private etagCounter = 0;
     private principalCalls = 0;
+    private managedCounter = 0;
 
     constructor(private readonly options: FakeOptions) {
         this.behaviour = { ...DEFAULT_BEHAVIOUR, ...options.behaviour };
@@ -300,11 +304,14 @@ export class FakeICloud {
             return hooked;
         }
         const expected = `Basic ${Buffer.from(`${this.options.appleId}:${this.options.appPassword}`).toString('base64')}`;
-        if (fake.headers.get('authorization') !== expected) {
+        const anonymousFile = fake.method === 'GET' && fake.url.pathname.includes('/attachments/')
+            && (this.behaviour.attachmentAnonymous || fake.url.searchParams.has('hop') || fake.url.hostname === ATTACHMENT_HOSTS.content);
+        if (!anonymousFile && fake.headers.get('authorization') !== expected) {
             return new Response('Unauthorized', { status: 401, headers: { 'www-authenticate': 'Basic realm="fake"' } });
         }
         try {
-            return this.route(fake);
+            const response = this.route(fake);
+            return this.behaviour.transformResponse === undefined ? response : await this.behaviour.transformResponse(fake, response);
         } catch {
             return new Response('fake server error', { status: 500 });
         }
@@ -313,6 +320,11 @@ export class FakeICloud {
     private route(req: FakeRequest): Response {
         const host = req.url.hostname;
         const path = decodeURIComponent(req.url.pathname);
+        const attachment = /^\/[^/]+\/attachments\/([^/]+)\/[^/]+$/.exec(path);
+        if (attachment !== null) {
+            // Served on whatever host it is asked on; the tests assert which hosts the probe really contacted.
+            return this.attachmentFile(req, attachment[1] ?? '');
+        }
         if (host !== 'caldav.icloud.com' && host !== this.host) {
             return new Response('wrong host', { status: 421 });
         }
@@ -347,6 +359,121 @@ export class FakeICloud {
             return this.collection(req, calId);
         }
         return this.resource(req, calId, name);
+    }
+
+    private attachmentUrl(id: string, filename: string): string {
+        const host = ATTACHMENT_HOSTS[this.behaviour.attachmentHost];
+        const port = this.behaviour.attachmentHost === 'partition' || this.behaviour.attachmentHost === 'root' ? ':443' : '';
+        return `https://${host}${port}/${this.options.dsid}/attachments/${id}/${encodeURIComponent(filename)}`;
+    }
+
+    /** A new managed attachment: the file is stored and the ATTACH line that names it is returned. */
+    private managedLine(blob: FakeBlob, filename: string): { id: string; line: string } {
+        const id = `${String(++this.managedCounter).padStart(8, '0')}-0000-4000-8000-000000000000`;
+        this.blobs.set(id, blob);
+        const size = this.behaviour.attachmentSizeParam ? `;SIZE=${Buffer.byteLength(blob.text)}` : '';
+        return { id, line: `ATTACH;MANAGED-ID=${id};FMTTYPE=${blob.type}${size};FILENAME=${filename}:${this.attachmentUrl(id, filename)}` };
+    }
+
+    private attachmentFile(req: FakeRequest, id: string): Response {
+        const mode = this.behaviour.attachmentGet;
+        if (req.method !== 'GET') {
+            return new Response(null, { status: 405 });
+        }
+        if (mode === 'unauthorized') {
+            return new Response('Unauthorized', { status: 401, headers: { 'www-authenticate': 'Bearer realm="fake"' } });
+        }
+        if (mode === 'forbidden') {
+            return new Response('no', { status: 403 });
+        }
+        // Like a front end that redirects before it knows whether the file is still there.
+        const hopped = req.url.searchParams.has('hop') || req.url.hostname === ATTACHMENT_HOSTS.content;
+        if (!hopped && mode === 'redirect-allowed') {
+            return new Response(null, { status: 302, headers: { location: `https://${this.host}:443${req.url.pathname}?hop=2` } });
+        }
+        if (!hopped && mode === 'redirect-content') {
+            return new Response(null, { status: 302, headers: { location: `https://${ATTACHMENT_HOSTS.content}${req.url.pathname}` } });
+        }
+        const blob = this.blobs.get(id);
+        if (blob === undefined) {
+            return new Response('not found', { status: 404 });
+        }
+        const bytes = Buffer.from(blob.text, 'utf8');
+        const range = /^bytes=(\d+)-(\d+)$/.exec(req.headers.get('range') ?? '');
+        if (range?.[1] !== undefined && range[2] !== undefined && mode !== 'ignores-range') {
+            const [from, to] = [Number(range[1]), Math.min(Number(range[2]), bytes.length - 1)];
+            const slice = bytes.subarray(from, to + 1);
+            return new Response(slice, { status: 206, headers: { 'content-type': blob.type, 'accept-ranges': 'bytes', 'content-range': `bytes ${from}-${to}/${bytes.length}`, 'content-length': String(slice.length) } });
+        }
+        return new Response(bytes, { status: 200, headers: { 'content-type': blob.type, 'content-length': String(bytes.length), ...(mode === 'ignores-range' ? {} : { 'accept-ranges': 'bytes' }) } });
+    }
+
+    /** POST ?action=attachment-add and ?action=attachment-remove (RFC 8607) on an event. */
+    private attachmentAction(req: FakeRequest, cal: FakeCalendar, name: string, existing: FakeEvent | undefined): Response {
+        const mode = this.behaviour.attachmentAdd;
+        if (mode === 'unsupported') {
+            return new Response(null, { status: 405 });
+        }
+        if (mode === 'unauthorized') {
+            return new Response('Unauthorized', { status: 401, headers: { 'www-authenticate': 'Basic realm="fake"' } });
+        }
+        if (mode === 'forbidden' || !cal.writable) {
+            return errorResponse(403, 'd:need-privileges');
+        }
+        if (existing === undefined) {
+            return new Response('not found', { status: 404 });
+        }
+        const action = req.url.searchParams.get('action');
+        const lines = unfoldedLines(existing.ical);
+        const at = lines.indexOf('END:VEVENT');
+        if (action === 'attachment-add') {
+            const filename = /filename="([^"]*)"/.exec(req.headers.get('content-disposition') ?? '')?.[1] ?? 'attachment';
+            const { id, line } = this.managedLine({ text: req.body, type: req.headers.get('content-type') ?? 'application/octet-stream' }, filename);
+            lines.splice(at, 0, line);
+            existing.ical = `${lines.join('\r\n')}\r\n`;
+            existing.etag = this.nextEtag();
+            cal.rev++;
+            existing.rev = cal.rev;
+            const headers: Record<string, string> = { etag: existing.etag };
+            if (this.behaviour.attachmentAddHeaders) {
+                headers['cal-managed-id'] = id;
+                headers.location = this.attachmentUrl(id, filename);
+            }
+            const represent = this.behaviour.attachmentAddRepresentation && /return=representation/.test(req.headers.get('prefer') ?? '');
+            return new Response(represent ? existing.ical : null, { status: 201, headers: represent ? { ...headers, 'content-type': 'text/calendar; charset=utf-8' } : headers });
+        }
+        if (action === 'attachment-remove') {
+            const id = req.url.searchParams.get('managed-id') ?? '';
+            const kept = lines.filter((l) => !(l.startsWith('ATTACH;') && l.includes(`MANAGED-ID=${id};`)));
+            if (kept.length === lines.length || !this.blobs.has(id)) {
+                return new Response('no such attachment', { status: 404 });
+            }
+            this.blobs.delete(id);
+            existing.ical = `${kept.join('\r\n')}\r\n`;
+            existing.etag = this.nextEtag();
+            cal.rev++;
+            existing.rev = cal.rev;
+            return new Response(null, { status: 204, headers: { etag: existing.etag } });
+        }
+        return new Response('unknown action', { status: 400 });
+    }
+
+    /** What a PUT does to ATTACH properties (`attachmentPut`). */
+    private applyAttachmentPolicy(lines: string[]): string[] {
+        const policy = this.behaviour.attachmentPut;
+        if (policy === 'preserve') {
+            return lines;
+        }
+        if (policy === 'drop') {
+            return lines.filter((l) => !/^ATTACH[;:]/.test(l));
+        }
+        return lines.map((l) => {
+            const inline = /^ATTACH;[^:]*(?:ENCODING=BASE64|VALUE=BINARY)[^:]*:(.*)$/.exec(l);
+            if (inline?.[1] === undefined) {
+                return l;
+            }
+            return this.managedLine({ text: Buffer.from(inline[1], 'base64').toString('utf8'), type: /FMTTYPE=([^;:]+)/.exec(l)?.[1] ?? 'application/octet-stream' }, 'inline-file').line;
+        });
     }
 
     private principalProp(name: string): string | undefined {
@@ -415,6 +542,8 @@ export class FakeICloud {
                     return this.token(cal, cal.rev);
                 case 'supported-calendar-component-set':
                     return cal.components.map((c) => `<cal:comp name="${c}"/>`).join('');
+                case 'calendar-timezone':
+                    return cal.timezone === undefined ? undefined : xmlText(cal.timezone);
                 case 'current-user-privilege-set':
                     return `<d:privilege><d:read/></d:privilege>${cal.writable ? '<d:privilege><d:write/></d:privilege><d:privilege><d:write-content/></d:privilege>' : ''}`;
                 case 'source':
@@ -457,7 +586,15 @@ export class FakeICloud {
             const root = parseXml(req.body);
             const displayName = descendants(root, 'displayname')[0]?.text ?? calId;
             const components = descendants(root, 'comp').map((c) => c.attrs.name ?? '').filter((c) => c !== '');
-            this.calendars.set(calId, { id: calId, displayName, kind: 'owned', components: components.length > 0 ? components : ['VEVENT'], writable: true, color: '#000000FF', events: new Map(), tombstones: new Map(), rev: 1 });
+            const timezone = descendants(root, 'calendar-timezone')[0]?.text;
+            if (timezone !== undefined && this.behaviour.calendarTimezone === 'refused') {
+                return errorResponse(400, 'd:error');
+            }
+            this.calendars.set(calId, {
+                id: calId, displayName, kind: 'owned', components: components.length > 0 ? components : ['VEVENT'], writable: true, color: '#000000FF', events: new Map(), tombstones: new Map(), rev: 1,
+                ...(timezone !== undefined && this.behaviour.calendarTimezone === 'stored' ? { timezone } : {}),
+                ...(this.behaviour.calendarTimezone === 'replaced' ? { timezone: SERVER_DEFAULT_TIMEZONE } : {}),
+            });
             return new Response(null, { status: 201 });
         }
         if (cal === undefined) {
@@ -487,14 +624,45 @@ export class FakeICloud {
         return new Response(null, { status: 405 });
     }
 
-    private eventEntry(cal: FakeCalendar, name: string, event: FakeEvent, propNode: XmlNode | undefined, expandRange?: { start: number; end: number }): string {
+    /** How times are placed on the axis for one resource of one calendar. */
+    private env(cal: FakeCalendar, resource: ReturnType<typeof parseIcal>): TimeEnv {
+        let floating: ZoneRules | undefined;
+        if (this.behaviour.floatingInterpretation === 'calendar-timezone' && cal.timezone !== undefined) {
+            const tz = comps(parseIcal(cal.timezone) ?? { name: '', properties: [], components: [] }, 'VTIMEZONE')[0];
+            floating = tz === undefined ? undefined : zoneFromVtimezone(tz);
+        }
+        return {
+            floating, embedded: embeddedZones(resource), tzPolicy: this.behaviour.tzPolicy, unknownTzid: this.behaviour.unknownTzid,
+            overrideMatching: this.behaviour.overrideMatching, thisAndFuture: this.behaviour.thisAndFuture, feb29: this.behaviour.feb29,
+            repeatedHour: this.behaviour.repeatedHour, skippedHour: this.behaviour.skippedHour,
+        };
+    }
+
+    private queryText(ical: string): string {
+        switch (this.behaviour.queryCalendarData) {
+            case 'verbatim':
+                return ical;
+            case 'lf-line-endings':
+                return ical.replace(/\r\n/g, '\n');
+            case 'dropped-x-properties':
+                return `${unfoldedLines(ical).filter((l) => !l.startsWith('X-')).join('\r\n')}\r\n`;
+        }
+    }
+
+    private eventEntry(cal: FakeCalendar, name: string, event: FakeEvent, propNode: XmlNode | undefined, view: { expandRange?: { start: number; end: number }; limitRange?: { start: number; end: number }; query?: boolean } = {}): string {
         const found = new Map<string, string>();
         const missing: string[] = [];
         for (const p of propNode?.children ?? []) {
             if (p.name === 'getetag') {
-                found.set('getetag', escapeXml(event.etag));
+                found.set('getetag', escapeXml(view.query === true && this.behaviour.reportEtagSuffix !== '' ? event.etag.replace(/"$/, `${this.behaviour.reportEtagSuffix}"`) : event.etag));
             } else if (p.name === 'calendar-data') {
-                const ical = expandRange === undefined ? event.ical : expandResource(event.ical, expandRange.start, expandRange.end);
+                const parsed = view.expandRange !== undefined || view.limitRange !== undefined ? parseIcal(event.ical) : undefined;
+                let ical = view.query === true ? this.queryText(event.ical) : event.ical;
+                if (view.expandRange !== undefined) {
+                    ical = expandResource(event.ical, view.expandRange.start, view.expandRange.end, this.env(cal, parsed), { style: this.behaviour.expandStyle, keepDuration: this.behaviour.expandKeepsDuration });
+                } else if (view.limitRange !== undefined) {
+                    ical = limitRecurrenceSet(event.ical, view.limitRange.start, view.limitRange.end, this.env(cal, parsed));
+                }
                 found.set('calendar-data', xmlText(ical));
             } else {
                 missing.push(p.name);
@@ -516,10 +684,11 @@ export class FakeICloud {
         }
         if (root.name === 'calendar-multiget') {
             const propNode = child(root, 'prop');
-            return multistatus(childrenNamed(root, 'href').map((h) => {
+            const hides = this.behaviour.multigetHidesEvery;
+            return multistatus(childrenNamed(root, 'href').slice(0, this.behaviour.multigetMaxHrefs).map((h, i) => {
                 const href = h.text.trim();
                 const name = href.split('/').at(-1) ?? '';
-                const event = href.startsWith(`${this.homePath}${cal.id}/`) ? cal.events.get(name) : undefined;
+                const event = href.startsWith(`${this.homePath}${cal.id}/`) && !(hides > 0 && (i + 1) % hides === 0) ? cal.events.get(name) : undefined;
                 return event === undefined ? `<d:response><d:href>${escapeXml(href)}</d:href><d:status>HTTP/1.1 404 Not Found</d:status></d:response>` : this.eventEntry(cal, name, event, propNode);
             }));
         }
@@ -542,13 +711,18 @@ export class FakeICloud {
         const propNode = child(root, 'prop');
         const expand = child(child(propNode, 'calendar-data'), 'expand');
         const expandRange = expand !== undefined && this.behaviour.expand ? { start: parseDt(expand.attrs.start) ?? rangeStart, end: parseDt(expand.attrs.end) ?? rangeEnd } : undefined;
+        const limit = child(child(propNode, 'calendar-data'), 'limit-recurrence-set');
+        if (limit !== undefined && this.behaviour.limitRecurrenceSet === 'refused') {
+            return errorResponse(400, 'cal:valid-calendar-data');
+        }
+        const limitRange = limit !== undefined && this.behaviour.limitRecurrenceSet === 'works' ? { start: parseDt(limit.attrs.start) ?? rangeStart, end: parseDt(limit.attrs.end) ?? rangeEnd } : undefined;
         const out: string[] = [];
         for (const [name, event] of cal.events) {
             const parsed = parseIcal(event.ical);
             if (parsed === undefined || comps(parsed, compName).length === 0) {
                 continue;
             }
-            if (range !== undefined && this.behaviour.timeRange && !occurrences(parsed, rangeEnd).some((o) => overlaps(o, rangeStart, rangeEnd))) {
+            if (range !== undefined && this.behaviour.timeRange && !occurrences(parsed, rangeEnd, this.env(cal, parsed)).some((o) => overlaps(o, rangeStart, rangeEnd))) {
                 continue;
             }
             const textOk = propFilters.every((pf) => {
@@ -563,7 +737,7 @@ export class FakeICloud {
             if (!textOk) {
                 continue;
             }
-            out.push(this.eventEntry(cal, name, event, propNode, expandRange));
+            out.push(this.eventEntry(cal, name, event, propNode, { query: true, ...(expandRange === undefined ? {} : { expandRange }), ...(limitRange === undefined ? {} : { limitRange }) }));
         }
         return multistatus(out);
     }
@@ -626,6 +800,7 @@ export class FakeICloud {
         if (this.behaviour.rewritesProdid) {
             lines = lines.map((l) => (l.startsWith('PRODID') ? 'PRODID:-//Fake Inc.//Fake Calendar Server//EN' : l));
         }
+        lines = this.applyAttachmentPolicy(lines);
         const hasOrganizer = lines.some((l) => l.startsWith('ORGANIZER'));
         if (this.behaviour.scheduleStatus !== null && hasOrganizer) {
             lines = lines.map((l) => (l.startsWith('ATTENDEE') ? l.replace(/^ATTENDEE/, `ATTENDEE;SCHEDULE-STATUS=${this.behaviour.scheduleStatus}`) : l));
@@ -641,6 +816,58 @@ export class FakeICloud {
             }
         }
         return `${lines.join('\r\n')}\r\n`;
+    }
+
+    /** Server-side rules on what is stored: zero-length DATE events, RANGE parameters, unknown VTIMEZONEs. */
+    private policies(body: string, parsed: NonNullable<ReturnType<typeof parseIcal>>): { text: string } | { refuse: Response } {
+        const refuse = (): { refuse: Response } => ({ refuse: errorResponse(400, 'cal:valid-calendar-object-resource') });
+        let lines = unfoldedLines(body);
+        const zeroLengthDate = comps(parsed, 'VEVENT').some((e) => {
+            const start = prop(e, 'DTSTART');
+            const end = prop(e, 'DTEND');
+            return start !== undefined && end !== undefined && pointOf(start)?.kind === 'date' && start.value === end.value;
+        });
+        if (zeroLengthDate && this.behaviour.dateZeroLength === 'refuse') {
+            return refuse();
+        }
+        if (zeroLengthDate && this.behaviour.dateZeroLength === 'rewrite') {
+            lines = lines.map((l) => {
+                const match = /^DTEND;VALUE=DATE:(\d{8})$/.exec(l);
+                return match?.[1] === undefined ? l : `DTEND;VALUE=DATE:${utc((parseDt(match[1]) ?? 0) + DAY).slice(0, 8)}`;
+            });
+        }
+        if (lines.some((l) => /^RECURRENCE-ID;[^:]*RANGE=/.test(l))) {
+            if (this.behaviour.rangeParam === 'refuse') {
+                return refuse();
+            }
+            if (this.behaviour.rangeParam === 'strip') {
+                lines = lines.map((l) => (l.startsWith('RECURRENCE-ID;') ? l.replace(/;RANGE=[A-Z]+/, '') : l));
+            }
+        }
+        const unknown = new Set(comps(parsed, 'VTIMEZONE').map((tz) => prop(tz, 'TZID')?.value ?? '').filter((id) => BUILTIN_ZONES[id] === undefined));
+        if (unknown.size > 0 && this.behaviour.vtimezonePolicy === 'refuse-unknown') {
+            return refuse();
+        }
+        if (unknown.size > 0 && this.behaviour.vtimezonePolicy === 'strip-unknown') {
+            const kept: string[] = [];
+            let block: string[] | undefined;
+            for (const line of lines) {
+                if (line === 'BEGIN:VTIMEZONE') {
+                    block = [line];
+                } else if (block !== undefined) {
+                    block.push(line);
+                    if (line === 'END:VTIMEZONE') {
+                        const id = block.find((l) => l.startsWith('TZID:'))?.slice(5) ?? '';
+                        kept.push(...(unknown.has(id) ? [] : block));
+                        block = undefined;
+                    }
+                } else {
+                    kept.push(line);
+                }
+            }
+            lines = kept;
+        }
+        return { text: `${lines.join('\r\n')}\r\n` };
     }
 
     private resource(req: FakeRequest, calId: string, name: string): Response {
@@ -700,9 +927,13 @@ export class FakeICloud {
                 if (clash !== undefined && (clash.cal !== cal || clash.name !== name) && (this.behaviour.uniqueUidAcrossCalendars || clash.cal === cal)) {
                     return errorResponse(403, 'cal:no-uid-conflict', `<d:href>${this.homePath}${clash.cal.id}/${clash.name}</d:href>`);
                 }
+                const policy = this.policies(req.body, parsed);
+                if ('refuse' in policy) {
+                    return policy.refuse;
+                }
                 const etag = this.nextEtag();
                 cal.rev++;
-                cal.events.set(name, { ical: this.transform(req.body), etag, rev: cal.rev });
+                cal.events.set(name, { ical: this.transform(policy.text), etag, rev: cal.rev });
                 cal.tombstones.delete(name);
                 const headers: Record<string, string> = this.behaviour.putReturnsEtag ? { etag } : {};
                 if (this.behaviour.scheduleStatus !== null && /^ORGANIZER/m.test(req.body)) {
@@ -710,10 +941,17 @@ export class FakeICloud {
                 }
                 return new Response(null, { status: existing === undefined ? 201 : 204, headers });
             }
+            case 'POST':
+                return this.attachmentAction(req, cal, name, existing);
             default:
                 return new Response(null, { status: 405 });
         }
     }
+}
+
+/** Puts a file behind a managed-attachment URL (for events seeded with a managed ATTACH). */
+export function seedAttachment(fake: FakeICloud, id: string, text: string, type = 'text/plain'): void {
+    fake.blobs.set(id, { text, type });
 }
 
 /** Adds a calendar to a fake after construction (same defaults as the constructor). */
@@ -743,7 +981,7 @@ export function probeStyleEvent(uid: string, start = FAKE_NOW + 10 * DAY): FakeE
 }
 
 /** Synthetic event text for seeding. */
-export function seedEvent(options: { uid: string; summary: string; start: number; durationMinutes?: number; rrule?: string; description?: string; location?: string; attendee?: string }): string {
+export function seedEvent(options: { uid: string; summary: string; start: number; durationMinutes?: number; rrule?: string; description?: string; location?: string; attendee?: string; attach?: string[] }): string {
     const lines = [
         'BEGIN:VCALENDAR', 'VERSION:2.0', 'PRODID:-//seed//EN', 'BEGIN:VEVENT',
         `UID:${options.uid}`, `DTSTAMP:${utc(FAKE_NOW - DAY)}`, `DTSTART:${utc(options.start)}`,
@@ -761,6 +999,7 @@ export function seedEvent(options: { uid: string; summary: string; start: number
     if (options.attendee !== undefined) {
         lines.push(`ORGANIZER:mailto:${options.attendee}`, `ATTENDEE;CN=${options.attendee}:mailto:${options.attendee}`);
     }
+    lines.push(...(options.attach ?? []));
     lines.push('END:VEVENT', 'END:VCALENDAR');
     return `${lines.join('\r\n')}\r\n`;
 }

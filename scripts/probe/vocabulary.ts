@@ -22,8 +22,26 @@ export const NOT_DELETED_REASONS = [
 /** Placeholders the reducers write in place of a value. */
 export const PLACEHOLDERS = ['<other>', '<none>', '<non-path>', '<scrubbed>', 'other'] as const;
 
+/**
+ * The fixed enums of the attachment checks (host class, scheme class, top-level content type
+ * class, ATTACH form, what a server did with an ATTACH, why nothing was fetched). Each is chosen
+ * by the probe's own classification, never copied from a response.
+ */
+export const ATTACHMENT_CODES = [
+    'caldav-root', 'caldav-partition', 'icloud-other', 'icloud-content', 'apple-other', 'unparseable',
+    'https', 'http',
+    'application', 'image', 'text', 'audio', 'video', 'missing',
+    'inline-binary', 'uri-managed', 'uri-unmanaged', 'none',
+    'preserved', 'converted-to-managed', 'dropped', 'modified',
+    'none-found', 'host-not-allowed',
+    // The one media type the probe uploads itself (a FMTTYPE read back from its own attachment).
+    'text/plain',
+    'digits', 'uuid', 'hex', 'filename', 'literal:attachment', 'literal:attachments', 'literal:calendars',
+    'action', 'managed-id', 'token', 'download', 'basic', 'bearer', 'digest', 'x-mobileme-authtoken',
+] as const;
+
 /** Every code above, plus the `probe_`-prefixed HTTP error codes the backend check reports. */
 export const CODE_WORDS: ReadonlySet<string> = new Set<string>([
     ...HTTP_ERROR_CODES, ...HTTP_ERROR_CODES.map((code) => `probe_${code}`), ...BACKEND_CODES, ...VALIDATE_RESULTS,
-    ...NOT_DELETED_REASONS, ...PLACEHOLDERS,
+    ...NOT_DELETED_REASONS, ...PLACEHOLDERS, ...ATTACHMENT_CODES,
 ]);

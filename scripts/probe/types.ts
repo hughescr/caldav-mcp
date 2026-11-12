@@ -1,12 +1,12 @@
 import type { HttpLimits } from './http';
-import type { EtagShape, Safe, TokenShape } from './safe';
+import type { AuthoredValue, EtagShape, Safe, TokenShape } from './safe';
 import type { NOT_DELETED_REASONS } from './vocabulary';
 
 export type Outcome = 'confirmed' | 'refuted' | 'inconclusive' | 'skipped' | 'error';
 
-type Scalar = number | boolean | null | Safe;
-/** Evidence holds only numbers, booleans, null and `Safe` strings (names, shapes, placeholders). */
-export type EvidenceValue = Scalar | readonly Safe[] | EtagShape | TokenShape | { readonly [key: string]: Scalar };
+type Scalar = number | boolean | null | Safe | AuthoredValue;
+/** AuthoredValue carries construction-time provenance until the report's final rendering. */
+export type EvidenceValue = Scalar | readonly (Safe | AuthoredValue)[] | EtagShape | TokenShape | { readonly [key: string]: Scalar };
 export type Evidence = Record<string, EvidenceValue>;
 
 export interface CheckResult {
@@ -51,6 +51,8 @@ export type BackendLoad =
 
 export interface ProbeLimits extends HttpLimits {
     windowDays: number;
+    /** Half-width in days of the wide unexpanded query of the strictness census. */
+    wideWindowDays: number;
     maxCalendarsQueried: number;
 }
 

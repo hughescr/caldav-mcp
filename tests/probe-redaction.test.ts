@@ -3,7 +3,7 @@ import { runCli, type CliIo } from '../scripts/probe/cli';
 import { runProbe } from '../scripts/probe/core';
 import { runLambdaEvent } from '../scripts/probe/lambda';
 import type { BackendLoad, ProbeDeps } from '../scripts/probe/types';
-import { standardAccount, type Canaries, type FakeBehaviour, type FakeICloud } from './fixtures/probe/fake-icloud';
+import { FAKE_NOW, seedAttachment, seedEvent, standardAccount, type Canaries, type FakeBehaviour, type FakeICloud } from './fixtures/probe/fake-icloud';
 import { fakeDeps } from './fixtures/probe/harness';
 
 /** Every value is distinctive so that any leak, in any encoding, is found. */
@@ -59,6 +59,27 @@ function withLeftovers(fake: FakeICloud): FakeICloud {
     return fake;
 }
 
+/**
+ * Attachments carrying a canary in every place a report could be tempted to echo: file names, the
+ * MANAGED-ID, parameter names and values, URL host labels and paths, and the file itself.
+ */
+function withAttachments(fake: FakeICloud): FakeICloud {
+    const id = `${C.uid}-mid`;
+    const attach = [
+        `ATTACH;MANAGED-ID=${id};FMTTYPE=image/png;SIZE=${C.description.length};FILENAME=${C.summary}.png;X-APPLE-FILENAME=${C.summary}.png;X-${C.location.toUpperCase()}=${C.description}:https://p42-caldav.icloud.com:443/${C.dsid}/attachments/${id}/${C.summary}.png`,
+        `ATTACH;ENCODING=BASE64;VALUE=BINARY;FMTTYPE=text/plain;X-${C.summary.toUpperCase()}=1:${Buffer.from(C.description).toString('base64')}`,
+        `ATTACH:https://files.${C.location}.example.com/${C.summary}.pdf`,
+        `ATTACH;MANAGED-ID=${C.uid}-other;FILENAME=${C.location}.txt:https://p42-content.icloud-content.com/${C.dsid}/${C.summary}/${C.location}.txt`,
+    ];
+    fake.calendars.get(C.calendarId)?.events.set(`${C.uid}-att.ics`, {
+        ical: seedEvent({ uid: `${C.uid}-att`, summary: C.summary, start: FAKE_NOW + 3 * 86_400_000, attach }),
+        etag: `"${C.etagPrefix}att"`,
+        rev: 1,
+    });
+    seedAttachment(fake, id, C.description);
+    return fake;
+}
+
 /** A backend module that touches the server and then fails with an error carrying canaries. */
 const leakyBackend = async (): Promise<BackendLoad> => ({
     status: 'loaded',
@@ -105,7 +126,21 @@ describe('nothing personal reaches stdout, stderr or the JSON report', () => {
         ['read-only, other behaviours', [], { expand: true, textMatch: true, freeBusyStatus: 200, uidFilterStatus: 207, syncLimitHonoured: true, weakEtags: true }],
         ['--json', ['--json'], {}],
         ['--write', ['--write'], {}],
+        ['read-only, expansion that keeps forms and census-visible differences', [], { expand: true, expandStyle: 'keep-forms-no-vtimezone', expandKeepsDuration: true, queryCalendarData: 'dropped-x-properties', reportEtagSuffix: 'q', multigetHidesEvery: 2 }],
+        ['--write, expansion that keeps forms and reads floating values in the calendar-timezone', ['--write'], {
+            expand: true, expandStyle: 'keep-forms', floatingInterpretation: 'calendar-timezone', unknownTzid: 'as-new-york', thisAndFuture: 'applied', feb29: 'clamp', overrideMatching: 'original-slot', dateZeroLength: 'rewrite', rangeParam: 'strip',
+        }],
+        ['--write, a server that picks the second repeated hour and reads the skipped hour after the gap', ['--write'], { expand: true, repeatedHour: 'second', skippedHour: 'after-gap', overrideMatching: 'original-slot' }],
+        ['--write, a server that refuses the calendar-timezone and unknown zones', ['--write'], { expand: true, calendarTimezone: 'refused', vtimezonePolicy: 'refuse-unknown', dateZeroLength: 'refuse', rangeParam: 'refuse' }],
         ['--write, other behaviours', ['--write'], { expand: true, textMatch: true, ifMatchStar: 'works', requireEnd: false, uniqueUidAcrossCalendars: false, putReturnsEtag: false, addsVtimezone: true, rewritesProdid: false, syncLimitHonoured: true }],
+        ['read-only, attachments with canary names, hosts and parameters', [], {}, withAttachments],
+        ['read-only, attachments whose URL redirects off the allowed hosts', [], { attachmentGet: 'redirect-content' }, withAttachments],
+        ['--write, attachments with canaries and a server that serves them on the partition host', ['--write'], {}, withAttachments],
+        ['--write, attachment host evidence and in-span override', ['--write'], { expand: true, attachmentHost: 'icloud-other' }, withAttachments],
+        ['--write, attachments on another host, ignoring Range, with no headers or representation', ['--write'], { attachmentHost: 'content', attachmentGet: 'ignores-range', attachmentAddHeaders: false, attachmentAddRepresentation: false, attachmentSizeParam: false }, withAttachments],
+        ['--write, attachments redirected, converted and refused', ['--write'], { attachmentGet: 'redirect-allowed', attachmentPut: 'inline-to-managed' }, withAttachments],
+        ['--write, attachment actions refused and attachments dropped', ['--write'], { attachmentAdd: 'forbidden', attachmentPut: 'drop' }, withAttachments],
+        ['--write, attachment actions answered 401', ['--write'], { attachmentAdd: 'unauthorized' }, withAttachments],
         ['--write with undeletable calendars', ['--write'], { deleteCollection: 'fails' }],
         ['--write --invite', ['--write', '--invite'], {}],
         ['--cleanup', ['--cleanup'], {}, withLeftovers],

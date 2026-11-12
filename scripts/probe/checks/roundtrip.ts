@@ -1,16 +1,10 @@
 import { CheckStop, type CheckContext, type CheckDef, type RoundTripDiff } from '../context';
-import { getIcal } from '../dav';
+import { getIcal, requireSynthetic } from '../dav';
 import { comps, icalDate, icalLocal, icalUtc, parseIcal, prop, type IcalComponent, type IcalProperty } from '../ical';
 import { prose, safeNames, type Prose } from '../safe';
 import type { Evidence } from '../types';
 import { DAY, HOUR, SUMMARY, baseDay, createOrStop, newEvent, primary, probeCalendar } from './write-helpers';
-
-const NEW_YORK = [
-    'BEGIN:VTIMEZONE', 'TZID:America/New_York',
-    'BEGIN:DAYLIGHT', 'TZOFFSETFROM:-0500', 'TZOFFSETTO:-0400', 'TZNAME:EDT', 'DTSTART:20070311T020000', 'RRULE:FREQ=YEARLY;BYMONTH=3;BYDAY=2SU', 'END:DAYLIGHT',
-    'BEGIN:STANDARD', 'TZOFFSETFROM:-0400', 'TZOFFSETTO:-0500', 'TZNAME:EST', 'DTSTART:20071104T020000', 'RRULE:FREQ=YEARLY;BYMONTH=11;BYDAY=1SU', 'END:STANDARD',
-    'END:VTIMEZONE',
-];
+import { NEW_YORK } from './zones';
 
 function serialise(p: IcalProperty): string {
     const params = Object.entries(p.params).toSorted(([a], [b]) => a.localeCompare(b)).map(([k, v]) => `${k}=${v}`).join(';');
@@ -72,6 +66,7 @@ async function roundTrip(ctx: CheckContext, id: string, suffix: string, build: (
     if (stored.ical === undefined) {
         throw new CheckStop('inconclusive', prose`The stored event could not be read back (HTTP ${stored.status}).`, evidence);
     }
+    requireSynthetic(stored.ical, stored.url, temp.url, uid, stored.status);
     const sent = parseIcal(text);
     const diff = diffEvents(id, sent, stored.ical);
     ctx.state.roundTrips.push(diff);

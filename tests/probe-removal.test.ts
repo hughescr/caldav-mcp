@@ -19,7 +19,7 @@ function displayNameOf(req: FakeRequest): string {
 }
 
 describe('write-mode removal is only reported verified when it is (M2)', () => {
-    test('reviewer PoC J: a server-chosen URL from Location is registered, written to and deleted', async () => {
+    test('a differing Location is never adopted and requires manual cleanup', async () => {
         let fake: FakeICloud | undefined;
         fake = standardAccount(PLAIN, {
             hook: (req) => {
@@ -32,13 +32,14 @@ describe('write-mode removal is only reported verified when it is (M2)', () => {
             },
         });
         const report = await probe(fake, WRITE, creds);
-        expect(probeNamedLeft(fake)).toEqual([]);
-        expect(report.cleanup?.allRemoved).toBe(true);
-        expect(check(report, 'write-mkcalendar').evidence).toMatchObject({ locationHeader: true, locationUsed: true });
-        // Writes went to the server-chosen calendars (and nowhere else).
-        const writes = fake.requests.filter((r) => WRITE_METHODS.has(r.method) && r.method !== 'MKCALENDAR').map((r) => r.url.pathname);
-        expect(writes.some((p) => p.startsWith('/10000000001/calendars/uuid-'))).toBe(true);
-        expect(writes.every((p) => /^\/10000000001\/calendars\/(uuid-\d+|caldav-mcp-probe-[0-9a-f]{8})\//.test(p))).toBe(true);
+        expect(probeNamedLeft(fake)).toHaveLength(1);
+        expect(report.cleanup?.allRemoved).toBe(false);
+        expect(check(report, 'write-mkcalendar').outcome).toBe('inconclusive');
+        expect(check(report, 'write-mkcalendar').summary).toContain('manual cleanup');
+        expect(check(report, 'write-mkcalendar').evidence).toMatchObject({ locationHeader: true, locationUsed: false });
+        const writes = fake.requests.filter((r) => WRITE_METHODS.has(r.method) && r.method !== 'MKCALENDAR');
+        expect(writes.every((r) => r.method === 'DELETE' && /\/caldav-mcp-probe-[0-9a-f]{8}\/$/.test(r.url.pathname))).toBe(true);
+        expect(writes).toHaveLength(1);
     });
 
     test('a Location naming an existing calendar, another host or a deeper path is ignored', async () => {
@@ -63,6 +64,36 @@ describe('write-mode removal is only reported verified when it is (M2)', () => {
             expect(check(report, 'write-mkcalendar').evidence).toMatchObject({ locationHeader: true, locationUsed: false });
             expect(probeNamedLeft(fake)).toEqual([]);
         }
+    });
+
+    test('an unclassified owner collection and redirecting adoption PROPFIND cannot receive writes', async () => {
+        let requested = '';
+        const fake = standardAccount(PLAIN, {
+            hook: (req) => {
+                if (req.method === 'MKCALENDAR') {
+                    requested = req.url.href;
+                    seedCalendar(fake, { id: req.url.pathname.split('/').at(-2) ?? '', displayName: displayNameOf(req) });
+                    return new Response(null, { status: 201, headers: { location: `${HOME}unclassified/` } });
+                }
+                if (req.method === 'PROPFIND' && req.url.href === `${HOME}unclassified/`) {
+                    return new Response(null, { status: 307, headers: { location: requested } });
+                }
+                return undefined;
+            },
+            transformResponse: async (req, res) => {
+                if (req.method === 'PROPFIND' && req.url.href === HOME && req.headers.get('depth') === '1') {
+                    return new Response((await res.text()).replace(/<d:response><d:href>[^<]*\/unclassified\/<\/d:href>[\s\S]*?<\/d:response>/, '<d:response><d:href>/10000000001/calendars/unclassified/</d:href><d:status>HTTP/1.1 403 Forbidden</d:status></d:response>'), { status: res.status, headers: res.headers });
+                }
+                return res;
+            },
+        });
+        seedCalendar(fake, { id: 'unclassified', displayName: 'Owner calendar' });
+        const report = await probe(fake, WRITE, creds);
+        expect(fake.calendars.has('unclassified')).toBe(true);
+        expect(check(report, 'write-mkcalendar').outcome).toBe('inconclusive');
+        expect(fake.requests.filter((r) => ['PUT', 'POST', 'DELETE'].includes(r.method) && r.url.href.startsWith(`${HOME}unclassified/`))).toEqual([]);
+        expect(fake.requests.some((r) => r.method === 'DELETE' && r.url.href === requested)).toBe(true);
+        expect(fake.requests.some((r) => r.url.href === `${HOME}unclassified/`)).toBe(false);
     });
 
     test('the DELETE is always sent, even when a PROPFIND says the calendar is missing', async () => {
@@ -144,10 +175,10 @@ describe('the HTTP layer only accepts a server-chosen calendar it was not told a
         }
         expect(() => http.registerCreatedCollection(`${HOME}uuid-1/`, HOME, existing, `${HOME}caldav-mcp-probe-0b0b0b0b/`)).toThrow(ProbeHttpError);
         expect(() => make('cleanup').registerCreatedCollection(`${HOME}uuid-1/`, HOME, existing, requested)).toThrow(ProbeHttpError);
-        http.registerCreatedCollection(`${HOME}uuid-1/`, HOME, existing, requested);
-        await http.request({ method: 'PUT', url: `${HOME}uuid-1/e.ics`, body: 'x' });
-        await http.request({ method: 'DELETE', url: `${HOME}uuid-1/` });
-        expect(sent).toEqual([`PUT ${HOME}uuid-1/e.ics`, `DELETE ${HOME}uuid-1/`]);
+        expect(() => http.registerCreatedCollection(`${HOME}uuid-1/`, HOME, existing, requested)).toThrow(ProbeHttpError);
+        await expect(http.request({ method: 'PUT', url: `${HOME}uuid-1/e.ics`, body: 'x' })).rejects.toBeInstanceOf(ProbeHttpError);
+        await expect(http.request({ method: 'DELETE', url: `${HOME}uuid-1/` })).rejects.toBeInstanceOf(ProbeHttpError);
+        expect(sent).toEqual([]);
     });
 });
 

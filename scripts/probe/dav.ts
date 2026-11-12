@@ -1,7 +1,7 @@
-import { stopOnThrottle, type CheckContext } from './context';
+import { CheckStop, stopOnThrottle, type CheckContext } from './context';
 import type { ProbeResponse } from './http';
 import { comps, parseIcal, prop, props, textValues, type IcalComponent } from './ical';
-import type { Taint } from './safe';
+import { prose, type Taint } from './safe';
 import { descendants, elementNames, parseMultistatus, parseXml, type Multistatus, type XmlNode } from './xml';
 
 export const NS = 'xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav" xmlns:CS="http://calendarserver.org/ns/" xmlns:A="http://apple.com/ns/ical/"';
@@ -121,18 +121,41 @@ export function isRecurring(cal: IcalComponent | undefined): boolean {
     return eventComponents(cal).some((e) => prop(e, 'RRULE') !== undefined || props(e, 'RDATE').length > 0);
 }
 
-export function calendarQueryBody(options: { start: number; end: number; calendarData: 'full' | 'expand' | 'none'; extraFilter?: string; component?: string }): string {
+export function calendarQueryBody(options: { start: number; end: number; calendarData: 'full' | 'expand' | 'limit-recurrence-set' | 'none'; extraFilter?: string; component?: string }): string {
     const range = `start="${calDavUtc(options.start)}" end="${calDavUtc(options.end)}"`;
     const data = options.calendarData === 'full'
         ? '<C:calendar-data/>'
         : options.calendarData === 'expand'
             ? `<C:calendar-data><C:expand ${range}/></C:calendar-data>`
-            : '';
+            : options.calendarData === 'limit-recurrence-set'
+                ? `<C:calendar-data><C:limit-recurrence-set ${range}/></C:calendar-data>`
+                : '';
     return xmlDoc(`<C:calendar-query ${NS}><D:prop><D:getetag/>${data}</D:prop><C:filter><C:comp-filter name="VCALENDAR"><C:comp-filter name="${options.component ?? 'VEVENT'}"><C:time-range ${range}/>${options.extraFilter ?? ''}</C:comp-filter></C:comp-filter></C:filter></C:calendar-query>`);
 }
 
+/** Fail closed before any synthetic read-back values are described. No rejected values escape. */
+export function requireSynthetic(ical: IcalComponent | undefined, finalUrl: string, calendarUrl: string, uid: string, status: number): void {
+    const events = eventComponents(ical);
+    let confined = false;
+    try {
+        const target = new URL(finalUrl);
+        const calendar = new URL(calendarUrl);
+        confined = target.origin === calendar.origin && new URL('.', target).href === calendar.href && target.search === '' && target.hash === '';
+    } catch { /* No provenance. */ }
+    if (!confined || ical === undefined || events.length === 0 || events.some((e) => props(e, 'UID').length !== 1 || prop(e, 'UID')?.value !== uid)) {
+        throw new CheckStop('inconclusive', prose`The read-back resource could not be attributed to the probe's event.`, { status, returnedVevents: events.length, provenanceVerified: false });
+    }
+}
+
+/** GET one resource; returns the body as received and the parsed (and tainted) calendar. */
+export async function getResource(ctx: CheckContext, url: string): Promise<{ status: number; url: string; etag: string | null; body: string; ical: IcalComponent | undefined }> {
+    const res = await ctx.http.request({ method: 'GET', url });
+    stopOnThrottle(ctx, res);
+    return { status: res.status, url: res.url, etag: res.headers.get('etag'), body: res.body, ical: res.status === 200 ? taintIcalText(res.body, ctx.taint) : undefined };
+}
+
 /** GET one resource; returns the parsed (and tainted) calendar. */
-export async function getIcal(ctx: CheckContext, url: string, essential = false): Promise<{ status: number; etag: string | null; ical: IcalComponent | undefined; headerNames: string[] }> {
+export async function getIcal(ctx: CheckContext, url: string, essential = false): Promise<{ status: number; url: string; etag: string | null; ical: IcalComponent | undefined; headerNames: string[] }> {
     const res = await ctx.http.request({ method: 'GET', url, essential });
     stopOnThrottle(ctx, res);
     const headerNames: string[] = [];
@@ -141,6 +164,7 @@ export async function getIcal(ctx: CheckContext, url: string, essential = false)
     });
     return {
         status: res.status,
+        url: res.url,
         etag: res.headers.get('etag'),
         ical: res.status === 200 ? taintIcalText(res.body, ctx.taint) : undefined,
         headerNames,

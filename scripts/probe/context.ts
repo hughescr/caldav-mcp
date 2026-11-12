@@ -1,3 +1,4 @@
+import type { AttachmentState } from './attachments';
 import type { IcalComponent } from './ical';
 import { ProbeHttpError, type ProbeHttp, type ProbeResponse } from './http';
 import { fixed, parseRetryAfter, prose, type Prose, type Safe, type Taint } from './safe';
@@ -23,11 +24,15 @@ export interface WindowResource {
     /** Lower-cased SUMMARY values of every component in the resource. In memory only. */
     summaries: string[];
     recurring: boolean;
+    /** The calendar-data text exactly as the XML parser returned it. In memory only. */
+    calendarData: string | null;
 }
 
 export interface WindowData {
     status: number;
     resources: WindowResource[];
+    /** Decoded size of the response body in bytes (0 when no response was read). */
+    bytes: number;
 }
 
 export interface TempCalendar {
@@ -40,6 +45,8 @@ export interface TempCalendar {
     deleteUrls: string[];
     removalVerified: boolean;
     deleteStatus: number | null;
+    /** Whether a PROPFIND showed the calendar-timezone the probe set at MKCALENDAR (null: not set or not read). */
+    calendarTimezoneKept?: boolean | null;
 }
 
 export interface RoundTripDiff {
@@ -64,8 +71,14 @@ export interface ProbeState {
     calendars?: CalendarInfo[];
     window: Map<string, WindowData>;
     windowLoaded: boolean;
+    /** The ±window the checks share, fixed on first use so every query covers the same days. */
+    windowBounds?: { start: number; end: number };
+    /** The same window queried with calendar-data/expand, per calendar (filled on demand). */
+    expanded: Map<string, WindowData>;
     /** Depth header that sync-collection accepted (RFC 6578 requires 0; 1 is a recorded fallback). */
     syncDepth?: '0' | '1';
+    /** Filled by the strictness census from its wide query; read by the attachment checks (in memory only). */
+    attachments?: AttachmentState;
     temp: TempCalendar[];
     primaryTemp?: TempCalendar;
     created?: { href: string; etag: string | null; staleEtag?: string | null; uid: string } | undefined;
@@ -191,6 +204,7 @@ export function newState(): ProbeState {
         schedulingProps: {},
         window: new Map(),
         windowLoaded: false,
+        expanded: new Map(),
         temp: [],
         roundTrips: [],
         eventCounter: 0,

@@ -101,7 +101,15 @@ describe('credentials that stop working mid-run stop the run (M1)', () => {
                 const report = await probe(fake, flags, creds);
                 expect(report.auth.rejected).toBe(true);
                 expect(report.auth.onFirstRequest).toBe(false);
-                const extra = unexpectedAfter401(fake.requests, switchAt);
+                const challenged = fake.requests[switchAt - 1];
+                const anonymousChallenge = challenged?.method === 'GET' && challenged.url.pathname.includes('/attachments/') && !challenged.headers.has('authorization');
+                if (anonymousChallenge) {
+                    const signed = fake.requests[switchAt];
+                    expect(signed?.url.href).toBe(challenged.url.href);
+                    expect(signed?.method).toBe('GET');
+                    expect(signed?.headers.has('authorization')).toBe(true);
+                }
+                const extra = unexpectedAfter401(fake.requests, switchAt + (anonymousChallenge ? 1 : 0));
                 // The last five requests of a run are the parallel burst: up to four of them may already
                 // be in flight when the first 401 arrives (documented residual).
                 const inFlight = switchAt > total - 5 ? Math.min(4, total - switchAt) : 0;

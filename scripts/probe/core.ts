@@ -1,8 +1,13 @@
+import { attachmentCensusCheck, attachmentFetchCheck } from './checks/attachments';
 import { authCheck, davCapabilitiesCheck, discoveryCheck, schedulingPropsCheck, stabilityCheck } from './checks/discovery';
 import { backendCheck } from './checks/backend';
 import { runCleanup } from './checks/cleanup';
 import { collectionsCheck } from './checks/collections';
+import { expandFormsCheck } from './checks/expand-forms';
+import { bulkMultigetCheck, calendarDataVsGetCheck, etagExpandVsMultigetCheck, limitRecurrenceSetCheck } from './checks/fetch-forms';
 import { pacingCheck } from './checks/pacing';
+import { payloadSizesCheck } from './checks/payload';
+import { strictnessCheck } from './checks/strictness';
 import { etagCheck, expandReadCheck, freeBusyCheck, multigetCheck, textMatchReadCheck, timeRangeCheck, uidFilterCheck } from './checks/queries';
 import { syncCheck, syncLimitCheck } from './checks/sync';
 import { runWritePhase } from './checks/write-phase';
@@ -12,11 +17,12 @@ import { Taint, recheckNames, renderProse, scrubValue } from './safe';
 import type { CheckResult, CleanupReport, Outcome, ProbeDeps, ProbeInput, ProbeLimits, ProbeReport } from './types';
 import { PROBE_VERSION, REPORT_SCHEMA_VERSION } from './version';
 
-export const DEFAULT_PROBE_LIMITS: ProbeLimits = { ...DEFAULT_HTTP_LIMITS, windowDays: 60, maxCalendarsQueried: 10 };
+export const DEFAULT_PROBE_LIMITS: ProbeLimits = { ...DEFAULT_HTTP_LIMITS, windowDays: 60, wideWindowDays: 1095, maxCalendarsQueried: 10 };
 
 const READ_CHECKS: CheckDef[] = [
     davCapabilitiesCheck, schedulingPropsCheck, stabilityCheck, collectionsCheck, timeRangeCheck, freeBusyCheck, expandReadCheck,
-    textMatchReadCheck, uidFilterCheck, multigetCheck, etagCheck, syncCheck, syncLimitCheck, backendCheck,
+    expandFormsCheck, etagExpandVsMultigetCheck, textMatchReadCheck, uidFilterCheck, multigetCheck, etagCheck, calendarDataVsGetCheck, limitRecurrenceSetCheck,
+    bulkMultigetCheck, payloadSizesCheck, strictnessCheck, attachmentCensusCheck, attachmentFetchCheck, syncCheck, syncLimitCheck, backendCheck,
 ];
 
 export class ProbeConfigError extends Error {

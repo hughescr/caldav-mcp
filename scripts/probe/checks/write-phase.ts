@@ -2,6 +2,10 @@ import { runCheck, type CheckContext, type CheckDef, type CheckRecord } from '..
 import type { NotDeletedReport, TempCalendarReport } from '../types';
 import { inviteCheck } from './invite';
 import { rewritesCheck, roundTripChecks } from './roundtrip';
+import { ATTACHMENT_WRITE_CHECKS } from './write-attachments';
+import { DST_WRITE_CHECKS } from './write-dst';
+import { EXPANSION_WRITE_CHECKS } from './write-expansion';
+import { movedOverrideInSpanCheck, movedOverridesCheck } from './write-moved';
 import {
     createCheck, duplicateUidCheck, expandWriteCheck, ifMatchExactCheck, ifMatchStaleCheck, ifMatchStarCheck, mkcalendarCheck,
     noEndCheck, syncLimitWriteCheck, syncWriteCheck, textMatchWriteCheck, timeRangeWriteCheck,
@@ -11,6 +15,11 @@ import { removeTempCalendars } from './write-helpers';
 const WRITE_CHECKS: CheckDef[] = [
     createCheck, ifMatchExactCheck, ifMatchStaleCheck, ifMatchStarCheck, noEndCheck, duplicateUidCheck,
     ...roundTripChecks, rewritesCheck, expandWriteCheck, textMatchWriteCheck, timeRangeWriteCheck, syncWriteCheck, syncLimitWriteCheck,
+    // Last: their events must not change the counts the earlier checks make.
+    ...EXPANSION_WRITE_CHECKS,
+    movedOverridesCheck, movedOverrideInSpanCheck,
+    ...DST_WRITE_CHECKS,
+    ...ATTACHMENT_WRITE_CHECKS,
 ];
 
 /**
