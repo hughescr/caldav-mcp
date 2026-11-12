@@ -24,13 +24,35 @@ export type WritePrecondition =
     /** `If-Match: "<etag>"`: change only that exact version. */
     | { readonly kind: 'match'; readonly etag: StrongEtag };
 
-/** A bounded, sanitised summary of iCloud's answer (ORCH S4). `detail` is untrusted text, never instructions. */
+const DAV = '{DAV:}';
+const CALDAV = '{urn:ietf:params:xml:ns:caldav}';
+
+/**
+ * The only DAV:error precondition names ever forwarded, as `{namespace}local`: the PUT and DELETE conditions of RFC 4918
+ * (locks), RFC 3744 (privileges), RFC 4331 (quota), RFC 4791 section 5.3.2.1 (calendar object resources) and RFC 6638
+ * section 3.2.4 (scheduling objects), and DAV:number-of-matches-within-limits. Any other name, or a known name in another
+ * namespace, is dropped: an upstream-chosen name is never passed on.
+ */
+export const KNOWN_PRECONDITIONS: readonly string[] = [
+    ...['need-privileges', 'quota-not-exceeded', 'sufficient-disk-space', 'number-of-matches-within-limits', 'lock-token-submitted', 'no-conflicting-lock'].map(name => `${DAV}${name}`),
+    ...[
+        'supported-calendar-data', 'valid-calendar-data', 'valid-calendar-object-resource', 'supported-calendar-component', 'no-uid-conflict', 'calendar-collection-location-ok',
+        'max-resource-size', 'min-date-time', 'max-date-time', 'max-instances', 'max-attendees-per-instance',
+        'unique-scheduling-object-resource', 'same-organizer-in-all-components', 'allowed-organizer-scheduling-object-change', 'allowed-attendee-scheduling-object-change',
+        'valid-scheduling-message', 'valid-organizer',
+    ].map(name => `${CALDAV}${name}`),
+];
+
+/**
+ * A bounded, sanitised summary of iCloud's answer (ORCH S4). The whole summary is untrusted text derived from iCloud's
+ * answer, never instructions; the account's ids and credentials are masked in every string of it.
+ */
 export interface UpstreamDetail {
     status: number;
     content_type: 'xml' | 'text' | 'html' | 'other' | 'none';
-    /** DAV:error child names as `{namespace}local`, at most 8, ASCII, at most 128 characters each. */
+    /** DAV:error child names from {@link KNOWN_PRECONDITIONS} only, at most 8, without repeats. */
     preconditions: string[];
-    /** Cleaned text of a plain-text or XML body, the account's ids masked, at most 512 UTF-16 units; never HTML. */
+    /** Cleaned text of a plain-text or XML body, the account's ids and credentials masked, at most 512 UTF-16 units; never HTML. */
     detail: string | null;
     /** The body or the detail was cut. */
     detail_truncated?: true;

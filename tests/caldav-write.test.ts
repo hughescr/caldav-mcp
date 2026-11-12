@@ -215,8 +215,41 @@ describe('answers', () => {
     });
 });
 
+describe('the account and its credentials never leave in an upstream summary (security review finding 4)', () => {
+    const TOKEN = BASIC.slice('Basic '.length);
+    const SECRETS = [AUTH.appPassword, BASIC, TOKEN, AUTH.appleId, '10000000001'];
+
+    test('detail: the app-specific password, the Basic value, its bare token, the Apple ID and the principal id are masked', async () => {
+        const text = `denied for ${BASIC} token=${TOKEN} pass ${AUTH.appPassword} user ${AUTH.appleId.toUpperCase()} path /10000000001/calendars/`;
+        for (const [contentType, body] of [
+            ['text/plain', text],
+            ['application/xml', `<D:error xmlns:D="DAV:"><D:need-privileges/><D:responsedescription>${text}</D:responsedescription></D:error>`],
+        ] as const) {
+            const { backend } = backendFor(() => new Response(body, { status: 403, headers: { 'content-type': contentType } }));
+            const result = await backend.putEvent(AUTH, DISCOVERY, { calendarId: CALENDAR, href: HREF, body: BODY, precondition: { kind: 'create' } });
+            const serialised = JSON.stringify(result);
+            for (const secret of SECRETS) { expect<unknown>([contentType, secret, serialised.toLowerCase().includes(secret.toLowerCase())]).toEqual([contentType, secret, false]); }
+            expect<unknown>(result.kind === 'status' ? result.upstream.detail : null).toBe('denied for <credential> token=<credential> pass <credential> user <account> path /<account>/calendars/');
+        }
+    });
+
+    test('preconditions: only known DAV and CalDAV names are forwarded; a name or namespace carrying a secret is dropped', async () => {
+        const xml = [
+            '<D:error xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav"',
+            ` xmlns:A="urn:x:${AUTH.appleId}" xmlns:T="urn:x:${TOKEN.replaceAll('=', '')}" xmlns:P="urn:x:${AUTH.appPassword}">`,
+            `<D:${AUTH.appPassword}/><A:need-privileges/><T:valid-calendar-data/><P:no-uid-conflict/><D:p10000000001/>`,
+            '<C:valid-calendar-data/><D:need-privileges/><D:valid-calendar-data/></D:error>',
+        ].join('');
+        const { backend } = backendFor(() => new Response(xml, { status: 403, headers: { 'content-type': 'application/xml' } }));
+        const result = await backend.putEvent(AUTH, DISCOVERY, { calendarId: CALENDAR, href: HREF, body: BODY, precondition: { kind: 'create' } });
+        expect<unknown>(result.kind === 'status' ? result.upstream.preconditions : null).toEqual(['{urn:ietf:params:xml:ns:caldav}valid-calendar-data', '{DAV:}need-privileges']);
+        const serialised = JSON.stringify(result);
+        for (const secret of [...SECRETS, TOKEN.replaceAll('=', '')]) { expect<unknown>([secret, serialised.toLowerCase().includes(secret.toLowerCase())]).toEqual([secret, false]); }
+    });
+});
+
 describe('sanitizeUpstream (ORCH S4): bounded, untrusted, never HTML, account masked', () => {
-    const MASKS = ['10000000001', 'writer@example.invalid'];
+    const MASKS = [{ text: '10000000001', label: '<account>' }, { text: 'writer@example.invalid', label: '<account>' }] as const;
     const bytes = (text: string): Uint8Array => new TextEncoder().encode(text);
 
     test('XML: DAV:error precondition names as {ns}local, at most 8, text as detail', () => {
@@ -224,8 +257,12 @@ describe('sanitizeUpstream (ORCH S4): bounded, untrusted, never HTML, account ma
         expect<unknown>(sanitizeUpstream(403, 'application/xml; charset=utf-8', bytes(xml), false, MASKS)).toEqual({
             status: 403, content_type: 'xml', preconditions: ['{DAV:}need-privileges', '{urn:ietf:params:xml:ns:caldav}valid-calendar-data'], detail: '/<account>/calendars/work/',
         });
-        const many = `<D:error xmlns:D="DAV:">${Array.from({ length: 12 }, (_, index) => `<D:p${index}/>`).join('')}</D:error>`;
-        expect<unknown>(sanitizeUpstream(409, 'text/xml', bytes(many), false, MASKS).preconditions).toEqual(['{DAV:}p0', '{DAV:}p1', '{DAV:}p2', '{DAV:}p3', '{DAV:}p4', '{DAV:}p5', '{DAV:}p6', '{DAV:}p7']);
+        const names = ['supported-calendar-data', 'valid-calendar-data', 'valid-calendar-object-resource', 'supported-calendar-component', 'no-uid-conflict', 'max-resource-size', 'min-date-time', 'max-date-time', 'max-instances', 'max-attendees-per-instance'];
+        const many = `<D:error xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav"><D:p0/>${names.map(name => `<C:${name}/>`).join('')}</D:error>`;
+        expect<unknown>(sanitizeUpstream(409, 'text/xml', bytes(many), false, MASKS).preconditions).toEqual(names.slice(0, 8).map(name => `{urn:ietf:params:xml:ns:caldav}${name}`));
+        // Known names in the wrong namespace, unknown names and repeats are dropped.
+        const odd = '<D:error xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav"><D:no-uid-conflict/><C:need-privileges/><D:quota-not-exceeded/><D:quota-not-exceeded/><D:number-of-matches-within-limits/></D:error>';
+        expect<unknown>(sanitizeUpstream(409, 'text/xml', bytes(odd), false, MASKS).preconditions).toEqual(['{DAV:}quota-not-exceeded', '{DAV:}number-of-matches-within-limits']);
         // A DTD, an entity or broken markup is never parsed into anything.
         for (const hostile of ['<!DOCTYPE x [<!ENTITY a "b">]><D:error xmlns:D="DAV:">&a;</D:error>', '<D:error xmlns:D="DAV:"><unclosed></D:error>', '<a:error xmlns:b="x"/>']) {
             expect<unknown>(sanitizeUpstream(400, 'application/xml', bytes(hostile), false, MASKS)).toEqual({ status: 400, content_type: 'xml', preconditions: [], detail: null });
@@ -256,7 +293,7 @@ describe('sanitizeUpstream (ORCH S4): bounded, untrusted, never HTML, account ma
 
     test('precondition names with quotes, angle brackets or over 128 characters are dropped', () => {
         const long = `p${'x'.repeat(140)}`;
-        const xml = `<D:error xmlns:D="DAV:" xmlns:Q="urn:a&quot;b"><D:${long}/><Q:quoted/><D:ok/></D:error>`;
-        expect<unknown>(sanitizeUpstream(409, 'application/xml', bytes(xml), false, MASKS).preconditions).toEqual(['{DAV:}ok']);
+        const xml = `<D:error xmlns:D="DAV:" xmlns:Q="urn:a&quot;b"><D:${long}/><Q:quoted/><D:need-privileges/></D:error>`;
+        expect<unknown>(sanitizeUpstream(409, 'application/xml', bytes(xml), false, MASKS).preconditions).toEqual(['{DAV:}need-privileges']);
     });
 });

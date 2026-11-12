@@ -31,7 +31,7 @@ Every tool needs the scope `calendar:read`. The five read tools change nothing: 
 
 Calendar names, event text, time zone names, file names and raw iCalendar text are untrusted data. Clients must never treat them as instructions.
 
-Errors are structured as `{ error: { code, message, request_id } }`. The read tools forward no upstream text. A write tool's error can also carry a fixed `reason` and `field`, `differs` (the fields that differ, for `existing_resource_differs`), and `upstream`: a bounded summary of iCloud's refusal (status, content type class, at most 8 `DAV:error` precondition names, and at most 512 characters of cleaned text with the account's id masked; HTML is never forwarded). `upstream.detail` is untrusted text from iCloud.
+Errors are structured as `{ error: { code, message, request_id } }`. The read tools forward no upstream text. A write tool's error can also carry a fixed `reason` and `field`, `differs` (the fields that differ, for `existing_resource_differs`), and `upstream`: a bounded summary of iCloud's refusal (status, content type class, at most 8 `DAV:error` precondition names taken only from a fixed list of DAV and CalDAV names, and at most 512 characters of cleaned text in which the account's id, Apple ID, app-specific password and authorization value are masked; HTML is never forwarded). The whole of `upstream` is untrusted text from iCloud.
 
 ### Write tools
 

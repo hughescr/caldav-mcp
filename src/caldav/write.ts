@@ -16,7 +16,7 @@ import { isCanonicalPath } from '../calendar/model';
 import { CalDavError, type CalDavAuth, type Discovery } from './contracts';
 import { assertAllowedCalDavUrl, createGuardedFetch, isTruncatedResponse, type FetchLike } from './hosts';
 import { canonicalizeServerHref, isDirectChildResource } from './identifiers';
-import { strongEtag, type CalDavWriteBackend, type UpstreamDetail, type WriteCallOptions, type WriteResponse } from './write-contracts';
+import { KNOWN_PRECONDITIONS, strongEtag, type CalDavWriteBackend, type UpstreamDetail, type WriteCallOptions, type WriteResponse } from './write-contracts';
 import { DAV_NS, parseXml, type XmlElement } from './xml';
 
 export interface WriteBackendOptions {
@@ -30,7 +30,6 @@ export interface WriteBackendOptions {
 export const MAX_WRITE_RESPONSE_BYTES = 16 * 1024;
 const WRITE_TIMEOUT_MS = 10_000;
 const MAX_PRECONDITIONS = 8;
-const MAX_PRECONDITION_LENGTH = 128;
 const MAX_DETAIL_UNITS = 512;
 
 function fail(code: 'protocol' | 'temporary' | 'too_large'): never {
@@ -68,18 +67,30 @@ function spaceUnsafe(text: string): string {
     return out;
 }
 
-const PRECONDITION_RE = /^\{[\x21\x23-\x3B\x3D\x3F-\x5B\x5D-\x7E]{0,100}\}[A-Za-z0-9._-]{1,64}$/u;
+const KNOWN: ReadonlySet<string> = new Set(KNOWN_PRECONDITIONS);
+
+/** One text that must never leave in a summary, and what replaces it. */
+export interface Mask {
+    readonly text: string;
+    readonly label: '<account>' | '<credential>';
+}
 
 function escapeRegExp(text: string): string {
     return text.replaceAll(/[.*+?^${}()|[\]\\]/gu, '\\$&');
 }
 
-/** Cleaned, masked, cut to 512 units on a code-point boundary; null when nothing is left. */
-function cleanDetail(text: string, masks: readonly string[]): { detail: string | null; cut: boolean } {
-    let clean = spaceUnsafe(text.toWellFormed()).replaceAll(/\s+/gu, ' ').trim();
-    for (const mask of masks) {
-        if (mask !== '') { clean = clean.replaceAll(new RegExp(escapeRegExp(mask), 'giu'), '<account>'); }
+/** Every mask replaced, longest first, case-insensitively (over-masking is harmless, under-masking is not). */
+function applyMasks(text: string, masks: readonly Mask[]): string {
+    let out = text;
+    for (const mask of [...masks].sort((a, b) => b.text.length - a.text.length)) {
+        if (mask.text !== '') { out = out.replaceAll(new RegExp(escapeRegExp(mask.text), 'giu'), mask.label); }
     }
+    return out;
+}
+
+/** Cleaned, masked, cut to 512 units on a code-point boundary; null when nothing is left. */
+function cleanDetail(text: string, masks: readonly Mask[]): { detail: string | null; cut: boolean } {
+    const clean = applyMasks(spaceUnsafe(text.toWellFormed()).replaceAll(/\s+/gu, ' ').trim(), masks);
     if (clean === '') { return { detail: null, cut: false }; }
     if (clean.length <= MAX_DETAIL_UNITS) { return { detail: clean, cut: false }; }
     let end = MAX_DETAIL_UNITS;
@@ -94,12 +105,13 @@ function allText(element: XmlElement): string {
 
 /**
  * A bounded summary of an answer body. XML goes through the strict xml.ts parser (no DTD, no entities beyond the
- * predefined five); a DAV:error root yields its child names as preconditions and its text as detail. HTML and unknown
- * types are never forwarded. Text is decoded as strict UTF-8 (else null), controls and bidi characters become spaces,
- * whitespace collapses, each mask (the account's principal id, its Apple ID) becomes `<account>`, and the result is cut to
- * 512 UTF-16 units.
+ * predefined five); a DAV:error root yields its child names that are in {@link KNOWN_PRECONDITIONS} as preconditions and
+ * its text as detail. HTML and unknown types are never forwarded. Text is decoded as strict UTF-8 (else null), controls
+ * and bidi characters become spaces, whitespace collapses, each mask (the account's principal id and Apple ID, the
+ * app-specific password, the Basic authorization value and its token) is replaced by its label, and the result is cut to
+ * 512 UTF-16 units. Every forwarded string is masked: a precondition name that masking would change is dropped.
  */
-export function sanitizeUpstream(status: number, contentType: string | null, body: Uint8Array, bodyTruncated: boolean, masks: readonly string[]): UpstreamDetail {
+export function sanitizeUpstream(status: number, contentType: string | null, body: Uint8Array, bodyTruncated: boolean, masks: readonly Mask[]): UpstreamDetail {
     const content_type = contentTypeClass(contentType);
     const summary: UpstreamDetail = { status, content_type, preconditions: [], detail: null };
     let text: string | null = null;
@@ -111,10 +123,12 @@ export function sanitizeUpstream(status: number, contentType: string | null, bod
         try { root = parseXml(text); } catch { root = null; }
         text = null;
         if (root !== null && root.ns === DAV_NS && root.local === 'error') {
-            summary.preconditions = root.children
-                .map(child => `{${child.ns}}${child.local}`)
-                .filter(name => name.length <= MAX_PRECONDITION_LENGTH && PRECONDITION_RE.test(name))
-                .slice(0, MAX_PRECONDITIONS);
+            const names = new Set<string>();
+            for (const child of root.children) {
+                const name = `{${child.ns}}${child.local}`;
+                if (names.size < MAX_PRECONDITIONS && KNOWN.has(name) && applyMasks(name, masks) === name) { names.add(name); }
+            }
+            summary.preconditions = [...names];
             text = allText(root);
         }
     }
@@ -140,17 +154,30 @@ function writeTarget(discovery: Discovery, calendarId: string, href: string): Ta
     return { home, url, href };
 }
 
-/** Masks for answer text: the numeric principal id from the discovered URLs, and the Apple ID. */
-function accountMasks(auth: CalDavAuth, discovery: Discovery): string[] {
-    const ids = new Set<string>();
+/**
+ * Masks for answer text: the numeric principal id from the discovered URLs and the Apple ID (also percent-encoded) as
+ * `<account>`; the app-specific password, the whole authorization value sent and its bare token as `<credential>`.
+ */
+function accountMasks(auth: CalDavAuth, discovery: Discovery, authorization: string): Mask[] {
+    const masks: Mask[] = [];
+    const add = (text: unknown, label: Mask['label']): void => {
+        if (typeof text === 'string' && text !== '') { masks.push({ text, label }); }
+    };
     for (const url of [discovery.principalUrl, discovery.calendarHomeUrl]) {
         try {
             const first = new URL(url).pathname.split('/')[1] ?? '';
-            if (/^\d{4,}$/u.test(first)) { ids.add(first); }
+            if (/^\d{4,}$/u.test(first)) { add(first, '<account>'); }
         } catch { /* a URL that does not parse has no id to mask */ }
     }
-    if (typeof auth.appleId === 'string' && auth.appleId !== '') { ids.add(auth.appleId); }
-    return [...ids].sort((a, b) => b.length - a.length);
+    if (typeof auth.appleId === 'string') {
+        add(auth.appleId, '<account>');
+        add(encodeURIComponent(auth.appleId), '<account>');
+    }
+    add(auth.appPassword, '<credential>');
+    add(authorization, '<credential>');
+    const space = authorization.indexOf(' ');
+    if (space > 0) { add(authorization.slice(space + 1).trim(), '<credential>'); }
+    return masks;
 }
 
 // ---- Sending ----
@@ -201,7 +228,7 @@ export function createWriteBackend(options: WriteBackendOptions): CalDavWriteBac
             kind: 'status',
             status,
             etag: strongEtag(response.headers.get('etag')),
-            upstream: sanitizeUpstream(status, response.headers.get('content-type'), bytes, lost || isTruncatedResponse(response), accountMasks(auth, discovery)),
+            upstream: sanitizeUpstream(status, response.headers.get('content-type'), bytes, lost || isTruncatedResponse(response), accountMasks(auth, discovery, authorization)),
         };
     }
 
