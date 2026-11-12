@@ -88,14 +88,15 @@ describe('iCloud expanded shape: VCALENDAR without VERSION or PRODID', () => {
         }
     });
 
-    test('f: expanded RECURRENCE-ID forms: Z, DATE and floating share one token space, anything else degrades alone', () => {
+    test('f: expanded RECURRENCE-ID forms: Z, DATE and floating share one token space, TZID has its own, anything else degrades alone', () => {
         const rid = (line: string): string => `BEGIN:VCALENDAR\nBEGIN:VEVENT\nUID:u1\nDTSTART;VALUE=DATE:20261218\nDTEND;VALUE=DATE:20261219\n${line}\nEND:VEVENT\nEND:VCALENDAR\n`;
         const token = (line: string): string | null | undefined => parseExpandedResource(rid(line), {}).components[0]?.recurrenceId?.token;
         expect<unknown>(token('RECURRENCE-ID:20261218T000000Z')).toBe('occ1_20261218T000000Z');
         expect<unknown>(token('RECURRENCE-ID;VALUE=DATE:20261218')).toBe('occ1_20261218T000000Z');
         expect<unknown>(token('RECURRENCE-ID:20261218T000000')).toBe('occ1_20261218T000000Z');
         expect<unknown>(token('RECURRENCE-ID:20261218T093000')).toBe('occ1_20261218T093000Z');
-        expect<unknown>(reasonOf(() => token('RECURRENCE-ID;TZID=America/Los_Angeles:20261218T090000'))).toBe('unsupported_recurrence_id');
+        expect<unknown>(token('RECURRENCE-ID;TZID=America/Los_Angeles:20261218T090000')).toBe('occ2_20261218T090000_QW1lcmljYS9Mb3NfQW5nZWxlcw');
+        expect<unknown>(reasonOf(() => token('RECURRENCE-ID;TZID=America/Los_Angeles:20261218T170000Z'))).toBe('unsupported_recurrence_id');
         expect<unknown>(reasonOf(() => token('RECURRENCE-ID;VALUE=DATE;TZID=America/Los_Angeles:20261218'))).toBe('unsupported_recurrence_id');
         expect<unknown>(reasonOf(() => token('RECURRENCE-ID;X-FOO=1:20261218T000000Z'))).toBe('unsupported_recurrence_id');
         expect<unknown>(reasonOf(() => token('RECURRENCE-ID;VALUE=DATE:20261318'))).toBe('malformed');

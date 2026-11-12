@@ -45,10 +45,22 @@ test('a DATE expanded RID is readable, so it does not degrade its resource', asy
     expect(result.unreadable).toEqual([]);
 });
 
-test('non-server-form expanded RIDs (TZID) degrade only their resource, even without readable recurring siblings', async () => {
+test('a TZID-form expanded RID is readable, with an occ2_ token of its text', async () => {
     const { backend, deps } = setup();
     backend.scriptQuery(path('work'), [
-        resource(card(['DTSTART:20270111T100000Z', 'RECURRENCE-ID;TZID=America/New_York:20270111T100000']), 'bad-rid.ics'),
+        resource(card(['DTSTART:20270111T100000Z', 'RECURRENCE-ID;TZID=America/New_York:20270111T100000']), 'tzid-rid.ics'),
+        resource(card(['DTSTART:20270111T100000Z', 'SUMMARY:readable']), 'single.ics'),
+    ]);
+    const result = await listEvents(deps, { range });
+    expect(result.calendars[0]?.status).toBe('ok');
+    expect(result.events.map(event => [event.title, event.recurrence_id])).toEqual([['readable', null], [null, 'occ2_20270111T100000_QW1lcmljYS9OZXdfWW9yaw']]);
+    expect(result.unreadable).toEqual([]);
+});
+
+test('expanded RIDs with no token form degrade only their resource, even without readable recurring siblings', async () => {
+    const { backend, deps } = setup();
+    backend.scriptQuery(path('work'), [
+        resource(card(['DTSTART:20270111T100000Z', 'RECURRENCE-ID;TZID=America/New_York;X-FOO=1:20270111T100000']), 'bad-rid.ics'),
         resource(card(['DTSTART:20270111T100000Z', 'SUMMARY:readable']), 'single.ics'),
     ]);
     const result = await listEvents(deps, { range });

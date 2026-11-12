@@ -407,18 +407,26 @@ function nullTokenComponent(resource: OriginalResource): { component: EventCompo
 /**
  * The one expanded-query window for a non-null token, without expanding recurrence: the token's original slot with the
  * series' nominal span, unioned with the actual intervals of every stored override that maps to the token or cannot be
- * mapped (an unrecognized zone), padded 24 h (time-core). Too wide is result_too_large; a DATE series token off midnight,
- * or a token on a non-recurring event, is not_found.
+ * mapped (an unrecognized zone), padded 24 h (time-core). An `occ2_` token is matched by text only: the stored override whose
+ * RECURRENCE-ID has the same token, with no zone conversion. Too wide is result_too_large; a DATE series `occ1_` token off
+ * midnight, or a token on a non-recurring event, is not_found.
  */
 function occurrenceWindow(resource: OriginalResource, token: NonNullable<ReturnType<typeof parseOccurrenceId>>): { startUtc: string; endUtc: string } {
     if (resource.kind === 'single') { throw new ReadError('not_found'); }
-    const seriesIsDate = resource.master !== null ? resource.master.start.kind === 'date' : resource.overrides.every(override => override.recurrenceId?.time.kind === 'date');
-    if (seriesIsDate && !token.serverForm.endsWith('T000000Z')) { throw new ReadError('not_found'); }
-    const related = resource.overrides.filter(override => {
-        const form = override.recurrenceId === null ? null : occurrenceServerForm(override.recurrenceId.time);
-        return form === null || form === token.serverForm;
-    });
-    const matched = resource.overrides.find(override => override.recurrenceId !== null && occurrenceServerForm(override.recurrenceId.time) === token.serverForm);
+    let related: EventComponent[];
+    if (token.kind === 'stored') {
+        related = resource.overrides.filter(override => override.recurrenceId?.token === token.id);
+    } else {
+        const seriesIsDate = resource.master !== null ? resource.master.start.kind === 'date' : resource.overrides.every(override => override.recurrenceId?.time.kind === 'date');
+        if (seriesIsDate && !token.serverForm.endsWith('T000000Z')) { throw new ReadError('not_found'); }
+        related = resource.overrides.filter(override => {
+            const form = override.recurrenceId === null ? null : occurrenceServerForm(override.recurrenceId.time);
+            return form === null || form === token.serverForm;
+        });
+    }
+    const matched = token.kind === 'stored'
+        ? related[0]
+        : resource.overrides.find(override => override.recurrenceId !== null && occurrenceServerForm(override.recurrenceId.time) === token.serverForm);
     const nominalSource = resource.master ?? matched ?? null;
     const masterSpanSeconds = nominalSource === null ? 0 : nominalSpanSeconds(eventSpan(nominalSource.start, nominalSource.end, nominalSource.duration));
     try {
