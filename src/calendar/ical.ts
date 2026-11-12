@@ -204,7 +204,7 @@ function storedTime(property: RawProperty): StoredTime {
 
 function recurrenceIdInfo(property: RawProperty): RecurrenceIdInfo {
     const time = storedTime(property);
-    return { raw: property, time, token: occurrenceIdFromRecurrenceId(property.type, stringValue(property), property.params.size > 0) };
+    return { raw: property, time, token: occurrenceIdFromRecurrenceId(property.type, stringValue(property), property.params) };
 }
 
 function buildEvent(parsed: ParsedEvent, scans: readonly AttachPrescan[] | null, expanded: boolean): EventComponent {
@@ -231,7 +231,8 @@ function buildEvent(parsed: ParsedEvent, scans: readonly AttachPrescan[] | null,
 
     const retainsRecurrenceRules = properties.has('rrule') || properties.has('rdate') || properties.has('exdate');
     if (expanded) {
-        // T0-DECISION: a structurally valid but non-server-form expanded RID is unsupported, never a guessed token.
+        // T0-DECISION: an expanded RID with no token form (another parameter, a DATE with a TZID, an over-long TZID) is
+        // unsupported, never a guessed token. A TZID-form RID has an occ2_ token of its text, so it is readable.
         if (retainsRecurrenceRules) { throw new IcalError('unsupported_recurrence_data'); }
         if (recurrenceId !== null && recurrenceId.token === null) { throw new IcalError('unsupported_recurrence_id'); }
     }

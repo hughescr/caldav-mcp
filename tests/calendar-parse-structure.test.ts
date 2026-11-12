@@ -43,10 +43,11 @@ describe('typed errors never carry parser text', () => {
 
 test('an expanded RID outside server form is distinct from retained recurrence rules', () => {
     // ORCHESTRATOR-RULING: iCloud emits VALUE=DATE recurrence ids in expanded data (measured)
-    for (const rid of ['RECURRENCE-ID;VALUE=DATE:20270111', 'RECURRENCE-ID:20270111T100000']) {
+    // Probe Run 7: an overridden instance of a TZID series carries its RECURRENCE-ID in the stored TZID form.
+    for (const rid of ['RECURRENCE-ID;VALUE=DATE:20270111', 'RECURRENCE-ID:20270111T100000', 'RECURRENCE-ID;TZID=America/New_York:20270111T100000']) {
         expect(reasonOf(() => parseExpandedResource(wrap(event(rid)), {}))).toBeNull();
     }
-    for (const rid of ['RECURRENCE-ID;TZID=America/New_York:20270111T100000', 'RECURRENCE-ID;VALUE=DATE;X-FOO=1:20270111', 'RECURRENCE-ID;VALUE=DATE;TZID=America/New_York:20270111']) {
+    for (const rid of ['RECURRENCE-ID;TZID=America/New_York;X-FOO=1:20270111T100000', 'RECURRENCE-ID;VALUE=DATE;X-FOO=1:20270111', 'RECURRENCE-ID;VALUE=DATE;TZID=America/New_York:20270111']) {
         expect(reasonOf(() => parseExpandedResource(wrap(event(rid)), {}))).toBe('unsupported_recurrence_id');
     }
     expect(reasonOf(() => parseExpandedResource(wrap(event('RECURRENCE-ID;VALUE=DATE:20270230')), {}))).toBe('malformed');

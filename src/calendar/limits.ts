@@ -46,6 +46,12 @@ export const TRANSPORT_PAD_HOURS = 24;
 /** 366 days + two 24 h axis offsets + two 31-day pads, rounded up: the largest transport span a valid range can produce. */
 export const MAX_TRANSPORT_DAYS = 430;
 
+// Occurrence tokens.
+/** Longest TZID text, in UTF-8 bytes, that an `occ2_` token carries. A longer one leaves its expanded resource unreadable. */
+export const MAX_TOKEN_TZID_BYTES = 128;
+/** `occ2_` (5) + `YYYYMMDDTHHMMSS` (15) + `_` (1) + unpadded base64url of MAX_TOKEN_TZID_BYTES bytes (171). */
+export const OCCURRENCE_ID_MAX = 192;
+
 // Concurrency and deadlines (milliseconds).
 export const CALENDAR_CONCURRENCY = 3;
 export const READ_CALL_MS = 45_000;
