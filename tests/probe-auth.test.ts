@@ -87,6 +87,14 @@ function unexpectedAfter401(requests: FakeRequest[], first401: number): string[]
     return extra;
 }
 
+/**
+ * The sweep below replays the whole probe once per request of a baseline run (about 170 full runs for
+ * `write`, each ~10-20 ms of real CPU work in the probe and the fake; every `sleep` is already stubbed).
+ * That is ~1.7 s locally and several times that on a slow CI runner, so it gets an explicit budget
+ * instead of bun's 5 s default.
+ */
+const SWEEP_TIMEOUT_MS = 60_000;
+
 describe('credentials that stop working mid-run stop the run (M1)', () => {
     for (const [label, flags] of [['read-only', READ_ONLY], ['write', WRITE]] as const) {
         test(`${label}: after the first 401 nothing is sent except one DELETE of a created calendar`, async () => {
@@ -118,7 +126,7 @@ describe('credentials that stop working mid-run stop the run (M1)', () => {
                     expect(report.cleanup?.allRemoved).toBe(false);
                 }
             }
-        });
+        }, SWEEP_TIMEOUT_MS);
     }
 
     test('reviewer PoC D: credentials revoked right after discovery', async () => {
