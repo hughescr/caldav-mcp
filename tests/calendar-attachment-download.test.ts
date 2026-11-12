@@ -331,7 +331,7 @@ describe('get_event_attachment_download end to end over the fake backend', () =>
         expect(performance.now() - started).toBeLessThan(3000);
     });
 
-    test('through MCP: a staged copy comes back as structured data plus one resource_link', async () => {
+    test('through MCP: a staged copy comes back as structured data plus its JSON text copy', async () => {
         const f = setup();
         const ref = await f.refOf('inline');
         f.backend.scriptMultiget(calendarId, [{ kind: 'found', resource: resource() }]);
@@ -344,7 +344,9 @@ describe('get_event_attachment_download end to end over the fake backend', () =>
         const reply = await (await handleMcp(request, authInfo, f.service)).json();
         const structured = downloadOutputSchema.parse(reply.result.structuredContent);
         expect(structured.form).toBe('inline');
-        expect(reply.result.content[1]).toEqual({ type: 'resource_link', uri: structured.download_url, name: 'page.html', mimeType: 'application/octet-stream', size: 9 });
+        expect(reply.result.content).toHaveLength(1);
+        expect(reply.result.content[0].type).toBe('text');
+        expect(JSON.parse(reply.result.content[0].text)).toEqual(structured);
         expect(JSON.stringify(reply)).not.toContain(credentials.appPassword);
     });
 });

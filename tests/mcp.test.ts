@@ -151,7 +151,7 @@ test('the server is caldav-mcp and lists exactly five read-only calendar tools',
     expect(f.calls()).toBe(0);
 });
 
-test('a staged download returns its link in structured content, the JSON text copy and one resource_link', async () => {
+test('a staged download returns its link in structured content and the JSON text copy only', async () => {
     for (const protocol of ['2025-11-25', '2026-07-28']) {
         const f = fixture();
         const reply = await f.rpc('tools/call', { name: 'get_event_attachment_download', arguments: downloadArgs }, undefined, { 'mcp-protocol-version': protocol });
@@ -160,8 +160,7 @@ test('a staged download returns its link in structured content, the JSON text co
         expect(downloadOutputSchema.parse(result.structuredContent)).toEqual(stagedDownload);
         expect(result.structuredContent.result).toBeUndefined();
         expect(JSON.parse(result.content[0].text)).toEqual(stagedDownload);
-        expect(result.content[1]).toEqual({ type: 'resource_link', uri: downloadUrl, name: 'probe.txt', mimeType: 'text/plain', size: 32 });
-        expect(result.content).toHaveLength(2);
+        expect(result.content.map((item: { type: string }) => item.type)).toEqual(['text']);
         expect(f.calls()).toBe(1);
     }
     expect(JSON.stringify(warn.mock.calls)).not.toContain('presigned-canary');
@@ -173,7 +172,26 @@ test('an external attachment is returned as an unfetched link with a fixed notic
     const result = (await f.rpc('tools/call', { name: 'get_event_attachment_download', arguments: downloadArgs })).result;
     expect(result.structuredContent).toEqual(externalDownload);
     expect(result.content.map((item: { type: string }) => item.type)).toEqual(['text', 'text']);
+    expect(JSON.parse(result.content[0].text)).toEqual(externalDownload);
     expect(result.content[1].text).toContain('did not fetch');
+});
+
+/** How many times `needle` occurs in `haystack`. */
+function occurrences(haystack: string, needle: string): number { return haystack.split(needle).length - 1; }
+
+test('the link of a download appears once in the content blocks and once in structured content, in both forms and both protocol eras', async () => {
+    const cases: [DownloadOutput, string][] = [[stagedDownload, downloadUrl], [externalDownload, externalDownload.url ?? '']];
+    for (const protocol of ['2025-11-25', '2026-07-28']) {
+        for (const [download, link] of cases) {
+            expect(link).not.toBe('');
+            const f = fixture();
+            f.service.get_event_attachment_download = async () => download;
+            const result = (await f.rpc('tools/call', { name: 'get_event_attachment_download', arguments: downloadArgs }, undefined, { 'mcp-protocol-version': protocol })).result;
+            expect(occurrences(JSON.stringify(result.content), link)).toBe(1);
+            expect(occurrences(JSON.stringify(result.structuredContent), link)).toBe(1);
+            expect(result.content.every((item: { type: string }) => item.type === 'text')).toBe(true);
+        }
+    }
 });
 
 test('a download result that breaks the output contract is upstream_error, not passed through', async () => {

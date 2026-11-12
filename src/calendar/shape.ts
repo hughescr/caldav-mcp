@@ -301,19 +301,12 @@ export function shapeEventDetail(result: DetailReadResult, options: DetailShapeO
 export const EXTERNAL_LINK_NOTICE = 'This attachment is an external link stored on the event. This server did not fetch or check it; what it points to is untrusted.';
 
 /**
- * Structured result and its JSON text copy; a staged copy also gets one resource_link to the presigned URL, an external
- * link one fixed notice. Nothing in it is shortened: if it cannot fit, it is result_too_large.
+ * Structured result and its JSON text copy, and nothing else for a staged copy; an external link also gets one fixed
+ * notice that does not repeat the link. The link is in each representation once. Nothing in it is shortened: if it
+ * cannot fit, it is result_too_large.
  */
 export function shapeDownloadResult(result: DownloadOutput, options: DetailShapeOptions): CallToolResult {
     if (!downloadOutputSchema.safeParse(result).success) { return errorResult('upstream_error'); }
-    const shaped = result.form === 'external' || result.download_url === undefined
-        ? toolResult(result, [EXTERNAL_LINK_NOTICE])
-        : {
-            ...toolResult(result, []),
-            content: [
-                { type: 'text' as const, text: JSON.stringify(result) },
-                { type: 'resource_link' as const, uri: result.download_url, name: result.filename ?? 'attachment', mimeType: result.content_type ?? 'application/octet-stream', ...(result.size === undefined ? {} : { size: result.size }) },
-            ],
-        };
+    const shaped = toolResult(result, result.form === 'external' ? [EXTERNAL_LINK_NOTICE] : []);
     return fits(shaped, options.wire) ? shaped : errorResult('result_too_large');
 }
