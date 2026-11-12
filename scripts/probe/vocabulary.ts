@@ -40,8 +40,24 @@ export const ATTACHMENT_CODES = [
     'action', 'managed-id', 'token', 'download', 'basic', 'bearer', 'digest', 'x-mobileme-authtoken',
 ] as const;
 
+/**
+ * The fixed enums of the phase 3 checks (probe 0.6.0): what a PUT did to a TZID, the class of a
+ * body's Content-Type, line endings, what happened to a nonsense RRULE, how expansion renders an
+ * overridden instance's RECURRENCE-ID, and the invite steps' request labels and roles.
+ */
+export const PHASE3_CODES = [
+    'kept-tzid', 'floating', 'utc', 'tzid-changed',
+    'xml', 'html', 'plain', 'calendar', 'json',
+    'crlf', 'lf', 'mixed',
+    'refused', 'unread', 'stored-no-instances', 'stored-one-instance', 'stored-many-instances',
+    'b-utc-token', 'a-stored-text',
+    'create', 'update', 'delete', 'read', 'add-attendee', 'remove-attendee', 'alarm-only', 'transp-only', 'time-change', 'description-only',
+    'override', 'exdate', 'split-new', 'split-truncate', 'partstat-accepted', 'summary-change', 'create-client', 'create-none',
+    'I1', 'I2', 'I2b', 'I3', 'I5', 'I6', 'I7', 'I8', 'I9', 'I10',
+] as const;
+
 /** Every code above, plus the `probe_`-prefixed HTTP error codes the backend check reports. */
 export const CODE_WORDS: ReadonlySet<string> = new Set<string>([
     ...HTTP_ERROR_CODES, ...HTTP_ERROR_CODES.map((code) => `probe_${code}`), ...BACKEND_CODES, ...VALIDATE_RESULTS,
-    ...NOT_DELETED_REASONS, ...PLACEHOLDERS, ...ATTACHMENT_CODES,
+    ...NOT_DELETED_REASONS, ...PLACEHOLDERS, ...ATTACHMENT_CODES, ...PHASE3_CODES,
 ]);

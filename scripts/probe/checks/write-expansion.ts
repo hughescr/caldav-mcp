@@ -28,7 +28,7 @@ export async function putOrStop(ctx: CheckContext, url: string, body: string, ev
     return put;
 }
 
-export interface Expanded { status: number; returned: boolean; events: IcalComponent[]; vtimezones: number }
+export interface Expanded { status: number; returned: boolean; events: IcalComponent[]; vtimezones: number; etag?: string | null }
 
 export function resourceOf(status: number, ical: IcalComponent | undefined): Expanded {
     return { status, returned: ical !== undefined, events: eventComponents(ical), vtimezones: ical === undefined ? 0 : comps(ical, 'VTIMEZONE').length };
@@ -60,7 +60,7 @@ export async function windowResources(ctx: CheckContext, temp: TempCalendar, hre
             const uid = new URL(href).pathname.split('/').at(-1)?.slice(0, -4) ?? '';
             requireSynthetic(root, href, temp.url, uid, r.res.status);
         }
-        return [href, { ...resourceOf(r.res.status, root), returned: matches.length > 0 }];
+        return [href, { ...resourceOf(r.res.status, root), returned: matches.length > 0, etag: matches[0]?.etag ?? null }];
     }));
 }
 

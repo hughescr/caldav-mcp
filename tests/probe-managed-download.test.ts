@@ -27,12 +27,12 @@ function transport(respond: (req: Request) => Response | Promise<Response>, limi
     return { http, requests, inits };
 }
 
-test('0.5.0 standard fake request totals', async () => {
+test('0.6.0 standard fake request totals', async () => {
     for (const expand of [false, true]) {
         for (const flags of [READ_ONLY, WRITE]) {
             const fake = standardAccount(PLAIN, { expand });
             const report = await probe(fake, flags, credentials);
-            const expected = flags.write ? expand ? 184 : 170 : 54;
+            const expected = flags.write ? expand ? 222 : 208 : 54;
             expect(report.totals.requests).toBe(expected);
             expect(fake.requests).toHaveLength(expected);
         }

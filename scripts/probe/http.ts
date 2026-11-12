@@ -65,7 +65,9 @@ const MAX_ESSENTIAL_WAIT_MS = 2_000;
 
 export const DEFAULT_HTTP_LIMITS: HttpLimits = {
     minIntervalMs: 150,
-    maxRequests: 400,
+    // 0.6.0's phase 3 checks add about 125 requests to a write run and the invite steps about 50
+    // more; 400 no longer left headroom over a real account's ~210-request write run.
+    maxRequests: 600,
     reserveRequests: 25,
     timeoutMs: 20_000,
     cleanupTimeoutMs: CLEANUP_TIMEOUT_MS,
@@ -95,7 +97,10 @@ export interface ProbeRequest {
     method: string;
     url: string;
     headers?: Record<string, string>;
-    body?: string;
+    /** Bytes are sent as given: the text round-trip check folds lines inside a UTF-8 sequence on purpose. */
+    body?: string | Uint8Array<ArrayBuffer>;
+    /** Also return the body's bytes as received (`raw`), before UTF-8 decoding. */
+    raw?: boolean;
     /** Cleanup requests: allowed past the cap reserve, the deadline, throttling and interruption. */
     essential?: boolean;
     /** Default true. The burst measurement turns pacing off. */
@@ -117,6 +122,8 @@ export interface ProbeResponse {
     redirects: number;
     redirectStatuses: number[];
     elapsedMs: number;
+    /** The body's bytes as received, only when the request asked for them (`raw`). */
+    raw?: Uint8Array;
     /** The body was cut at `maxBytes`. */
     truncated: boolean;
 }
@@ -206,6 +213,11 @@ export class ProbeHttp {
     /** True once an authenticated response was HTTP 401 (anonymous attachment challenges do not reject credentials). */
     get credentialsRejected(): boolean {
         return this.rejected;
+    }
+
+    /** The run was interrupted (Ctrl-C, SIGTERM, SIGHUP): long waits between invite steps stop early. */
+    get interrupted(): boolean {
+        return this.options.signal?.aborted === true;
     }
 
     /** True when the very first request sent in this run was answered 401. */
@@ -376,10 +388,10 @@ export class ProbeHttp {
     }
 
     /** The body as text; past `softLimit` bytes reading stops and the text is cut there (`truncated`). */
-    private async readCapped(response: Response, softLimit?: number): Promise<{ text: string; truncated: boolean }> {
+    private async readCapped(response: Response, softLimit?: number): Promise<{ text: string; truncated: boolean; bytes: Uint8Array }> {
         const reader = response.body?.getReader();
         if (reader === undefined) {
-            return { text: '', truncated: false };
+            return { text: '', truncated: false, bytes: new Uint8Array(0) };
         }
         const chunks: Uint8Array[] = [];
         let size = 0;
@@ -402,11 +414,12 @@ export class ProbeHttp {
                 throw new ProbeHttpError('body_too_large');
             }
         }
-        const bytes = Buffer.concat(chunks);
-        return { text: new TextDecoder('utf-8', { ignoreBOM: true }).decode(truncated ? bytes.subarray(0, softLimit) : bytes), truncated };
+        const all = Buffer.concat(chunks);
+        const bytes = truncated ? all.subarray(0, softLimit) : all;
+        return { text: new TextDecoder('utf-8', { ignoreBOM: true }).decode(bytes), truncated, bytes };
     }
 
-    private async sendOnce(method: string, url: string, request: ProbeRequest, body: string | undefined, attachment?: { anonymous: boolean }): Promise<{ response: Response; text: string | undefined; truncated: boolean; elapsedMs: number }> {
+    private async sendOnce(method: string, url: string, request: ProbeRequest, body: string | Uint8Array<ArrayBuffer> | undefined, attachment?: { anonymous: boolean }): Promise<{ response: Response; text: string | undefined; truncated: boolean; bytes?: Uint8Array; elapsedMs: number }> {
         const headers = new Headers(request.headers);
         if (attachment?.anonymous !== true) {
             headers.set('authorization', this.authorization);
@@ -448,7 +461,7 @@ export class ProbeHttp {
             }
             try {
                 const read = await this.readCapped(response, request.maxBytes);
-                return { response, text: read.text, truncated: read.truncated };
+                return { response, text: read.text, truncated: read.truncated, bytes: read.bytes };
             } catch (error) {
                 if (error instanceof ProbeHttpError) {
                     throw error;
@@ -500,7 +513,7 @@ export class ProbeHttp {
             this.checkPolicy(method, url);
             this.checkLatch(method, url, request, hop);
             await this.beforeSend(request);
-            const { response, text, truncated, elapsedMs } = await this.sendOnce(method, url, request, body);
+            const { response, text, truncated, bytes, elapsedMs } = await this.sendOnce(method, url, request, body);
             elapsedTotal += elapsedMs;
             this.record(method, response, elapsedMs);
             if (text === undefined) {
@@ -512,7 +525,10 @@ export class ProbeHttp {
                 }
                 continue;
             }
-            return { status: response.status, headers: response.headers, body: text, url, redirects: redirectStatuses.length, redirectStatuses, elapsedMs: elapsedTotal, truncated };
+            return {
+                status: response.status, headers: response.headers, body: text, url, redirects: redirectStatuses.length, redirectStatuses, elapsedMs: elapsedTotal, truncated,
+                ...(request.raw === true && bytes !== undefined ? { raw: bytes } : {}),
+            };
         }
         throw new ProbeHttpError('too_many_redirects');
     }

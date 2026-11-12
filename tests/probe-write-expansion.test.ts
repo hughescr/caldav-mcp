@@ -67,7 +67,7 @@ describe('every new write check runs inside the temporary calendar and leaves no
         expect(first.cleanup?.allRemoved).toBe(false);
         const left = [...fake.calendars.values()].filter((c) => c.id.startsWith('caldav-mcp-probe-'));
         expect(left.length).toBe(2);
-        expect(Math.max(...left.map((c) => c.events.size))).toBeLessThanOrEqual(50);
+        expect(Math.max(...left.map((c) => c.events.size))).toBeLessThanOrEqual(100);
         fake.behaviour.deleteCollection = 'works';
         const cleaned = await probe(fake, { write: false, invite: false, cleanup: true }, creds, { confirmCleanup: async () => true });
         expect(check(cleaned, 'cleanup-leftovers').evidence).toMatchObject({ found: 2, candidates: 2, removalVerified: 2 });

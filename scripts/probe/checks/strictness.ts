@@ -7,6 +7,7 @@ import { prose } from '../safe';
 import { zoneValidator } from '../tz';
 import type { Evidence } from '../types';
 import { Failures, attempt } from './census-helpers';
+import { addRecurrenceShapes } from './census-recurrence';
 import { eventCalendars, toResources } from './queries';
 
 const DAY = 86_400_000;
@@ -114,6 +115,7 @@ export const strictnessCheck: CheckDef = {
                 attachments.candidate = { url, declaredSize: size };
             }
         };
+        const recurrence: Record<string, number> = {};
         let queried = 0;
         let read = 0;
         let overCap = 0;
@@ -151,6 +153,7 @@ export const strictnessCheck: CheckDef = {
                     addToCensus(census, resource.ical, isIanaZone);
                     // The same successfully parsed resources feed the attachment census (no request of its own).
                     addAttachments(attachments.tally, resource.ical, keepCandidate);
+                    addRecurrenceShapes(recurrence, resource.ical);
                 }
             }
         }
@@ -161,6 +164,7 @@ export const strictnessCheck: CheckDef = {
         const complete = read === eventCalendars(ctx).length && overCap === 0 && failures.count === 0 && missingData === 0 && parseFailed === 0;
         attachments.coverageComplete = complete;
         ctx.state.attachments = attachments;
+        ctx.state.recurrenceCensus = { tally: recurrence, coverageComplete: complete };
         const anomalies = ANOMALY_KEYS.reduce((sum, key) => sum + census[key], 0);
         const evidence: Evidence = {
             wideWindowDays: days * 2,

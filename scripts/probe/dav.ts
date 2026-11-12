@@ -1,4 +1,4 @@
-import { CheckStop, stopOnThrottle, type CheckContext } from './context';
+import { CheckStop, stopOnThrottle, type CheckContext, type RefusalShape } from './context';
 import type { ProbeResponse } from './http';
 import { comps, parseIcal, prop, props, textValues, type IcalComponent } from './ical';
 import { prose, type Taint } from './safe';
@@ -85,15 +85,34 @@ export async function dav(ctx: CheckContext, method: string, url: string, option
     }
     let ms: Multistatus | undefined;
     let errorElements: string[] = [];
+    let rootName: string | undefined;
     if (res.status === 207) {
         ms = parseMultistatus(res.body);
         taintXml(ms?.root, ctx.taint);
     } else if (/^\s*</.test(res.body)) {
         const root = parseXml(res.body);
         taintXml(root, ctx.taint);
+        rootName = root?.name;
         errorElements = elementNames(root).filter((name) => name !== 'error' && name !== 'href');
     }
+    if (WRITE_METHODS.has(method) && res.status >= 400) {
+        ctx.state.refusals.push({ method, status: res.status, contentType: contentTypeClass(res.headers.get('content-type')), bytes: Buffer.byteLength(res.body), root: rootName, elements: errorElements });
+    }
     return { res, ms, errorElements };
+}
+
+const WRITE_METHODS = new Set(['PUT', 'DELETE', 'MKCALENDAR', 'POST']);
+
+/** The class of a Content-Type header; the header itself is never recorded. */
+export function contentTypeClass(header: string | null): RefusalShape['contentType'] {
+    if (header === null || header.trim() === '') {
+        return 'none';
+    }
+    const type = header.split(';')[0]?.trim().toLowerCase() ?? '';
+    if (type === 'text/xml' || type === 'application/xml' || type.endsWith('+xml')) {
+        return 'xml';
+    }
+    return ({ 'text/html': 'html', 'text/plain': 'plain', 'text/calendar': 'calendar', 'application/json': 'json' } as const)[type] ?? 'other';
 }
 
 export function absolute(href: string, base: string): string | undefined {

@@ -1,6 +1,7 @@
 import { runCheck, type CheckContext, type CheckDef, type CheckRecord } from '../context';
 import type { NotDeletedReport, TempCalendarReport } from '../types';
 import { inviteCheck } from './invite';
+import { WRITE_3A_CHECKS, errorBodiesCheck } from './write-3a';
 import { rewritesCheck, roundTripChecks } from './roundtrip';
 import { ATTACHMENT_WRITE_CHECKS } from './write-attachments';
 import { DST_WRITE_CHECKS } from './write-dst';
@@ -20,6 +21,10 @@ const WRITE_CHECKS: CheckDef[] = [
     movedOverridesCheck, movedOverrideInSpanCheck,
     ...DST_WRITE_CHECKS,
     ...ATTACHMENT_WRITE_CHECKS,
+    // Phase 3 (probe 0.6.0), after every older check so their counts do not change.
+    ...WRITE_3A_CHECKS,
+    // Last: it describes the refusal bodies of every write above.
+    errorBodiesCheck,
 ];
 
 /**
