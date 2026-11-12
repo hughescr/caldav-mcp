@@ -148,9 +148,43 @@ describe('answers', () => {
         const result = await broken.backend.deleteEvent(AUTH, DISCOVERY, { calendarId: CALENDAR, href: HREF, etag: ETAG });
         expect<unknown>(result).toEqual({ kind: 'uncertain' });
         expect(JSON.stringify(result)).not.toContain('canary');
-        // A stalled body after the status line is uncertain too: the status may never be read in full.
-        const stalled = backendFor((_request, signal) => new Response(new ReadableStream<Uint8Array>({ start(controller) { signal?.addEventListener('abort', () => controller.error(new Error('aborted'))); } }), { status: 201 }));
-        expect<unknown>(await stalled.backend.putEvent(AUTH, DISCOVERY, { calendarId: CALENDAR, href: HREF, body: BODY, precondition: { kind: 'create' } }, { deadlineMs: 20 })).toEqual({ kind: 'uncertain' });
+    });
+
+    /** A body that never ends on its own; it errors when the request is aborted. `cancelled` reports a cancel. */
+    const stallingBody = (signal: AbortSignal | undefined, state: { cancelled: boolean }): ReadableStream<Uint8Array> => new ReadableStream<Uint8Array>({
+        start(controller) {
+            controller.enqueue(new TextEncoder().encode('partial '));
+            signal?.addEventListener('abort', () => { try { controller.error(new Error('aborted')); } catch { /* already closed */ } });
+        },
+        cancel() { state.cancelled = true; },
+    });
+    const failingBody = (): ReadableStream<Uint8Array> => new ReadableStream<Uint8Array>({
+        pull(controller) { controller.error(new TypeError('connection reset write-test-canary-pass')); },
+    });
+
+    test('a definitive 2xx keeps its status and ETag as soon as the headers arrive: a stalled or failing body is discarded unread', async () => {
+        for (const status of [200, 201, 204]) {
+            const state = { cancelled: false };
+            const stalled = backendFor((_request, signal) => new Response(status === 204 ? null : stallingBody(signal, state), { status, headers: { etag: '"new1"', 'content-type': 'text/plain' } }));
+            const started = performance.now();
+            const result = await stalled.backend.putEvent(AUTH, DISCOVERY, { calendarId: CALENDAR, href: HREF, body: BODY, precondition: { kind: 'create' } }, { deadlineMs: 5000 });
+            // Returned without waiting for the 5 s deadline, and the body was cancelled, not read.
+            expect<unknown>([status, result, performance.now() - started < 1000, state.cancelled || status === 204]).toEqual([status, { kind: 'status', status, etag: '"new1"', upstream: { status, content_type: 'text', preconditions: [], detail: null } }, true, true]);
+            const failing = backendFor(() => new Response(status === 204 ? null : failingBody(), { status, headers: { etag: '"new2"' } }));
+            expect<unknown>([status, await failing.backend.deleteEvent(AUTH, DISCOVERY, { calendarId: CALENDAR, href: HREF, etag: ETAG })]).toEqual([status, { kind: 'status', status, etag: '"new2"', upstream: { status, content_type: 'none', preconditions: [], detail: null } }]);
+        }
+    });
+
+    test('a refusal or a 202 whose body stalls or fails keeps its status with empty detail; never uncertain', async () => {
+        for (const status of [202, 403, 412, 500]) {
+            const stalled = backendFor((_request, signal) => new Response(stallingBody(signal, { cancelled: false }), { status, headers: { 'content-type': 'text/plain' } }));
+            const result = await stalled.backend.putEvent(AUTH, DISCOVERY, { calendarId: CALENDAR, href: HREF, body: BODY, precondition: { kind: 'create' } }, { deadlineMs: 30 });
+            expect<unknown>([status, result]).toEqual([status, { kind: 'status', status, etag: null, upstream: { status, content_type: 'text', preconditions: [], detail: null, detail_truncated: true } }]);
+            const failing = backendFor(() => new Response(failingBody(), { status, headers: { 'content-type': 'text/plain' } }));
+            const failed = await failing.backend.deleteEvent(AUTH, DISCOVERY, { calendarId: CALENDAR, href: HREF, etag: ETAG });
+            expect<unknown>([status, failed]).toEqual([status, { kind: 'status', status, etag: null, upstream: { status, content_type: 'text', preconditions: [], detail: null, detail_truncated: true } }]);
+            expect(JSON.stringify(failed)).not.toContain('canary');
+        }
     });
 
     test('no time left: refused before sending', async () => {

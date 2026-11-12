@@ -57,11 +57,21 @@ export interface GuardedFetchOptions {
      * with a huge error body is still known. {@link isTruncatedResponse} reports the cut.
      */
     truncateBody?: boolean;
+    /**
+     * Writes: for a final status where this returns true, the body is cancelled unread and the Response has none. The status
+     * and headers are the answer; the body can then neither stall nor fail it.
+     */
+    skipBody?: (status: number) => boolean;
+    /**
+     * Writes: once a final status has arrived, a body that fails or stalls past the timeout yields that status with an empty
+     * body, marked by {@link isTruncatedResponse}, instead of an error. A shared charge's BudgetError still propagates.
+     */
+    keepStatusOnBodyFailure?: boolean;
 }
 
 const truncatedResponses = new WeakSet<Response>();
 
-/** True when a guarded fetch with `truncateBody` cut this response's body. */
+/** True when a guarded fetch with `truncateBody` cut this response's body, or `keepStatusOnBodyFailure` dropped it. */
 export function isTruncatedResponse(response: Response): boolean {
     return truncatedResponses.has(response);
 }
@@ -337,7 +347,21 @@ export function createGuardedFetch(baseFetch?: FetchLike, options: GuardedFetchO
                     discard(response);
                     throw new CalDavError('protocol');
                 }
-                const { bytes, truncated } = await readCapped(response, signal, options);
+                if (options.skipBody?.(status) === true) {
+                    discard(response);
+                    const bodiless = new Response(null, { status, statusText: response.statusText, headers: response.headers });
+                    Object.defineProperty(bodiless, 'url', { value: request.url.href });
+                    return bodiless;
+                }
+                let read: { bytes: Uint8Array<ArrayBuffer>; truncated: boolean };
+                try {
+                    read = await readCapped(response, signal, options);
+                } catch (error) {
+                    if (options.keepStatusOnBodyFailure !== true || error instanceof BudgetError) { throw error; }
+                    // The status is known; only the body is lost (readCapped has cancelled it).
+                    read = { bytes: new Uint8Array(0), truncated: true };
+                }
+                const { bytes, truncated } = read;
                 const buffered = new Response(NULL_BODY_STATUSES.has(status) ? null : bytes, {
                     status,
                     statusText: response.statusText,

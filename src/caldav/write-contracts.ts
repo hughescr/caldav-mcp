@@ -41,7 +41,7 @@ export type WriteResponse =
     | { kind: 'status'; status: number; etag: StrongEtag | null; upstream: UpstreamDetail }
     /** A 3xx: not followed, nothing re-sent. */
     | { kind: 'redirected'; status: number }
-    /** The request was sent and no usable answer arrived (timeout, network failure, unreadable answer). */
+    /** The request was sent and no status arrived (timeout, network failure). A status with a lost body is a `status`. */
     | { kind: 'uncertain' };
 
 export interface WriteCallOptions {

@@ -4,8 +4,11 @@
  *   target href, a direct child of a calendar collection directly under the home;
  * - `If-None-Match: *` for a create, the exact strong ETag in `If-Match` for an update or delete; nothing else is buildable;
  * - no redirect is followed (a 3xx is reported, the write is never re-sent), no retry of any kind;
- * - the answer body is read at most 16 KiB and summarised by {@link sanitizeUpstream}; a 401 is decided from the status alone;
- * - a failure after the request was handed to the network is `uncertain`, never a refusal: iCloud may have applied it.
+ * - a 401 is decided from the status alone; a definitive 2xx (not 202) is decided from its status and headers, its body
+ *   cancelled unread; any other answer body is read at most 16 KiB and summarised by {@link sanitizeUpstream}, and when it
+ *   fails or stalls the status still stands, with an empty summary;
+ * - a failure after the request was handed to the network and before a status arrived is `uncertain`, never a refusal:
+ *   iCloud may have applied it.
  * Errors before sending are bare CalDavError codes. Nothing here logs.
  */
 import { MAX_RESOURCE_BYTES } from '../calendar/limits';
@@ -33,6 +36,9 @@ const MAX_DETAIL_UNITS = 512;
 function fail(code: 'protocol' | 'temporary' | 'too_large'): never {
     throw new CalDavError(code);
 }
+
+/** A 2xx other than 202: the save or delete happened. Its body is never read, so it can neither stall nor fail the answer. */
+const isDefinitiveSuccess = (status: number): boolean => status >= 200 && status < 300 && status !== 202;
 
 // ---- Answer summaries (ORCH S4) ----
 
@@ -163,6 +169,8 @@ export function createWriteBackend(options: WriteBackendOptions): CalDavWriteBac
             timeoutMs: Math.min(WRITE_TIMEOUT_MS, call.deadlineMs ?? WRITE_TIMEOUT_MS),
             maxResponseBytes: MAX_WRITE_RESPONSE_BYTES,
             truncateBody: true,
+            skipBody: isDefinitiveSuccess,
+            keepStatusOnBodyFailure: true,
             followRedirects: false,
             preserveMethod: true,
             validateUrl: (url, raw) => {
@@ -185,13 +193,15 @@ export function createWriteBackend(options: WriteBackendOptions): CalDavWriteBac
         const { status } = response;
         if (status === 401) { throw new CalDavError('unauthorized'); }
         if (status >= 300 && status < 400) { return { kind: 'redirected', status }; }
+        // The status is the answer from here on: a body that cannot be read only empties the summary, never the status.
         let bytes: Uint8Array;
-        try { bytes = new Uint8Array(await response.arrayBuffer()); } catch { return { kind: 'uncertain' }; }
+        let lost = false;
+        try { bytes = new Uint8Array(await response.arrayBuffer()); } catch { bytes = new Uint8Array(0); lost = true; }
         return {
             kind: 'status',
             status,
             etag: strongEtag(response.headers.get('etag')),
-            upstream: sanitizeUpstream(status, response.headers.get('content-type'), bytes, isTruncatedResponse(response), accountMasks(auth, discovery)),
+            upstream: sanitizeUpstream(status, response.headers.get('content-type'), bytes, lost || isTruncatedResponse(response), accountMasks(auth, discovery)),
         };
     }
 
