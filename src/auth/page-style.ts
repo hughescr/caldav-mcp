@@ -40,7 +40,7 @@ export const PAGE_STYLE = [
     '.permission span{display:block;min-width:0;overflow-wrap:anywhere}',
     '.permission small{display:block;color:var(--muted);font:500 13px/1.4 ui-monospace,monospace}',
     '.permission em{display:block;color:var(--sensitive);font-style:normal;font-size:12px;font-weight:700;letter-spacing:.04em;text-transform:uppercase}',
-    'li.permission::before{content:"\\2013";content:"\\2013" / "";flex:none;width:20px;text-align:center;color:var(--muted)}',
+    'li.permission::before{content:"\\2713";content:"\\2713" / "";flex:none;width:20px;text-align:center;color:var(--accent);font-weight:700}',
     '.privacy{margin-top:22px;color:var(--muted);font-size:14px}',
     '.actions{display:flex;gap:12px;flex-wrap:wrap;margin-top:25px}',
     'button{font:700 15px system-ui,sans-serif;min-height:48px;min-width:112px;padding:10px 22px;border:2px solid var(--button);cursor:pointer}',
