@@ -4,7 +4,7 @@
  * the text of iCloud's own expansion and zone-free arithmetic on the probe's own values only.
  * The owner-observed checks (P3C-5, P3D-4, `--observe-client`) are not part of this version.
  */
-import type { CheckContext, CheckDef, CheckOutput, Phase3Series } from '../context';
+import { isRefusal, type CheckContext, type CheckDef, type CheckOutput, type Phase3Series } from '../context';
 import { icalDate, icalLocal, icalUtc, prop, type IcalComponent } from '../ical';
 import { fixed, prose } from '../safe';
 import type { Evidence } from '../types';
@@ -175,7 +175,7 @@ export const splitNewSeriesCheck: CheckDef = {
         const moved = (series.overrides[0] ?? []).map((line) => (line.startsWith('UID:') ? `UID:${fresh.uid}` : line));
         const created = await tryWrite(ctx, fresh.url, calendarText([newMaster, moved]), evidence, 'newSeries');
         if (created === undefined) {
-            return { outcome: 'refuted', summary: prose`The new series of the split was not accepted.`, evidence };
+            return { outcome: isRefusal(Number(evidence.newSeriesPutStatus)) ? 'refuted' : 'inconclusive', summary: prose`The new series of the split was not accepted.`, evidence };
         }
         series.overrides = [];
         const truncatedMaster = editLines(series.master, { RRULE: `RRULE:${truncatedRule('FREQ=WEEKLY', until)}`, SEQUENCE: 'SEQUENCE:1', DTSTAMP: `DTSTAMP:${stamp}` });
@@ -351,14 +351,23 @@ export const seriesMoveShiftCheck: CheckDef = {
                 const [unmoved, moved] = overrides[spec.key] ?? [];
                 const slots = [0, 1, 2, 3, 5].map((k) => shifted(spec.start, d + 7 * k * DAY));
                 const expected = [slots[0], shifted(unmoved?.[1] ?? '', d), moved?.[1], slots[3], slots[4]].map(String).toSorted();
-                const overrideAt = after.events.find((e) => summaryOf(e) === OVERRIDE_SUMMARY);
-                const movedAt = after.events.find((e) => summaryOf(e) === MOVED);
-                Object.assign(evidence, {
-                    [`${s.key}UnmovedOverrideShifted`]: overrideAt !== undefined && startText(overrideAt) === shifted(unmoved?.[1] ?? '', d),
-                    [`${s.key}MovedOverrideKeptTime`]: movedAt !== undefined && startText(movedAt) === moved?.[1],
-                    [`${s.key}ExclusionKept`]: !after.events.some((e) => startText(e) === shifted(spec.start, d + 28 * DAY)),
-                });
-                return after.events.length === 5 && sameList(dtstarts(after.events), expected);
+                const overrideAt = after.events.filter((e) => summaryOf(e) === OVERRIDE_SUMMARY);
+                const movedAt = after.events.filter((e) => summaryOf(e) === MOVED);
+                // Each instance's slot, compared zone-free: the RECURRENCE-ID digits without Z, a DATE slot at midnight.
+                const slotKey = (value: string | undefined): string => {
+                    const v = (value ?? '').replace(/Z$/, '').replace(/^.*:/, '');
+                    return /^\d{8}$/.test(v) ? `${v}T000000` : v;
+                };
+                const ridOf = (e: IcalComponent | undefined): string => slotKey(e === undefined ? undefined : prop(e, 'RECURRENCE-ID')?.value);
+                const expectedSlots = slots.map((line) => slotKey(line)).toSorted();
+                const flags = {
+                    [`${s.key}UnmovedOverrideShifted`]: overrideAt.length === 1 && startText(overrideAt[0] as IcalComponent) === shifted(unmoved?.[1] ?? '', d) && ridOf(overrideAt[0]) === slotKey(slots[1]),
+                    [`${s.key}MovedOverrideKeptTime`]: movedAt.length === 1 && startText(movedAt[0] as IcalComponent) === moved?.[1] && ridOf(movedAt[0]) === slotKey(slots[2]),
+                    [`${s.key}ExclusionKept`]: !after.events.some((e) => startText(e) === shifted(spec.start, d + 28 * DAY) || ridOf(e) === slotKey(shifted(spec.start, d + 28 * DAY))),
+                    [`${s.key}SlotsAsExpected`]: sameList(after.events.map(ridOf).toSorted(), expectedSlots),
+                };
+                Object.assign(evidence, flags);
+                return after.events.length === 5 && sameList(dtstarts(after.events), expected) && Object.values(flags).every(Boolean);
             });
     },
 };

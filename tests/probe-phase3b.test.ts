@@ -82,7 +82,7 @@ describe('write-override-reedit (P3B-3)', () => {
         let gets = 0;
         const { report } = await run({
             ...ICLOUD_MEASURED,
-            transformResponse: async (req, res) => (req.method === 'GET' && req.url.pathname.endsWith('-p3b1utc.ics') && ++gets === 2
+            transformResponse: async (req, res) => (req.method === 'GET' && req.url.pathname.endsWith('-p3b1utc.ics') && ++gets === 3
                 ? new Response((await res.text()).replace('SEQUENCE:0', 'SEQUENCE:7'), { status: res.status, headers: res.headers })
                 : res),
         });

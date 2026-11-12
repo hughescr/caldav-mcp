@@ -26,7 +26,7 @@ export const MIN_INVITE_GAP_SECONDS = 10;
 export const MAX_INVITE_GAP_SECONDS = 900;
 
 /** The most mails a step can cause if iCloud mails every change (each recipient address counted). */
-export const MAIL_UPPER_BOUND: Record<InviteStep, number> = { I1: 2, I2: 3, I2b: 3, I3: 4, I5: 6, I6: 3, I7: 3, I8: 5, I9: 3, I10: 4 };
+export const MAIL_UPPER_BOUND: Record<InviteStep, number> = { I1: 2, I2: 3, I2b: 3, I3: 4, I5: 6, I6: 3, I7: 3, I8: 5, I9: 4, I10: 4 };
 
 /** Waits inside a step between successive changes (a third of the gap, at least 5 s), so each change can be told apart in the mailbox. */
 export const pauseWithinStepMs = (gapMs: number): number => Math.max(5000, Math.round(gapMs / 3));
@@ -64,11 +64,14 @@ export function scheduleCode(value: string | undefined): Safe | null {
     return /^\d\.\d{1,2}(\.\d{1,2})?(,\d\.\d{1,2}(\.\d{1,2})?)*$/.test(value) ? fixed(value) : fixed('<other>');
 }
 
-/** Waits in 1 s pieces so that Ctrl-C ends a long wait (the next request then fails with `interrupted` and cleanup runs). */
+/** Waits in 1 s pieces so that Ctrl-C or a rejected password ends a long wait at once (cleanup then runs). */
 export async function pause(ctx: CheckContext, ms: number): Promise<void> {
     for (let left = ms; left > 0; left -= 1000) {
         if (ctx.http.interrupted) {
             throw new ProbeHttpError('interrupted');
+        }
+        if (ctx.http.credentialsRejected) {
+            throw new ProbeHttpError('unauthorized');
         }
         await ctx.sleep(Math.min(1000, left));
     }
@@ -84,7 +87,7 @@ export async function gapBeforeStep(ctx: CheckContext): Promise<void> {
 interface Recipients { organizer: string; addresses: Map<string, string> }
 
 /** The organizer (the account's own mailto) and the expanded recipient address of each role; every one must not be the account's own. */
-function recipients(ctx: CheckContext, step: InviteStep, roles: readonly string[]): Recipients {
+function recipients(ctx: CheckContext, step: InviteStep, roles: readonly string[], distinct = false): Recipients {
     const organizer = ctx.state.addresses.find((a) => /^mailto:/i.test(a));
     const template = ctx.inviteAttendee?.trim().toLowerCase();
     if (organizer === undefined) {
@@ -104,6 +107,10 @@ function recipients(ctx: CheckContext, step: InviteStep, roles: readonly string[
         ctx.taint.add(address);
         addresses.set(role, address);
     }
+    if (distinct && new Set(addresses.values()).size !== roles.length) {
+        // No second address is invented: without {tag} the step cannot tell its recipients apart.
+        throw new CheckStop('skipped', prose`Skipped: this step needs a separate address per attendee, which only a recipient containing {tag} gives; nothing was sent.`);
+    }
     return { organizer, addresses };
 }
 
@@ -112,6 +119,7 @@ class StepLog {
     private n = 0;
     writesRefused = 0;
     writesFailed = 0;
+    readsFailed = 0;
     constructor(private readonly ctx: CheckContext, readonly evidence: Evidence) {}
 
     private record(label: string, method: string): string {
@@ -138,6 +146,8 @@ class StepLog {
         const got = await getIcal(this.ctx, url);
         if (got.status === 200) {
             requireSynthetic(got.ical, got.url, primary(this.ctx).url, uid, got.status);
+        } else {
+            this.readsFailed++;
         }
         const events = eventComponents(got.ical);
         const attendees = events.flatMap((e) => props(e, 'ATTENDEE'));
@@ -150,6 +160,40 @@ class StepLog {
         this.evidence[`${key}ScheduleStatus_organizerProperty`] = scheduleCode(organizer?.params['SCHEDULE-STATUS']);
         return got.etag;
     }
+
+    /** The DELETE that ends a step: never throws, so a cleanup failure cannot replace the step's own result; it is recorded as `cleanupError`. */
+    async remove(url: string): Promise<void> {
+        if (this.ctx.http.credentialsRejected) {
+            this.evidence.cleanupError = fixed('unauthorized');
+            return;
+        }
+        try {
+            await this.write('delete', 'DELETE', url);
+        } catch (error) {
+            this.evidence.cleanupError = fixed(errorCode(error));
+        }
+    }
+}
+
+/** A fixed code for an error that ended a step (never the error's text). */
+function errorCode(error: unknown): string {
+    if (error instanceof ProbeHttpError) {
+        return error.code;
+    }
+    return error instanceof CheckStop ? 'stopped' : 'internal';
+}
+
+/**
+ * Folds an error that ended a step into its record: a fixed code, and for a CheckStop (throttling,
+ * unverifiable provenance) the stop's own fixed evidence and outcome. Returns the outcome.
+ */
+export function absorbStepError(error: unknown, evidence: Evidence): 'inconclusive' | 'error' | CheckStop['outcome'] {
+    evidence.stepError = fixed(errorCode(error));
+    if (error instanceof CheckStop) {
+        Object.assign(evidence, error.evidence);
+        return error.outcome;
+    }
+    return error instanceof ProbeHttpError ? 'inconclusive' : 'error';
 }
 
 const SUMMARY_OF = (step: string): string => `caldav-mcp probe invitation ${step}`;
@@ -161,6 +205,8 @@ interface StepSpec {
     question: string;
     sequence: string;
     roles: readonly string[];
+    /** The roles must expand to different addresses (I5), so the template must contain {tag}. */
+    distinct?: boolean;
     run(ctx: CheckContext, log: StepLog, who: Recipients, at: number): Promise<void>;
 }
 
@@ -198,9 +244,7 @@ async function simpleFlow(ctx: CheckContext, log: StepLog, step: string, who: Re
         }
         await pause(ctx, wait);
     } finally {
-        if (!ctx.http.credentialsRejected) {
-            await log.write('delete', 'DELETE', url);
-        }
+        await log.remove(url);
     }
 }
 
@@ -224,7 +268,7 @@ const STEPS: readonly StepSpec[] = [
         },
     },
     {
-        step: 'I5', question: 'Is attendee B invited when added, and attendee A sent a cancellation when removed?', sequence: 'create with attendee A; PUT adding attendee B; PUT removing A; delete', roles: ['a', 'b'],
+        step: 'I5', question: 'Is attendee B invited when added, and attendee A sent a cancellation when removed?', sequence: 'create with attendee A; PUT adding attendee B; PUT removing A; delete', roles: ['a', 'b'], distinct: true,
         run: (ctx, log, who, at) => simpleFlow(ctx, log, 'I5', who, at, [
             { label: 'add-attendee', body: (uid) => calendarText([organizerEvent(ctx, uid, 'I5', who, [addr(who, 'a'), addr(who, 'b')], at, [], 1)]) },
             { label: 'remove-attendee', body: (uid) => calendarText([organizerEvent(ctx, uid, 'I5', who, [addr(who, 'b')], at, [], 2)]) },
@@ -272,12 +316,10 @@ const STEPS: readonly StepSpec[] = [
                 }
                 await pause(ctx, wait);
             } finally {
-                if (!ctx.http.credentialsRejected) {
-                    if (made) {
-                        await log.write('delete', 'DELETE', next.url);
-                    }
-                    await log.write('delete', 'DELETE', url);
+                if (made) {
+                    await log.remove(next.url);
                 }
+                await log.remove(url);
             }
         },
     },
@@ -318,10 +360,8 @@ const STEPS: readonly StepSpec[] = [
                 }
                 await pause(ctx, pauseWithinStepMs(ctx.invite.gapMs));
             } finally {
-                if (!ctx.http.credentialsRejected) {
-                    for (const e of made) {
-                        await log.write('delete', 'DELETE', e.url);
-                    }
+                for (const e of made) {
+                    await log.remove(e.url);
                 }
             }
         },
@@ -335,7 +375,7 @@ function stepCheck(spec: StepSpec, index: number): CheckDef {
         claim: `Every request of invite step ${spec.step} (${spec.sequence}) is accepted by iCloud. The question, ${spec.question} is answered by hand from the mailbox, matched by the recorded tag, SUMMARY and UTC times.`,
         needs: 'temp',
         async run(ctx): Promise<CheckOutput> {
-            const who = recipients(ctx, spec.step, spec.roles);
+            const who = recipients(ctx, spec.step, spec.roles, spec.distinct === true);
             await gapBeforeStep(ctx);
             const temp = primary(ctx);
             const evidence: Evidence = {
@@ -345,17 +385,20 @@ function stepCheck(spec: StepSpec, index: number): CheckDef {
                 startedAt: new AuthoredValue(fixed(new Date(ctx.now()).toISOString())),
             };
             const log = new StepLog(ctx, evidence);
+            const byHand = prose`Check the mailbox by hand against the recorded tags and times.`;
             try {
                 await spec.run(ctx, log, who, baseDay(ctx) + (9 + index) * DAY + 16 * HOUR);
+            } catch (error) {
+                // Mail may already have been sent: the partial record is kept, with the fixed code of what ended the step.
+                return { outcome: absorbStepError(error, evidence), summary: prose`Step ${fixed(spec.step)} stopped early (${fixed(errorCode(error))}); the requests it sent are recorded. ${byHand}`, evidence };
             } finally {
                 ctx.state.lastInviteStepAt = ctx.now();
                 evidence.endedAt = new AuthoredValue(fixed(new Date(ctx.now()).toISOString()));
             }
-            const byHand = prose`Check the mailbox by hand against the recorded tags and times.`;
             if (log.writesRefused > 0) {
                 return { outcome: 'refuted', summary: prose`${log.writesRefused} write(s) of step ${fixed(spec.step)} were refused. ${byHand}`, evidence };
             }
-            if (log.writesFailed > 0 || evidence.requests === undefined) {
+            if (log.writesFailed > 0 || log.readsFailed > 0 || evidence.cleanupError !== undefined || evidence.requests === undefined) {
                 return { outcome: 'inconclusive', summary: prose`Step ${fixed(spec.step)} did not complete. ${byHand}`, evidence };
             }
             return { outcome: 'confirmed', summary: prose`Every write of step ${fixed(spec.step)} was accepted. ${byHand}`, evidence };

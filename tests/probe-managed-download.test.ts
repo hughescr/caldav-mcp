@@ -34,17 +34,17 @@ test('0.6.0 standard fake request totals', async () => {
         for (const flags of [READ_ONLY, WRITE]) {
             const fake = standardAccount(PLAIN, { expand });
             const report = await probe(fake, flags, credentials);
-            const expected = flags.write ? expand ? 275 : 241 : 54;
+            const expected = flags.write ? expand ? 276 : 241 : 54;
             expect(report.totals.requests).toBe(expected);
             expect(fake.requests).toHaveLength(expected);
         }
     }
     // Against the measured behaviour every phase 3 check runs to the end (P3B-6 is skipped), and every invite step adds its requests.
     const measured = standardAccount(PLAIN, ICLOUD_MEASURED);
-    expect((await probe(measured, WRITE, credentials)).totals.requests).toBe(304);
+    expect((await probe(measured, WRITE, credentials)).totals.requests).toBe(308);
     const invite = standardAccount(PLAIN, ICLOUD_MEASURED);
     const all = await runProbe({ ...credentials, flags: { write: true, invite: true, cleanup: false }, runLocation: 'local', inviteAttendee: 'owner.{tag}@mail.example.invalid', inviteSteps: [...INVITE_STEPS] }, fakeDeps(invite));
-    expect(all.totals.requests).toBe(359);
+    expect(all.totals.requests).toBe(363);
     // Nine 90 s gaps, twenty 30 s pauses inside steps and I1's 3 s wait, on the fake clock.
     expect(all.totals.durationMs - (await probe(standardAccount(PLAIN, ICLOUD_MEASURED), WRITE, credentials)).totals.durationMs).toBeGreaterThanOrEqual((9 * 90 + 20 * 30 + 3) * 1000);
 });

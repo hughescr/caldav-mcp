@@ -108,6 +108,19 @@ describe('write-series-move-shift (P3D-2) and write-series-move-drop (P3D-3)', (
         expect(drop).not.toContain('RECURRENCE-ID');
     });
 
+    test('the right starts are not enough: a server whose expansion loses the overrides’ identity refutes the shift', async () => {
+        const { report } = await run({
+            ...ICLOUD_MEASURED,
+            transformResponse: async (req, res) => {
+                const text = await res.text();
+                // After the move only (SEQUENCE:2 is on the shifted overrides), the overrides come back with the master's title.
+                const shiftedBody = req.method === 'REPORT' && text.includes('p3d2') && text.includes('SEQUENCE:2');
+                return new Response(shiftedBody ? text.replaceAll('SUMMARY:caldav-mcp probe override moved', 'SUMMARY:caldav-mcp probe event').replaceAll('SUMMARY:caldav-mcp probe override', 'SUMMARY:caldav-mcp probe event') : text, { status: res.status, headers: res.headers });
+            },
+        });
+        expect(check(report, 'write-series-move-shift')).toMatchObject({ outcome: 'refuted', evidence: { utcUnmovedOverrideShifted: false, utcMovedOverrideKeptTime: false, utcSlotsAsExpected: true } });
+    });
+
     test('a server where only UTC RECURRENCE-IDs match is inconclusive: the DATE series has extra instances before the move, so it is not moved', async () => {
         const { report } = await run({ ...ICLOUD_MEASURED, ridMatching: 'utc-only' });
         // The DATE series no longer expands as written before the move, so only the UTC series is judged.

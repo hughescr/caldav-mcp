@@ -80,9 +80,6 @@ export async function dav(ctx: CheckContext, method: string, url: string, option
         ...(options.essential === undefined ? {} : { essential: options.essential }),
         ...(options.paced === undefined ? {} : { paced: options.paced }),
     });
-    if (options.stopOnThrottle !== false) {
-        stopOnThrottle(ctx, res);
-    }
     let ms: Multistatus | undefined;
     let errorElements: string[] = [];
     let rootName: string | undefined;
@@ -96,9 +93,18 @@ export async function dav(ctx: CheckContext, method: string, url: string, option
         errorElements = elementNames(root).filter((name) => name !== 'error' && name !== 'href');
     }
     if (WRITE_METHODS.has(method) && res.status >= 400) {
-        ctx.state.refusals.push({ method, status: res.status, contentType: contentTypeClass(res.headers.get('content-type')), bytes: Buffer.byteLength(res.body), root: rootName, elements: errorElements });
+        recordRefusal(ctx, method, res, rootName, errorElements);
+    }
+    // After the body is parsed and tainted, and the refusal recorded (429 and 503 included).
+    if (options.stopOnThrottle !== false) {
+        stopOnThrottle(ctx, res);
     }
     return { res, ms, errorElements };
+}
+
+/** Records the shape of a refused write's body for `write-error-bodies` (names are reduced when reported). */
+export function recordRefusal(ctx: CheckContext, method: string, res: ProbeResponse, rootName: string | undefined, elements: string[]): void {
+    ctx.state.refusals.push({ method, status: res.status, contentType: contentTypeClass(res.headers.get('content-type')), bytes: Buffer.byteLength(res.body), root: rootName, elements });
 }
 
 const WRITE_METHODS = new Set(['PUT', 'DELETE', 'MKCALENDAR', 'POST']);

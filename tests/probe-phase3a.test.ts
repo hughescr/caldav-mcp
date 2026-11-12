@@ -57,6 +57,25 @@ describe('write-iana-zones (P3A-2)', () => {
     });
 });
 
+describe('unavailable answers are not refutations (review finding 4)', () => {
+    test('IANA zones: one failed read-back with the other three as claimed is inconclusive', async () => {
+        const { report } = await run({ ...ICLOUD_MEASURED, hook: (req) => (req.method === 'GET' && req.url.pathname.endsWith('-p3a2kolkata.ics') ? new Response('busy', { status: 500 }) : undefined) });
+        expect(check(report, 'write-iana-zones')).toMatchObject({ outcome: 'inconclusive', evidence: { asClaimed: 3, kolkataReadBackStatus: 500 } });
+    });
+
+    test('RRULE creates: a 500 on one valid series is inconclusive, not a refusal; a 500 on the nonsense rule is unread', async () => {
+        const fail = (suffix: string) => run({ ...ICLOUD_MEASURED, hook: (req) => (req.method === 'PUT' && req.url.pathname.endsWith(`-${suffix}.ics`) ? new Response('busy', { status: 500 }) : undefined) });
+        expect(check((await fail('p3a9fltdaily')).report, 'write-rrule-create')).toMatchObject({ outcome: 'inconclusive', evidence: { floatingDailyIntervalPutStatus: 500 } });
+        expect(check((await fail('p3a9nonsense')).report, 'write-rrule-create')).toMatchObject({ outcome: 'confirmed', evidence: { nonsenseDisposition: 'unread' } });
+    });
+
+    test('the folded-text PUT’s refusal is counted by write-error-bodies', async () => {
+        const { report } = await run({ hook: (req) => (req.method === 'PUT' && req.url.pathname.endsWith('-p3a4text.ics') ? new Response('<html>no</html>', { status: 400, headers: { 'content-type': 'text/html' } }) : undefined) });
+        expect(check(report, 'write-text-roundtrip')).toMatchObject({ outcome: 'refuted', evidence: { putStatus: 400, refusalBodyClass: 'html' } });
+        expect(check(report, 'write-error-bodies')).toMatchObject({ outcome: 'refuted', evidence: { refusalContentTypes: { html: 1 } } });
+    });
+});
+
 describe('write-zone-change (P3A-3)', () => {
     test('a span-edited update keeps untouched lines, bumps SEQUENCE and confirms', async () => {
         const { report, fake } = await run(ICLOUD_MEASURED);

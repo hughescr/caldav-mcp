@@ -168,6 +168,81 @@ export function shiftLine(p: IcalProperty, ms: number, name = p.name): string {
 
 const nameOf = (line: string): string => /^[A-Za-z0-9-]+/.exec(line)?.[0].toUpperCase() ?? '';
 
+/** The raw content lines of a body, each with its continuation lines, so untouched lines are re-sent byte for byte. */
+export function contentLines(body: string): string[] {
+    const out: string[] = [];
+    for (const physical of body.split(/\r?\n/)) {
+        if ((physical.startsWith(' ') || physical.startsWith('\t')) && out.length > 0) {
+            out[out.length - 1] += `\r\n${physical}`;
+        } else if (physical !== '') {
+            out.push(physical);
+        }
+    }
+    return out;
+}
+
+const unfoldLine = (line: string): string => line.replace(/\r\n[ \t]/g, '');
+
+/**
+ * Span edit of one VEVENT of a stored body (design §3.3, ORCH S1): in the first VEVENT whose
+ * unfolded lines satisfy `select`, the named direct properties are replaced, DTSTAMP is renewed
+ * and SEQUENCE incremented (inserted as 1 if absent); every other line is kept byte for byte.
+ * Undefined when no VEVENT matches.
+ */
+export function spanEditVevent(body: string, select: (lines: readonly string[]) => boolean, replace: Record<string, string>, stamp: string): string | undefined {
+    const lines = contentLines(body);
+    const blocks: [number, number][] = [];
+    let depth = 0;
+    let start = -1;
+    lines.forEach((line, i) => {
+        const begin = line.startsWith('BEGIN:');
+        const end = line.startsWith('END:');
+        if (line === 'BEGIN:VEVENT' && depth === 1) {
+            start = i;
+        }
+        depth += begin ? 1 : end ? -1 : 0;
+        if (line === 'END:VEVENT' && depth === 1 && start >= 0) {
+            blocks.push([start, i]);
+            start = -1;
+        }
+    });
+    const chosen = blocks.find(([from, to]) => select(lines.slice(from, to + 1).map(unfoldLine)));
+    if (chosen === undefined) {
+        return undefined;
+    }
+    const [from, to] = chosen;
+    const out: string[] = [];
+    let inner = 0;
+    let sequenceSeen = false;
+    lines.forEach((line, i) => {
+        if (i <= from || i > to) {
+            out.push(line);
+            return;
+        }
+        if (i === to) {
+            if (!sequenceSeen) {
+                out.push('SEQUENCE:1');
+            }
+            out.push(line);
+            return;
+        }
+        const top = inner === 0;
+        inner += line.startsWith('BEGIN:') ? 1 : line.startsWith('END:') ? -1 : 0;
+        const name = nameOf(line);
+        if (top && name in replace) {
+            out.push(replace[name] ?? line);
+        } else if (top && name === 'DTSTAMP') {
+            out.push(`DTSTAMP:${stamp}`);
+        } else if (top && name === 'SEQUENCE') {
+            sequenceSeen = true;
+            out.push(`SEQUENCE:${Number(/:(\d+)$/.exec(unfoldLine(line))?.[1] ?? '0') + 1}`);
+        } else {
+            out.push(line);
+        }
+    });
+    return `${out.join('\r\n')}\r\n`;
+}
+
 /** Master lines that §3.3 does not copy into a new override (the override gets its own). */
 const NOT_COPIED = new Set(['BEGIN', 'END', 'UID', 'RRULE', 'RDATE', 'EXDATE', 'EXRULE', 'DTSTART', 'DTEND', 'DURATION', 'DTSTAMP', 'LAST-MODIFIED', 'SEQUENCE', 'SUMMARY']);
 

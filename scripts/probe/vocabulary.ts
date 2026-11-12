@@ -49,7 +49,7 @@ export const PHASE3_CODES = [
     'kept-tzid', 'floating', 'utc', 'tzid', 'date', 'invalid', 'tzid-changed',
     'xml', 'html', 'plain', 'calendar', 'json',
     'crlf', 'lf', 'mixed',
-    'refused', 'unread', 'hidden', 'shown', 'stored-no-instances', 'stored-one-instance', 'stored-many-instances',
+    'internal', 'stopped', 'refused', 'unread', 'unavailable', 'hidden', 'shown', 'stored-no-instances', 'stored-one-instance', 'stored-many-instances',
     'b-utc-token', 'a-stored-text',
     'create', 'update', 'delete', 'read', 'add-attendee', 'remove-attendee', 'alarm-only', 'transp-only', 'time-change', 'description-only',
     'override', 'exdate', 'split-new', 'split-truncate', 'partstat-accepted', 'summary-change', 'create-client', 'create-none',

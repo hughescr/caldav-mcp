@@ -5,7 +5,8 @@
  * resources whose URL and UID were validated, and only in strict date shapes or fixed codes.
  */
 import { CheckStop, isOk, isRefusal, stopOnThrottle, type CheckContext, type CheckDef, type CheckOutput } from '../context';
-import { requireSynthetic, taintIcalText } from '../dav';
+import { recordRefusal, requireSynthetic, taintIcalText, taintXml } from '../dav';
+import { elementNames, parseXml } from '../xml';
 import { comps, icalDate, icalLocal, icalUtc, prop, type IcalComponent, type IcalProperty } from '../ical';
 import { dateShape, kindOf } from '../ical-time';
 import { fixed, prose, safeNames, type Safe } from '../safe';
@@ -13,8 +14,9 @@ import { zoneValidator } from '../tz';
 import type { Evidence } from '../types';
 import { DAY, HOUR, SUMMARY, baseDay, deleteEvent, newEvent, primary, propfindEtag } from './write-helpers';
 import {
-    NY, PLAN_3A, bodyClass, calendarText, describeExpanded, expandAll, expanded, guardedGet, readRaw, stampNow, tryWrite, vevent, writeOrStop,
+    NY, PLAN_3A, bodyClass, calendarText, spanEditVevent, describeExpanded, expandAll, expanded, guardedGet, readRaw, stampNow, tryWrite, vevent, writeOrStop,
 } from './phase3-helpers';
+import type { Expanded } from './write-expansion';
 import { easternOffset, wallToInstant } from './zones';
 
 /** What a PUT did to a TZID it was sent: `kept-tzid`, `floating`, `utc`, `tzid-changed` or `other` (never the stored TZID). */
@@ -118,7 +120,7 @@ export const ianaZonesCheck: CheckDef = {
     async run(ctx) {
         const evidence: Evidence = {};
         const day = baseDay(ctx) + 24 * DAY + 10 * HOUR;
-        const results = [];
+        const results: Awaited<ReturnType<typeof zoneCreate>>[] = [];
         for (const [i, zone] of IANA_ZONES.entries()) {
             results.push(await zoneCreate(ctx, zone, day + i * DAY, evidence));
         }
@@ -127,67 +129,18 @@ export const ianaZonesCheck: CheckDef = {
         if (good === IANA_ZONES.length) {
             return { outcome: 'confirmed', summary: prose`All ${good} zones were kept, gained a VTIMEZONE, and the ETag header matched.`, evidence };
         }
-        if (results.some((r) => r.refused || (r.accepted && r.disposition !== undefined))) {
+        // A counterexample is a refusal, or a read-back that differs from the claim; an unread case is not one.
+        const asClaimed = (r: (typeof results)[number]): boolean => r.disposition === 'kept-tzid' && r.zoneAdded && r.etagEqual === true;
+        if (results.some((r) => r.refused || (r.accepted && r.disposition !== undefined && !asClaimed(r)))) {
             return { outcome: 'refuted', summary: prose`${good} of ${IANA_ZONES.length} zones behaved as claimed (each case is recorded).`, evidence };
         }
         return { outcome: 'inconclusive', summary: prose`The events could not be written or read back.`, evidence };
     },
 };
 
-/** The raw content lines of a body, each with its continuation lines, so untouched lines are re-sent byte for byte. */
-function contentLines(body: string): string[] {
-    const out: string[] = [];
-    for (const physical of body.split(/\r?\n/)) {
-        if ((physical.startsWith(' ') || physical.startsWith('\t')) && out.length > 0) {
-            out[out.length - 1] += `\r\n${physical}`;
-        } else if (physical !== '') {
-            out.push(physical);
-        }
-    }
-    return out;
-}
-
-const nameOfLine = (line: string): string => /^[A-Za-z0-9-]+/.exec(line)?.[0].toUpperCase() ?? '';
-
-/** Span edit of the master VEVENT: only the named lines change; SEQUENCE+1 (inserted as 1 if absent). */
-function spanEdit(body: string, replace: Record<string, string>, stamp: string): string {
-    const lines = contentLines(body);
-    const out: string[] = [];
-    let inEvent = false;
-    let depth = 0;
-    let sequenceSeen = false;
-    for (const line of lines) {
-        if (line === 'BEGIN:VEVENT') {
-            inEvent = true;
-            depth = 0;
-            sequenceSeen = false;
-        }
-        if (inEvent) {
-            depth += line.startsWith('BEGIN:') ? 1 : line.startsWith('END:') ? -1 : 0;
-        }
-        const name = nameOfLine(line);
-        if (inEvent && depth === 1 && name in replace) {
-            out.push(replace[name] ?? line);
-            continue;
-        }
-        if (inEvent && depth === 1 && name === 'DTSTAMP') {
-            out.push(`DTSTAMP:${stamp}`);
-            continue;
-        }
-        if (inEvent && depth === 1 && name === 'SEQUENCE') {
-            sequenceSeen = true;
-            out.push(`SEQUENCE:${Number(/:(\d+)$/.exec(line)?.[1] ?? '0') + 1}`);
-            continue;
-        }
-        if (inEvent && line === 'END:VEVENT' && depth === 0) {
-            if (!sequenceSeen) {
-                out.push('SEQUENCE:1');
-            }
-            inEvent = false;
-        }
-        out.push(line);
-    }
-    return `${out.join('\r\n')}\r\n`;
+/** Span edit of the master VEVENT (the one without RECURRENCE-ID). */
+function spanEdit(body: string, replace: Record<string, string>, stamp: string): string | undefined {
+    return spanEditVevent(body, (lines) => !lines.some((l) => /^RECURRENCE-ID[;:]/i.test(l)), replace, stamp);
 }
 
 export const zoneChangeCheck: CheckDef = {
@@ -208,6 +161,9 @@ export const zoneChangeCheck: CheckDef = {
             return { outcome: 'inconclusive', summary: prose`The created event could not be read back (HTTP ${before.status}).`, evidence };
         }
         const edited = spanEdit(before.body, { DTSTART: `DTSTART;TZID=Europe/Berlin:${start}`, DTEND: `DTEND;TZID=Europe/Berlin:${end}` }, stampNow(ctx));
+        if (edited === undefined) {
+            return { outcome: 'inconclusive', summary: prose`The stored event had no master VEVENT to edit.`, evidence };
+        }
         const put = await tryWrite(ctx, url, edited, evidence, 'update', before.etag);
         if (put === undefined) {
             const status = evidence.updatePutStatus;
@@ -329,6 +285,12 @@ export const textRoundTripCheck: CheckDef = {
         ]);
         const evidence: Evidence = { sentFoldsInsideUtf8: folded.reduce((n, f) => n + f.insideUtf8, 0), sentDescriptionOctets: encoder.encode(TEXT_VALUES.DESCRIPTION).length };
         const put = await ctx.http.request({ method: 'PUT', url, body: bytes, headers: { 'content-type': 'text/calendar; charset=utf-8', 'if-none-match': '*' } });
+        if (put.status >= 400) {
+            // Sent outside dav(), so its refusal is recorded here for write-error-bodies.
+            const root = /^\s*</.test(put.body) ? parseXml(put.body) : undefined;
+            taintXml(root, ctx.taint);
+            recordRefusal(ctx, 'PUT', put, root?.name, elementNames(root).filter((name) => name !== 'error' && name !== 'href'));
+        }
         stopOnThrottle(ctx, put);
         evidence.putStatus = put.status;
         if (!isOk(put.status)) {
@@ -392,7 +354,7 @@ function lineEndings(raw: Uint8Array): string {
 export const errorBodiesCheck: CheckDef = {
     id: 'write-error-bodies',
     planItem: `${PLAN_3A} (P3A-5): the shape of refusal bodies (sanitiser constants)`,
-    claim: 'Every refused write of this run (status 400 or above, including one PUT whose DTSTART is after its DTEND in UTC) has an empty body or a DAV:error XML body.',
+    claim: 'Every write refused before this check (status 400 or above, 429 and 503 included, in every earlier write check and one PUT whose DTSTART is after its DTEND in UTC; the invite steps and cleanup run later and are not counted) has an empty body or a DAV:error XML body.',
     needs: 'temp',
     async run(ctx) {
         const temp = primary(ctx);
@@ -563,16 +525,17 @@ export const rruleCreateCheck: CheckDef = {
             if (put !== undefined) {
                 urls.set(c.key, url);
             } else if (c.expected === null) {
-                evidence.nonsenseDisposition = fixed('refused');
+                evidence.nonsenseDisposition = fixed(isRefusal(Number(evidence.nonsensePutStatus)) ? 'refused' : 'unread');
             }
         }
         const valid = cases.filter((c) => c.expected !== null);
-        if (urls.size === 0) {
-            return { outcome: 'refuted', summary: prose`No series was accepted.`, evidence };
-        }
-        const got = await expandAll(ctx, temp, [...urls.values()], Date.UTC(2027, 0, 1), Date.UTC(2027, 4, 1));
+        // Only a 4xx is a refusal; any other failure leaves that series unanswered.
+        const refused = valid.filter((c) => !urls.has(c.key) && isRefusal(Number(evidence[`${c.key}PutStatus`]))).length;
+        const unanswered = valid.filter((c) => !urls.has(c.key)).length - refused;
+        const got = urls.size === 0 ? new Map<string, Expanded>() : await expandAll(ctx, temp, [...urls.values()], Date.UTC(2027, 0, 1), Date.UTC(2027, 4, 1));
         let matches = 0;
-        let unread = 0;
+        let unread = unanswered;
+        let wrong = 0;
         for (const c of cases) {
             const url = urls.get(c.key);
             const result = url === undefined ? undefined : got.get(url);
@@ -592,16 +555,16 @@ export const rruleCreateCheck: CheckDef = {
                 continue;
             }
             matches += count === c.expected ? 1 : 0;
+            wrong += count === c.expected ? 0 : 1;
         }
         evidence.seriesAsClaimed = matches;
-        const refused = valid.filter((c) => !urls.has(c.key)).length;
-        if (refused === 0 && matches === valid.length) {
+        if (matches === valid.length) {
             return { outcome: 'confirmed', summary: prose`All ${matches} valid series were accepted and expanded to the expected counts.`, evidence };
         }
-        if (unread > 0 && refused === 0) {
-            return { outcome: 'inconclusive', summary: prose`${unread} series were not expanded by the server, so their counts cannot be read.`, evidence };
+        if (refused > 0 || wrong > 0) {
+            return { outcome: 'refuted', summary: prose`${refused} valid series were refused and ${wrong} expanded to another count than expected.`, evidence };
         }
-        return { outcome: 'refuted', summary: prose`${refused} valid series were refused and ${matches} of ${valid.length} expanded to the expected count.`, evidence };
+        return { outcome: 'inconclusive', summary: prose`${unread} series could not be written or were not expanded by the server, so their counts cannot be read.`, evidence };
     },
 };
 

@@ -25,7 +25,7 @@ only on the two CalDAV hosts.
 |---|---|---|
 | default (read-only) | `OPTIONS`, `PROPFIND`, `REPORT`, `GET` only | Nothing. The HTTP layer refuses every other method. (One `GET`, with `Range: bytes=0-0`, may fetch one managed attachment of yours; see [the attachment checks](#attachment-checks).) |
 | `--write` | adds `MKCALENDAR`, `PUT`, `DELETE`, and `POST` for the two managed-attachment actions only | Creates up to two calendars named `caldav-mcp-probe-<8 hex digits>` (the first with a `calendar-timezone` of America/Los_Angeles, so floating times can be tested; if the server refuses that, the `MKCALENDAR` is repeated once without it), writes synthetic events into them (summaries starting "caldav-mcp probe ", dated 10 to 80 days ahead; the phase 2 checks also write series up to about a year ahead, events on 2027-03-14 and 2027-11-07 (the days the clocks change in America/New_York) and one yearly all-day series starting on 2028-02-29; the attachment checks write three events, one of which gets a 32-byte text file attached; the phase 3 checks write, change and delete about 50 more events and series dated January to November 2027, some of them in the zones Asia/Kolkata, Australia/Lord_Howe, America/Sao_Paulo, Etc/GMT+5, Europe/Berlin, and the non-zones `Pacific Standard Time`, `US/Eastern` and `Mars/Olympus`), then cleanup is attempted, and calendar removal verified where possible. Your devices may show these calendars for a moment. `PUT`, `DELETE` and `POST` outside those calendars are refused by the HTTP layer, and the only `POST`s it accepts are `?action=attachment-add` and `?action=attachment-remove&managed-id=…` on a `.ics` event directly inside one of them. None of these events has attendees. |
-| `--write --invite` | as `--write` | Additionally saves events with attendee addresses you supply, which makes iCloud send real email. Without `--invite-steps` that is the single step I1 (one event, you as organizer: an invitation and a cancellation); `--invite-steps=all` runs the ten steps I1 to I10, which can send up to 36 emails over about 25 minutes. See [the invite run](#3-invite-run-optional-sends-real-email) before using it. |
+| `--write --invite` | as `--write` | Additionally saves events with attendee addresses you supply, which makes iCloud send real email. Without `--invite-steps` that is the single step I1 (one event, you as organizer: an invitation and a cancellation); `--invite-steps=all` runs the ten steps I1 to I10, which can send up to 37 emails over about 25 minutes. See [the invite run](#3-invite-run-optional-sends-real-email) before using it. |
 | `--cleanup` | the read-only methods, plus `DELETE` | Deletes only calendars the probe itself left behind, and only after you type `delete` (rules below). |
 
 The general sender allows only `https://caldav.icloud.com` and hosts matching `pNN-caldav.icloud.com`,
@@ -52,13 +52,13 @@ retries; the hard limit is 600, with a reserve for cleanup. The phase 2 read che
 49 requests over the basic checks, plus at most 2 attachment-fetch requests. The ETag comparison
 reuses an expanded window and adds one multiget (at most two requests if an expansion was not
 already cached). The write-expansion checks add 66 requests, or 67 if the calendar-timezone is
-refused, attachment writes add at most 14, and the phase 3 checks at most 124 (each stops early
+refused, attachment writes add at most 14, and the phase 3 checks at most 128 (each stops early
 when the server does not expand as iCloud was measured to). See the per-check budgets below.
 These are budgets, not promises about a real account's total. In the standard fake account,
-version 0.6.0 sends **54 requests read-only, 275 with `--write` when expansion is enabled and 304
+version 0.6.0 sends **54 requests read-only, 276 with `--write` when expansion is enabled and 308
 when the fake expands the way iCloud was measured to** (every phase 3 check then runs to the end).
 With the fake's default expansion-disabled behavior the totals are **54 and 241**. `--write
---invite --invite-steps=all` adds 55 requests: **359** in the measured fake. These totals include
+--invite --invite-steps=all` adds 55 requests: **363** in the measured fake. These totals include
 the ETag comparison and the managed attachment's anonymous 401 followed by its authenticated GET.
 On a real account a `--write` run is expected to send about 330 requests and take about two
 minutes; `--invite-steps=all` adds about 24 minutes of deliberate waiting.
@@ -244,7 +244,8 @@ address, and every expanded address must not be one of the account's own address
 is skipped, and nothing is sent). A mailbox that accepts `you.<anything>@example.com` (a
 catch-all or sub-addressing domain you control) then receives every message under a tagged
 address. Without `{tag}` every message goes to the one address and only the subject and time
-tell the steps apart.
+tell the steps apart, and I5 is skipped before it sends anything: it needs two different
+attendee addresses, and the probe never invents one.
 
 | Step | What it sends (each in its own event, SUMMARY `caldav-mcp probe invitation <step>`) | Question it answers | Roles (tag suffix) | Most emails |
 |---|---|---|---|---|
@@ -256,12 +257,12 @@ tell the steps apart.
 | I6 | weekly series (COUNT=4); PUT adding an override that moves instance 2 by two hours; delete | Per-instance update mail? | `a` | 3 |
 | I7 | weekly series (COUNT=4); PUT adding an EXDATE for instance 2; delete | Per-instance cancellation? | `a` | 3 |
 | I8 | weekly series (COUNT=6); PUT of a new-UID series from instance 4 (COUNT=3, If-None-Match); PUT truncating the original with UNTIL; delete both | Invitation for the new series? Update for the truncated one? | `a` | 5 |
-| I9 | ORGANIZER = the tagged address (role `o`), you as ATTENDEE (NEEDS-ACTION); PUT with your PARTSTAT=ACCEPTED; PUT changing SUMMARY; delete | Does any step mail the organizer address (a reply, a decline)? | `o` | 3 |
+| I9 | ORGANIZER = the tagged address (role `o`), you as ATTENDEE (NEEDS-ACTION); PUT with your PARTSTAT=ACCEPTED; PUT changing SUMMARY; delete | Does any step mail the organizer address (a reply, a decline)? | `o` | 4 |
 | I10 | one event with `ATTENDEE;SCHEDULE-AGENT=CLIENT`, one with `SCHEDULE-AGENT=NONE`; delete both | Is mail suppressed? | `c`, `n` | 4 |
 
 In I9 the organizer address is made from the same template as every recipient, so it is always
 an address you control, never a third party. Each step uses at most 4 writes and 2 reads (I8: 5
-writes, since it deletes two events). `--invite-steps=all` can therefore send **up to 36 emails**
+writes, since it deletes two events). `--invite-steps=all` can therefore send **up to 37 emails**
 and waits about 24 minutes at the default gap (nine gaps of 90 s, twenty pauses of 30 s inside the
 steps, and I1's 3 s); with the write checks before it the whole run takes about 26 minutes:
 
@@ -270,8 +271,12 @@ PROBE_APPLE_ID="$probe_id" PROBE_APP_PASSWORD="$probe_pw" PROBE_INVITE_ATTENDEE=
 ```
 
 Each step is one check (`write-invite` for I1, `write-invite-i2` … `write-invite-i10`). It is
-`confirmed` when iCloud accepted every write of the step, `refuted` when it refused one, and
-`inconclusive` when one failed otherwise; the mail itself can only be checked by hand. Its
+`confirmed` when iCloud accepted every write and answered every read of the step, `refuted` when
+it refused a write, and `inconclusive` otherwise; the mail itself can only be checked by hand.
+A step that stops early (throttling, Ctrl-C, a rejected password, an unverifiable read-back)
+keeps everything it recorded, with `stepError` (a fixed code); a failed delete is recorded as
+`cleanupError` and does not replace the step's record. A rejected password also ends the wait at
+once, so cleanup is not delayed. Its
 evidence holds `step`, `tags` (the tags used, never an address), `startedAt` and `endedAt`, the
 upper bound `mailUpperBound`, and per request `r<n>Label` (`create`, `read`, `time-change`,
 `description-only`, `alarm-only`, `transp-only`, `add-attendee`, `remove-attendee`, `override`,
@@ -743,10 +748,10 @@ claim, with the answer in the evidence.
 | `write-end-order` (P3A-7) | end equal to start; end before start in one zone; end before start only as an instant (New York start, Berlin end) | The first is accepted and the other two refused. Status, preconditions, and whether an accepted end was stored as sent. | 3 to 6 |
 | `write-delete-semantics` (P3A-8) | one event, DELETE with the exact If-Match, the same DELETE again | 204, then 404 (not 412). | 3 |
 | `write-rrule-create` (P3A-9) | TZID weekly `BYDAY=TU;COUNT=6`; TZID weekly with a UTC UNTIL; DATE monthly with a DATE UNTIL; floating daily `INTERVAL=2;COUNT=5`; `FREQ=WEEKLY;BYMONTHDAY=31;BYDAY=MO` | The four valid series expand to 6, 4, 4 and 5 instances. The nonsense rule is recorded, not judged: `refused`, `stored-no-instances`, `stored-one-instance`, `stored-many-instances` or `unread`. | 6 |
-| `write-error-bodies` (P3A-5, runs last) | one PUT whose DTSTART is after its DTEND (UTC) | Every refused write of the run (status 400 or above) has an empty or a DAV:error XML body. Records counts per method and status, Content-Type classes (`xml`, `html`, `plain`, `calendar`, `json`, `none`, `other`), the longest body in octets, and the root and precondition element names. | 1 |
+| `write-error-bodies` (P3A-5, runs last) | one PUT whose DTSTART is after its DTEND (UTC) | Every write refused before it (status 400 or above, 429 and 503 included, in every earlier write check; the invite steps and cleanup come later and are not counted) has an empty or a DAV:error XML body. Records counts per method and status, Content-Type classes (`xml`, `html`, `plain`, `calendar`, `json`, `none`, `other`), the longest body in octets, and the root and precondition element names. | 1 |
 | `write-override-new-forms` (P3B-1) | weekly TZID, UTC, DATE and floating series (6 instances); then an override for instance 3 (RECURRENCE-ID from the expanded instance in the master's form, a title change) | Exactly 6 instances with instance 3 replaced, and the stored RECURRENCE-ID text kept verbatim. | 14 |
 | `write-override-expanded-shape` (P3B-2) | adds to the same series an override moving instance 4 by two days | Outcome (b): an overridden instance's expanded RECURRENCE-ID is the same `…Z` token as an unmoved one (`b-utc-token`), not the stored text (`a-stored-text`), and its DTSTART/DTEND come back verbatim. Records the class per form, the property names only overridden instances carry, and `tzidSeriesOutcome` (decides design §3.2 step 5). | 5 |
-| `write-override-reedit` (P3B-3) | re-edits that moved override alone (new times and title, RECURRENCE-ID line kept) | One instance for that slot at the new values, 6 in all, and the stored master byte-identical. | 9 |
+| `write-override-reedit` (P3B-3) | a span edit of the stored resource as iCloud returns it: only that moved override's DTSTART, DTEND, SUMMARY, DTSTAMP and SEQUENCE change (its RECURRENCE-ID line and every other line kept byte for byte) | One instance for that slot, still naming slot 4, at both new values; the other five starts kept; 6 in all; the stored master byte-identical before and after. | 13 |
 | `write-override-dst` (P3B-4) | New York weekly series through 2027-11-07 01:30 and 2027-03-14 02:30; an override of that night's instance using its expanded DTSTART text as RECURRENCE-ID | Each override replaces exactly that instance. | 6 |
 | `write-exdate-forms` (P3B-5) | the four forms again, plus a UTC series with an override; an EXDATE line in the master's form for instance 3 (removing the override for the fifth) | Exactly instance 3 is gone, with no orphan. | 12 |
 | `write-override-utc-rid-on-tzid` (P3B-6) | only when P3B-2 found outcome (a): a TZID series with an override whose RECURRENCE-ID is the UTC token | It replaces exactly instance 3; otherwise `skipped`. | 0 or 4 |
@@ -755,7 +760,7 @@ claim, with the answer in the evidence.
 | `write-split-new-series` (P3C-3) | a weekly UTC series with an EXDATE and a moved override after instance 4; split into a new-UID resource (If-None-Match, EXDATE copied, override with its UID replaced) and the truncated original (If-Match) | The new series applies the EXDATE and the override, and the two together show each slot once. | 5 |
 | `write-orphan-override` (P3C-4) | an override whose RECURRENCE-ID is beyond the series' UNTIL; one three hours off a slot | Neither is shown: each is `refused` or `hidden` (or `shown`, which refutes). | 3 |
 | `write-series-move-plain` (P3D-1) | a New York weekly series across 2027-03-14 moved one hour later and to the next day | All 4 instances at the new local time, none at the old; also whether the RECURRENCE-ID tokens are the new instants. | 4 |
-| `write-series-move-shift` (P3D-2) | weekly UTC and DATE series, each with an EXDATE, an unmoved and a moved override, moved by 25 hours and one day as design §3.6 "shift" does | The exclusion and both overrides stay on their instances and the moved override keeps its own time. | 6 |
+| `write-series-move-shift` (P3D-2) | weekly UTC and DATE series, each with an EXDATE, an unmoved and a moved override, moved by 25 hours and one day as design §3.6 "shift" does | The exclusion and both overrides stay on their instances (each override found by its title, at the shifted slot by RECURRENCE-ID), the moved override keeps its own time, and the starts and slots of all 5 instances are the expected ones. | 6 |
 | `write-series-move-drop` (P3D-3) | a New York weekly series with an override and an EXDATE moved one hour later, both exceptions dropped | The plain series of 5 at the new time, no orphan. | 4 |
 
 The owner-observed checks of the design (P3C-5 `observe-apple-split`, P3D-4 `observe-apple-move`,

@@ -3,7 +3,7 @@ import { eventComponents, getIcal, requireSynthetic } from '../dav';
 import { props } from '../ical';
 import { AuthoredValue, fixed, prose } from '../safe';
 import type { Evidence } from '../types';
-import { expandTemplate, gapBeforeStep, scheduleCode, stepTag } from './invite-steps';
+import { absorbStepError, expandTemplate, gapBeforeStep, scheduleCode, stepTag } from './invite-steps';
 import { DAY, HOUR, baseDay, deleteEvent, newEvent, primary, probeCalendar, putEvent, utcSpan } from './write-helpers';
 
 const at = (now: number): AuthoredValue => new AuthoredValue(fixed(new Date(now).toISOString()));
@@ -47,23 +47,30 @@ export const inviteCheck: CheckDef = {
         if (!isOk(put.status)) {
             return { outcome: isRefusal(put.status) ? 'refuted' : 'inconclusive', summary: prose`The event with an attendee was not accepted (HTTP ${put.status}). No invitation should have been sent.`, evidence };
         }
-        const first = await getIcal(ctx, url);
-        if (first.status === 200) {
-            requireSynthetic(first.ical, first.url, temp.url, uid, first.status);
+        let code: ReturnType<typeof scheduleCode> = null;
+        try {
+            const first = await getIcal(ctx, url);
+            if (first.status === 200) {
+                requireSynthetic(first.ical, first.url, temp.url, uid, first.status);
+            }
+            const invitee = eventComponents(first.ical).flatMap((e) => props(e, 'ATTENDEE')).find((p) => p.value.toLowerCase() === `mailto:${attendee}`);
+            code = scheduleCode(invitee?.params['SCHEDULE-STATUS']);
+            evidence.attendeeScheduleStatusPresent = code !== null;
+            evidence.scheduleStatus = code;
+            await ctx.sleep(3000);
+            const second = await getIcal(ctx, url);
+            if (second.status === 200) {
+                requireSynthetic(second.ical, second.url, temp.url, uid, second.status);
+            }
+            evidence.etagChangedAfterSave = first.etag !== null && second.etag !== null && first.etag !== second.etag;
+            evidence.deleteAt = at(ctx.now());
+            evidence.deleteStatus = await deleteEvent(ctx, url, second.etag ?? first.etag);
+        } catch (error) {
+            // The invitation may already have been sent: keep what was recorded, with a fixed code.
+            return { outcome: absorbStepError(error, evidence), summary: prose`The invite step stopped after the event was saved; what was sent is recorded. Check the mailbox by hand.`, evidence };
+        } finally {
+            ctx.state.lastInviteStepAt = ctx.now();
         }
-        const invitee = eventComponents(first.ical).flatMap((e) => props(e, 'ATTENDEE')).find((p) => p.value.toLowerCase() === `mailto:${attendee}`);
-        const code = scheduleCode(invitee?.params['SCHEDULE-STATUS']);
-        evidence.attendeeScheduleStatusPresent = code !== null;
-        evidence.scheduleStatus = code;
-        await ctx.sleep(3000);
-        const second = await getIcal(ctx, url);
-        if (second.status === 200) {
-            requireSynthetic(second.ical, second.url, temp.url, uid, second.status);
-        }
-        evidence.etagChangedAfterSave = first.etag !== null && second.etag !== null && first.etag !== second.etag;
-        evidence.deleteAt = at(ctx.now());
-        evidence.deleteStatus = await deleteEvent(ctx, url, second.etag ?? first.etag);
-        ctx.state.lastInviteStepAt = ctx.now();
         const byHand = prose`Check the invitee’s mailbox by hand to confirm whether an invitation email arrived; deleting the event may also have sent a cancellation.`;
         if (code !== null && code.startsWith('1.')) {
             return { outcome: 'confirmed', summary: prose`iCloud reported SCHEDULE-STATUS ${code} for the attendee. ${byHand}`, evidence };

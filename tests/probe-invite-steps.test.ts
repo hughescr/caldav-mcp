@@ -42,8 +42,8 @@ describe('step selection, tags and templates', () => {
         expect(normalizeInviteTemplate('not an address {tag}')).toBeUndefined();
     });
 
-    test('the budget: 36 mails at most for all steps, about 23.5 minutes of waiting at the default gap', () => {
-        expect(inviteBudget([...INVITE_STEPS], 90)).toEqual({ mails: 36, waitSeconds: 9 * 90 + 20 * 30 + 3 });
+    test('the budget: 37 mails at most for all steps (every write of I9 counted), about 23.5 minutes of waiting at the default gap', () => {
+        expect(inviteBudget([...INVITE_STEPS], 90)).toEqual({ mails: 37, waitSeconds: 9 * 90 + 20 * 30 + 3 });
         expect(inviteBudget(['I1'], 90)).toEqual({ mails: 2, waitSeconds: 3 });
     });
 });
@@ -123,6 +123,38 @@ describe('all invite steps against the measured fake', () => {
         expect(fake.requests.filter((r) => r.method === 'DELETE' && r.url.pathname.endsWith('-invi2.ics'))).toHaveLength(1);
     });
 
+    test('without {tag}, I5 is skipped before it sends anything (it cannot tell attendee A from B); the other steps run', async () => {
+        const { fake, report } = await run(['I2', 'I5', 'I10'], { template: 'owner@mail.example.invalid' });
+        expect(check(report, 'write-invite-i5').outcome).toBe('skipped');
+        expect(fake.requests.some((r) => r.url.pathname.endsWith('-invi5.ics'))).toBe(false);
+        expect(check(report, 'write-invite-i2').outcome).toBe('confirmed');
+        expect(check(report, 'write-invite-i10').outcome).toBe('confirmed');
+    });
+
+    test('a failure after the create keeps the partial record, and the step still deletes its event', async () => {
+        let reads = 0;
+        const { fake, report } = await run(['I2'], { behaviour: { ...ICLOUD_MEASURED, hook: (req) => (req.method === 'GET' && req.url.pathname.endsWith('-invi2.ics') && ++reads === 1 ? new Response(null, { status: 429 }) : undefined) } });
+        expect(check(report, 'write-invite-i2')).toMatchObject({ outcome: 'inconclusive', evidence: { stepError: 'stopped', status: 429, r1Label: 'create', r1Status: 201, r2Label: 'read', r3Label: 'delete', r3Status: 204 } });
+        expect(String(check(report, 'write-invite-i2').evidence.r1At)).toMatch(/Z$/);
+        expect(fake.requests.filter((r) => r.method === 'DELETE' && r.url.pathname.endsWith('-invi2.ics'))).toHaveLength(1);
+    });
+
+    test('a failed delete is recorded as cleanupError and does not replace the step’s record', async () => {
+        const { report } = await run(['I2'], { behaviour: { ...ICLOUD_MEASURED, hook: (req) => (req.method === 'DELETE' && req.url.pathname.endsWith('-invi2.ics') ? new Response(null, { status: 503 }) : undefined) } });
+        expect(check(report, 'write-invite-i2')).toMatchObject({ outcome: 'inconclusive', evidence: { cleanupError: 'stopped', r3Label: 'time-change', r3Status: 204 } });
+        expect(report.cleanup?.allRemoved).toBe(true);
+    });
+
+    test('a 401 during a step ends its wait at once: nothing more is sent but the calendar DELETE', async () => {
+        const { fake, report, sleeps } = await run(['I2', 'I3'], { behaviour: { ...ICLOUD_MEASURED, hook: (req) => (req.method === 'GET' && req.url.pathname.endsWith('-invi2.ics') ? new Response('Unauthorized', { status: 401 }) : undefined) } });
+        expect(check(report, 'write-invite-i2')).toMatchObject({ outcome: 'inconclusive', evidence: { stepError: 'unauthorized', r2Status: 401, cleanupError: 'unauthorized' } });
+        expect(check(report, 'write-invite-i3').outcome).toBe('skipped');
+        const after = fake.requests.slice(fake.requests.findIndex((r) => r.method === 'GET' && r.url.pathname.endsWith('-invi2.ics')) + 1);
+        // One DELETE per temporary calendar the run created, and nothing else.
+        expect(after.map((r) => `${r.method} ${r.url.pathname.endsWith('/') ? 'calendar' : 'event'}`)).toEqual(['DELETE calendar', 'DELETE calendar']);
+        expect(sleeps.filter((ms) => ms === 1000)).toHaveLength(0);
+    });
+
     test('a template that expands to one of the account’s own addresses sends nothing', async () => {
         const { fake, report } = await run(['I1', 'I2'], { template: PLAIN.address });
         expect(check(report, 'write-invite').outcome).toBe('skipped');
@@ -180,7 +212,7 @@ describe('the CLI options of the invite steps', () => {
         expect(await runCli(['--write', '--invite', '--invite-steps=all', '--invite-gap=120'], h.io, h.runtime)).toBe(0);
         expect(h.inputs[0]).toMatchObject({ inviteAttendee: 'owner.{tag}@mail.example.invalid', inviteSteps: [...INVITE_STEPS], inviteGapSeconds: 120 });
         expect(h.err.join('')).toContain('I1, I2, I2b, I3, I5, I6, I7, I8, I9, I10');
-        expect(h.err.join('')).toContain('up to 36 email(s)');
+        expect(h.err.join('')).toContain('up to 37 email(s)');
         const unconfirmed = harness({ ...ENV, PROBE_INVITE_CONFIRM: 'yes' });
         expect(await runCli(['--write', '--invite', '--invite-steps=I2'], unconfirmed.io, unconfirmed.runtime)).toBe(2);
         expect(unconfirmed.inputs).toHaveLength(0);

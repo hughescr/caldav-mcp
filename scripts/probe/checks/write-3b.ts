@@ -12,7 +12,7 @@ import type { Evidence } from '../types';
 import { SUMMARY, newEvent, primary } from './write-helpers';
 import {
     NY, OVERRIDE_SUMMARY, PLAN_3B, byRid, calendarText, describeExpanded, expandAll, expanded, formMatches, lineOf, overrideVevent, readRaw, shiftLine,
-    stampNow, startText, summaryOf, tryWrite, vevent, veventBlocks,
+    spanEditVevent, stampNow, startText, summaryOf, tryWrite, vevent, veventBlocks,
 } from './phase3-helpers';
 import type { Expanded } from './write-expansion';
 
@@ -76,7 +76,12 @@ export async function createSeries(ctx: CheckContext, temp: TempCalendar, specs:
 
 /** PUT of the master byte for byte plus the current overrides, with If-Match; the new ETag is kept. */
 export async function rewrite(ctx: CheckContext, series: Phase3Series, evidence: Evidence, key: string, master = series.master): Promise<boolean> {
-    const put = await tryWrite(ctx, series.url, calendarText([master, ...series.overrides]), evidence, key, series.etag);
+    return rewriteText(ctx, series, calendarText([master, ...series.overrides]), evidence, key, series.etag);
+}
+
+/** PUT of a whole body with If-Match; a refusal is counted in `editsRefused`. */
+export async function rewriteText(ctx: CheckContext, series: Phase3Series, body: string, evidence: Evidence, key: string, etag: string | null): Promise<boolean> {
+    const put = await tryWrite(ctx, series.url, body, evidence, key, etag);
     if (put !== undefined) {
         series.etag = put.etag;
     } else if (isRefusal(Number(evidence[`${key}PutStatus`]))) {
@@ -139,8 +144,9 @@ export const overrideNewFormsCheck: CheckDef = {
             const stored = await readRaw(ctx, temp, s.url, s.uid);
             const override = stored.events.find((e) => prop(e, 'RECURRENCE-ID') !== undefined);
             const rid = override === undefined ? undefined : prop(override, 'RECURRENCE-ID');
-            evidence[`${s.key}StoredRidVerbatim`] = rid !== undefined && lineOf(rid) === sent.get(s.key);
-            evidence[`${s.key}StoredRidKind`] = fixed(kindOf(rid));
+            // Unavailable (null) when the read failed: that is not evidence of a rewritten RECURRENCE-ID.
+            evidence[`${s.key}StoredRidVerbatim`] = stored.status !== 200 ? null : rid !== undefined && lineOf(rid) === sent.get(s.key);
+            evidence[`${s.key}StoredRidKind`] = fixed(stored.status !== 200 ? 'unavailable' : kindOf(rid));
             s.storedMaster = veventBlocks(stored.body).master;
         }
         const got = written.length === 0 ? new Map<string, Expanded>() : await expandAll(ctx, temp, written.map((s) => s.url), WINDOW_3B[0], WINDOW_3B[1]);
@@ -150,12 +156,19 @@ export const overrideNewFormsCheck: CheckDef = {
         for (const s of written) {
             const result = got.get(s.url);
             Object.assign(evidence, describeExpanded(`${s.key}After`, result));
-            if (!expanded(result)) {
+            if (!expanded(result) || evidence[`${s.key}StoredRidVerbatim`] === null) {
                 continue;
             }
             readable++;
             const replaced = result.events.filter((e) => summaryOf(e) === OVERRIDE_SUMMARY);
-            const exact = result.events.length === 6 && replaced.length === 1 && startText(replaced[0] as IcalComponent) === startText(s.slots[2] as IcalComponent)
+            const slot = s.slots[2] as IcalComponent;
+            const instance = replaced[0];
+            const rid = instance === undefined ? undefined : prop(instance, 'RECURRENCE-ID');
+            const [end, slotEnd] = [instance === undefined ? undefined : prop(instance, 'DTEND'), prop(slot, 'DTEND')];
+            // The override sits in slot 3 (by RECURRENCE-ID, token or stored text), at slot 3's start and end; every other start is kept.
+            const exact = result.events.length === 6 && replaced.length === 1 && instance !== undefined && startText(instance) === startText(slot)
+                && end !== undefined && slotEnd !== undefined && lineOf(end) === lineOf(slotEnd)
+                && rid !== undefined && (rid.value === prop(slot, 'RECURRENCE-ID')?.value || lineOf(rid) === sent.get(s.key))
                 && sameList(dtstarts(result.events), dtstarts(s.slots));
             evidence[`${s.key}Replaced`] = exact;
             held += exact && evidence[`${s.key}StoredRidVerbatim`] === true ? 1 : 0;
@@ -263,28 +276,35 @@ export const overrideReeditCheck: CheckDef = {
         if (series.length === 0) {
             return { outcome: 'inconclusive', summary: prose`P3B-2 left no moved override to edit.`, evidence };
         }
-        const edited = new Map<string, string>();
+        const edited = new Map<string, { start: string; end: string; masterBefore: string[] | undefined }>();
         for (const s of series) {
             const slot = s.slots[3];
             const start = slot === undefined ? undefined : prop(slot, 'DTSTART');
             const end = slot === undefined ? undefined : prop(slot, 'DTEND');
-            const old = s.overrides[1];
-            if (start === undefined || end === undefined || old === undefined) {
+            const ridLine = s.overrides[1]?.[3];
+            if (start === undefined || end === undefined || ridLine === undefined) {
                 continue;
             }
-            const newStart = shiftLine(start, 3 * DAY);
-            // Span edit: only DTSTART, DTEND, SUMMARY, DTSTAMP and SEQUENCE of that VEVENT change.
-            const again = old.map((line) => (line.startsWith('DTSTART') ? newStart : line.startsWith('DTEND') ? shiftLine(end, 3 * DAY) : line.startsWith('SUMMARY:') ? `SUMMARY:${AGAIN}` : line.startsWith('DTSTAMP:') ? `DTSTAMP:${stampNow(ctx)}` : line.startsWith('SEQUENCE:') ? 'SEQUENCE:2' : line));
-            s.overrides = [s.overrides[0] ?? [], again];
-            if (await rewrite(ctx, s, evidence, `${s.key}Reedit`)) {
-                edited.set(s.key, newStart);
+            // Span edit of the stored resource as iCloud holds it: only DTSTART, DTEND, SUMMARY, DTSTAMP and SEQUENCE of that one VEVENT change.
+            const stored = await readRaw(ctx, temp, s.url, s.uid);
+            evidence[`${s.key}PreEditReadStatus`] = stored.status;
+            const next = { start: shiftLine(start, 3 * DAY), end: shiftLine(end, 3 * DAY) };
+            const body = stored.status !== 200 ? undefined : spanEditVevent(stored.body, (lines) => lines.includes(ridLine), { DTSTART: next.start, DTEND: next.end, SUMMARY: `SUMMARY:${AGAIN}` }, stampNow(ctx));
+            evidence[`${s.key}StoredOverrideFound`] = body !== undefined;
+            if (body === undefined) {
+                continue;
+            }
+            if (await rewriteText(ctx, s, body, evidence, `${s.key}Reedit`, stored.etag ?? s.etag)) {
+                edited.set(s.key, { ...next, masterBefore: veventBlocks(stored.body).master });
             }
         }
         const written = series.filter((s) => edited.has(s.key));
         for (const s of written) {
             const stored = await readRaw(ctx, temp, s.url, s.uid);
             const master = veventBlocks(stored.body).master;
-            evidence[`${s.key}MasterUnchanged`] = master !== undefined && s.storedMaster !== undefined && sameList(master, s.storedMaster);
+            const before = edited.get(s.key)?.masterBefore;
+            // Unavailable (null) when either read failed: that is not evidence of a changed master.
+            evidence[`${s.key}MasterUnchanged`] = stored.status !== 200 || master === undefined || before === undefined ? null : sameList(master, before);
             evidence[`${s.key}StoredOverrides`] = stored.events.filter((e) => prop(e, 'RECURRENCE-ID') !== undefined).length;
         }
         const got = written.length === 0 ? new Map<string, Expanded>() : await expandAll(ctx, temp, written.map((s) => s.url), WINDOW_3B[0], WINDOW_3B[1]);
@@ -293,14 +313,26 @@ export const overrideReeditCheck: CheckDef = {
         for (const s of written) {
             const result = got.get(s.url);
             Object.assign(evidence, describeExpanded(`${s.key}Reedit`, result));
-            if (!expanded(result)) {
+            const unchanged = evidence[`${s.key}MasterUnchanged`];
+            if (!expanded(result) || unchanged === null) {
                 continue;
             }
             readable++;
+            const want = edited.get(s.key);
             const again = result.events.filter((e) => summaryOf(e) === AGAIN);
-            const ok = result.events.length === 6 && again.length === 1 && startText(again[0] as IcalComponent) === edited.get(s.key)
-                && !result.events.some((e) => summaryOf(e) === MOVED) && evidence[`${s.key}MasterUnchanged`] === true;
-            evidence[`${s.key}OneInstanceAtNewValues`] = ok;
+            const instance = again[0];
+            const rid = instance === undefined ? undefined : prop(instance, 'RECURRENCE-ID');
+            const end = instance === undefined ? undefined : prop(instance, 'DTEND');
+            const slotRid = s.slots[3] === undefined ? undefined : prop(s.slots[3], 'RECURRENCE-ID')?.value;
+            // The other five instances keep their starts; the edited one is at both new values and still names slot 4.
+            const others = dtstarts(result.events.filter((e) => summaryOf(e) !== AGAIN));
+            const flags = {
+                [`${s.key}OneInstanceAtNewValues`]: result.events.length === 6 && again.length === 1 && instance !== undefined && startText(instance) === want?.start && end !== undefined && lineOf(end) === want?.end,
+                [`${s.key}EditedInstanceKeepsSlot`]: rid !== undefined && (rid.value === slotRid || lineOf(rid) === s.overrides[1]?.[3]),
+                [`${s.key}OtherInstancesKept`]: !result.events.some((e) => summaryOf(e) === MOVED) && sameList(others, dtstarts(s.slots.filter((_, i) => i !== 3))),
+            };
+            Object.assign(evidence, flags);
+            const ok = Object.values(flags).every(Boolean) && unchanged === true;
             held += ok ? 1 : 0;
         }
         return verdict(FORM_COUNT, held, readable, {
