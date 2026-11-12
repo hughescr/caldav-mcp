@@ -3,8 +3,9 @@ import { runCli } from '../scripts/probe/cli';
 import { runProbe } from '../scripts/probe/core';
 import { ProbeHttp, ProbeHttpError } from '../scripts/probe/http';
 import { Taint } from '../scripts/probe/safe';
-import type { BackendLoad, ProbeFlags } from '../scripts/probe/types';
-import { PLAIN, standardAccount, type FakeRequest } from './fixtures/probe/fake-icloud';
+import { INVITE_STEPS } from '../scripts/probe/checks/invite-steps';
+import type { BackendLoad, ProbeFlags, ProbeInput } from '../scripts/probe/types';
+import { ICLOUD_MEASURED, PLAIN, standardAccount, type FakeRequest } from './fixtures/probe/fake-icloud';
 import { READ_ONLY, WRITE, fakeDeps, probe } from './fixtures/probe/harness';
 
 const creds = { appleId: PLAIN.appleId, appPassword: PLAIN.appPassword };
@@ -128,6 +129,68 @@ describe('credentials that stop working mid-run stop the run (M1)', () => {
             }
         }, SWEEP_TIMEOUT_MS);
     }
+
+    /**
+     * The phase 3 checks and invite steps only get far against a fake that expands the way iCloud
+     * does, and such a run sends 300+ requests at about 0.1 s of CPU each, so a full sweep would
+     * take half a minute. These sweeps sample the switch points instead: the first requests, the
+     * last ones (removal and the parallel burst), every Nth, and the first two requests of every
+     * phase 3 check and invite step (found from the event names of a baseline run).
+     */
+    const sampledSweep = async (flags: ProbeFlags, every: number, extraInput: Partial<ProbeInput> = {}): Promise<number> => {
+        const runOnce = async (fake: ReturnType<typeof standardAccount>) => runProbe({ ...creds, flags, runLocation: 'local', ...extraInput }, fakeDeps(fake));
+        const baseline = standardAccount(PLAIN, ICLOUD_MEASURED);
+        await runOnce(baseline);
+        const total = baseline.requests.length;
+        const points = new Set<number>();
+        for (let n = 2; n <= Math.min(8, total); n++) {
+            points.add(n);
+        }
+        for (let n = Math.max(2, total - 12); n <= total; n++) {
+            points.add(n);
+        }
+        for (let n = 2; n <= total; n += every) {
+            points.add(n);
+        }
+        const seen = new Set<string>();
+        baseline.requests.forEach((r, i) => {
+            // P3B-2 and P3B-3 edit P3B-1's events, so they are found by the SUMMARY they write.
+            const resource = /caldav-mcp-probe-[0-9a-f]{8}-(p3[a-d]\d|inv(?:ite|i\d+))/.exec(r.url.pathname)?.[1];
+            const marker = /SUMMARY:caldav-mcp probe override (moved|again)/.exec(r.body)?.[1];
+            const phase = resource === undefined ? undefined : `${resource}${marker === undefined ? '' : `:${marker}`}`;
+            if (phase !== undefined && !seen.has(phase)) {
+                seen.add(phase);
+                points.add(i + 1);
+                points.add(i + 2);
+            }
+        });
+        // 3a: 9, 3b: 5 (P3B-6 is skipped), 3c: 4, 3d: 3; invite: I1 and I2 to I10 (I2 and I2b share a prefix).
+        expect(seen.size).toBeGreaterThanOrEqual(flags.invite ? 9 + 21 : 21);
+        const lastCalendarDelete = baseline.requests.findLastIndex((r) => r.method === 'DELETE' && r.url.pathname.endsWith('/'));
+        const removalEnds = lastCalendarDelete + 3;
+        for (const switchAt of [...points].filter((n) => n <= total).toSorted((a, b) => a - b)) {
+            const fake = standardAccount(PLAIN, { ...ICLOUD_MEASURED, hook: (_req, n) => (n >= switchAt ? new Response('Unauthorized', { status: 401 }) : undefined) });
+            const report = await runOnce(fake);
+            expect(report.auth.rejected).toBe(true);
+            const challenged = fake.requests[switchAt - 1];
+            const anonymousChallenge = challenged?.method === 'GET' && challenged.url.pathname.includes('/attachments/') && !challenged.headers.has('authorization');
+            const extra = unexpectedAfter401(fake.requests, switchAt + (anonymousChallenge ? 1 : 0));
+            const inFlight = switchAt > total - 5 ? Math.min(4, total - switchAt) : 0;
+            expect({ switchAt, extra: extra.length <= inFlight ? [] : extra }).toEqual({ switchAt, extra: [] });
+            if (fake.requests.slice(0, switchAt - 1).some((r) => r.method === 'MKCALENDAR') && switchAt <= removalEnds) {
+                expect(report.cleanup?.allRemoved).toBe(false);
+            }
+        }
+        return points.size;
+    };
+
+    test('write with the phase 3 checks (measured fake, sampled): after the first 401 only one DELETE per created calendar', async () => {
+        expect(await sampledSweep(WRITE, 15)).toBeGreaterThan(60);
+    }, SWEEP_TIMEOUT_MS);
+
+    test('invite with every step (measured fake, sampled): after the first 401 only one DELETE per created calendar', async () => {
+        expect(await sampledSweep(INVITE, 30, { inviteAttendee: 'owner.{tag}@mail.example.invalid', inviteSteps: [...INVITE_STEPS], inviteGapSeconds: 10 })).toBeGreaterThan(40);
+    }, SWEEP_TIMEOUT_MS);
 
     test('reviewer PoC D: credentials revoked right after discovery', async () => {
         const fake = standardAccount(PLAIN, { hook: (_req, n) => (n > 6 ? new Response('Unauthorized', { status: 401 }) : undefined) });

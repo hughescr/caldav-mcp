@@ -89,9 +89,25 @@ export interface ProbeState {
     /** Filled by the strictness census from its wide query; read by `census-recurrence-shapes` (counts only). */
     recurrenceCensus?: { tally: Record<string, number>; coverageComplete: boolean };
     /** What one phase 3 check found that a later one needs. */
-    phase3: { overrideRid?: 'b-utc-token' | 'a-stored-text' | 'other' };
+    phase3: { overrideRid?: 'b-utc-token' | 'a-stored-text' | 'other'; overrideSeries?: Phase3Series[]; splitUtcStarts?: string[] };
     /** Invite steps: when the previous one ended, so the next waits the configured gap. */
     lastInviteStepAt?: number;
+}
+
+/** One probe-written series that P3B-1, P3B-2 and P3B-3 edit in turn (in memory only). */
+export interface Phase3Series {
+    key: string;
+    url: string;
+    uid: string;
+    etag: string | null;
+    /** The master VEVENT exactly as sent, re-sent byte for byte with every edit. */
+    master: string[];
+    /** The expanded instances before any override, sorted by RECURRENCE-ID. */
+    slots: IcalComponent[];
+    /** The override VEVENTs currently stored, as sent. */
+    overrides: string[][];
+    /** The stored master's unfolded lines after the first override (P3B-3 compares). */
+    storedMaster?: string[] | undefined;
 }
 
 /** A refused write's response body, reduced to its form (names are reduced by the check that reports them). */

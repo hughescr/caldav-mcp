@@ -166,6 +166,36 @@ export function shiftLine(p: IcalProperty, ms: number, name = p.name): string {
     return lineOf({ ...p, value: shiftText(p.value, ms) }, name);
 }
 
+const nameOf = (line: string): string => /^[A-Za-z0-9-]+/.exec(line)?.[0].toUpperCase() ?? '';
+
+/** Master lines that §3.3 does not copy into a new override (the override gets its own). */
+const NOT_COPIED = new Set(['BEGIN', 'END', 'UID', 'RRULE', 'RDATE', 'EXDATE', 'EXRULE', 'DTSTART', 'DTEND', 'DURATION', 'DTSTAMP', 'LAST-MODIFIED', 'SEQUENCE', 'SUMMARY']);
+
+/**
+ * A new override as design §3.3 builds it: the master's content lines except the recurrence and
+ * time properties; DTSTART/DTEND are the expanded instance's lines verbatim unless changed; the
+ * RECURRENCE-ID is the instance's DTSTART line renamed (master form); SUMMARY is the change.
+ */
+export function overrideVevent(uid: string, stamp: string, master: readonly string[], slot: IcalComponent, change: { summary: string; start?: string; end?: string; rid?: string }, sequence: number): string[] {
+    const start = prop(slot, 'DTSTART');
+    const end = prop(slot, 'DTEND');
+    const copied = master.filter((line) => !NOT_COPIED.has(nameOf(line)));
+    return vevent(uid, stamp, [
+        change.rid ?? (start === undefined ? 'RECURRENCE-ID:' : lineOf(start, 'RECURRENCE-ID')),
+        change.start ?? (start === undefined ? '' : lineOf(start)),
+        change.end ?? (end === undefined ? '' : lineOf(end)),
+        ...copied, `SUMMARY:${change.summary}`, `SEQUENCE:${sequence}`,
+    ]);
+}
+
+/** §3.2 slot text check: the expanded DTSTART has the master's form (same TZID text for a TZID master). */
+export function formMatches(masterStart: string, slot: IcalComponent): boolean {
+    const p = prop(slot, 'DTSTART');
+    const tzid = /;TZID=([^;:]+)/.exec(masterStart)?.[1];
+    const kind = /;VALUE=DATE[;:]/.test(masterStart) ? 'date' : tzid !== undefined ? 'tzid' : masterStart.endsWith('Z') ? 'utc' : 'floating';
+    return kindOf(p) === kind && (kind !== 'tzid' || p?.params.TZID === tzid);
+}
+
 /** Throttling ends a check like everywhere else in the probe. */
 export async function guardedGet(ctx: CheckContext, url: string): Promise<{ status: number; url: string; etag: string | null; raw: Uint8Array }> {
     const res = await ctx.http.request({ method: 'GET', url, raw: true });

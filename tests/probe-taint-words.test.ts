@@ -7,7 +7,7 @@
 import { describe, expect, test } from 'bun:test';
 import { Taint, fixed, prose, renderProse, scrubValue } from '../scripts/probe/safe';
 import type { EvidenceValue, ProbeDeps, ProbeFlags, ProbeReport } from '../scripts/probe/types';
-import { FAKE_NOW, PLAIN, probeStyleEvent, seedAttachment, seedCalendar, seedEvent, standardAccount, type FakeBehaviour, type FakeICloud } from './fixtures/probe/fake-icloud';
+import { FAKE_NOW, ICLOUD_MEASURED, PLAIN, probeStyleEvent, seedAttachment, seedCalendar, seedEvent, standardAccount, type FakeBehaviour, type FakeICloud } from './fixtures/probe/fake-icloud';
 import { probe } from './fixtures/probe/harness';
 
 const creds = { appleId: PLAIN.appleId, appPassword: PLAIN.appPassword };
@@ -89,7 +89,7 @@ function evidenceStrings(value: EvidenceValue): string[] {
 }
 
 describe('short tainted values inside the probe’s own words (redaction side channel)', () => {
-    const VARIANTS: [string, Partial<FakeBehaviour>][] = [['', {}], [', expansion recording forms and values', RECORDING]];
+    const VARIANTS: [string, Partial<FakeBehaviour>][] = [['', {}], [', expansion recording forms and values', RECORDING], [', measured iCloud behaviour (phase 3 checks run to the end)', ICLOUD_MEASURED]];
     for (const [name, flags] of MODES) {
         for (const [variant, behaviour] of VARIANTS) {
         test(`${name}${variant}: probe-authored text is identical to a run with neutral values, and nothing is scrubbed`, async () => {

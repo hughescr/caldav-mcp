@@ -1,7 +1,10 @@
 import { runCheck, type CheckContext, type CheckDef, type CheckRecord } from '../context';
 import type { NotDeletedReport, TempCalendarReport } from '../types';
 import { inviteCheck } from './invite';
+import { INVITE_STEPS, INVITE_STEP_CHECKS } from './invite-steps';
 import { WRITE_3A_CHECKS, errorBodiesCheck } from './write-3a';
+import { WRITE_3B_CHECKS } from './write-3b';
+import { WRITE_3C_CHECKS, WRITE_3D_CHECKS } from './write-3cd';
 import { rewritesCheck, roundTripChecks } from './roundtrip';
 import { ATTACHMENT_WRITE_CHECKS } from './write-attachments';
 import { DST_WRITE_CHECKS } from './write-dst';
@@ -23,6 +26,9 @@ const WRITE_CHECKS: CheckDef[] = [
     ...ATTACHMENT_WRITE_CHECKS,
     // Phase 3 (probe 0.6.0), after every older check so their counts do not change.
     ...WRITE_3A_CHECKS,
+    ...WRITE_3B_CHECKS,
+    ...WRITE_3C_CHECKS,
+    ...WRITE_3D_CHECKS,
     // Last: it describes the refusal bodies of every write above.
     errorBodiesCheck,
 ];
@@ -41,7 +47,13 @@ export async function runWritePhase(ctx: CheckContext): Promise<{ results: Check
             results.push(await runCheck(def, ctx));
         }
         if (ctx.flags.invite) {
-            results.push(await runCheck(inviteCheck, ctx));
+            // In the order of INVITE_STEPS, only the selected ones (default: I1 alone).
+            for (const step of INVITE_STEPS.filter((s) => ctx.invite.steps.includes(s))) {
+                const def = step === 'I1' ? inviteCheck : INVITE_STEP_CHECKS.get(step);
+                if (def !== undefined) {
+                    results.push(await runCheck(def, ctx));
+                }
+            }
         }
     } finally {
         const removal = await removeTempCalendars(ctx);

@@ -3,7 +3,7 @@ import { runCli, type CliIo } from '../scripts/probe/cli';
 import { runProbe } from '../scripts/probe/core';
 import { runLambdaEvent } from '../scripts/probe/lambda';
 import type { BackendLoad, ProbeDeps } from '../scripts/probe/types';
-import { FAKE_NOW, seedAttachment, seedEvent, standardAccount, type Canaries, type FakeBehaviour, type FakeICloud } from './fixtures/probe/fake-icloud';
+import { FAKE_NOW, ICLOUD_MEASURED, seedAttachment, seedEvent, standardAccount, type Canaries, type FakeBehaviour, type FakeICloud } from './fixtures/probe/fake-icloud';
 import { fakeDeps } from './fixtures/probe/harness';
 
 /** Every value is distinctive so that any leak, in any encoding, is found. */
@@ -143,6 +143,11 @@ describe('nothing personal reaches stdout, stderr or the JSON report', () => {
         ['--write, attachment actions answered 401', ['--write'], { attachmentAdd: 'unauthorized' }, withAttachments],
         ['--write with undeletable calendars', ['--write'], { deleteCollection: 'fails' }],
         ['--write --invite', ['--write', '--invite'], {}],
+        ['--write, measured iCloud behaviour (every phase 3 check runs to the end)', ['--write'], ICLOUD_MEASURED],
+        ['--write, measured, with every phase 3 question answered the other way', ['--write'], {
+            ...ICLOUD_MEASURED, overrideRid: 'stored-text', orphanOverride: 'refused', endBeforeStart: 'refuse', unknownTzidPut: 'floating', foldOnGet: true, weeklyByMonthDay: 'ignored', ridMatching: 'utc-only',
+        }],
+        ['--write --invite with every invite step', ['--write', '--invite', '--invite-steps=all', '--invite-gap=10'], ICLOUD_MEASURED],
         ['--cleanup', ['--cleanup'], {}, withLeftovers],
         ['--lambda --write', ['--lambda', 'caldav-mcp-probe', '--write'], {}],
         ['--lambda --cleanup', ['--lambda', 'caldav-mcp-probe', '--cleanup'], {}, withLeftovers],

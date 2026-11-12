@@ -3,8 +3,10 @@ import { PROBE_FILE_TEXT } from '../scripts/probe/checks/write-attachments';
 import { managedUrlShape } from '../scripts/probe/checks/managed-download';
 import { ProbeHttp } from '../scripts/probe/http';
 import { Taint } from '../scripts/probe/safe';
-import { PLAIN, standardAccount, type FakeBehaviour } from './fixtures/probe/fake-icloud';
-import { READ_ONLY, WRITE, check, probe } from './fixtures/probe/harness';
+import { INVITE_STEPS } from '../scripts/probe/checks/invite-steps';
+import { runProbe } from '../scripts/probe/core';
+import { ICLOUD_MEASURED, PLAIN, standardAccount, type FakeBehaviour } from './fixtures/probe/fake-icloud';
+import { READ_ONLY, WRITE, check, fakeDeps, probe } from './fixtures/probe/harness';
 
 const credentials = { appleId: PLAIN.appleId, appPassword: PLAIN.appPassword };
 const URL_VALUE = 'https://p123-attachment.icloud.com/10000000001/attachments/abc/probe-attachment.txt';
@@ -32,11 +34,19 @@ test('0.6.0 standard fake request totals', async () => {
         for (const flags of [READ_ONLY, WRITE]) {
             const fake = standardAccount(PLAIN, { expand });
             const report = await probe(fake, flags, credentials);
-            const expected = flags.write ? expand ? 222 : 208 : 54;
+            const expected = flags.write ? expand ? 275 : 241 : 54;
             expect(report.totals.requests).toBe(expected);
             expect(fake.requests).toHaveLength(expected);
         }
     }
+    // Against the measured behaviour every phase 3 check runs to the end (P3B-6 is skipped), and every invite step adds its requests.
+    const measured = standardAccount(PLAIN, ICLOUD_MEASURED);
+    expect((await probe(measured, WRITE, credentials)).totals.requests).toBe(304);
+    const invite = standardAccount(PLAIN, ICLOUD_MEASURED);
+    const all = await runProbe({ ...credentials, flags: { write: true, invite: true, cleanup: false }, runLocation: 'local', inviteAttendee: 'owner.{tag}@mail.example.invalid', inviteSteps: [...INVITE_STEPS] }, fakeDeps(invite));
+    expect(all.totals.requests).toBe(359);
+    // Nine 90 s gaps, twenty 30 s pauses inside steps and I1's 3 s wait, on the fake clock.
+    expect(all.totals.durationMs - (await probe(standardAccount(PLAIN, ICLOUD_MEASURED), WRITE, credentials)).totals.durationMs).toBeGreaterThanOrEqual((9 * 90 + 20 * 30 + 3) * 1000);
 });
 
 describe('scoped managed download transport', () => {

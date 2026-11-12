@@ -183,6 +183,22 @@ describe('write-rrule-create (P3A-9)', () => {
     });
 });
 
+describe('every phase 3 event stays in the temporary calendar and --cleanup can remove it', () => {
+    test('measured run with undeletable calendars: at most 100 probe events, all recognised by --cleanup', async () => {
+        const { fake, report } = await run({ ...ICLOUD_MEASURED, deleteCollection: 'fails' });
+        expect(report.cleanup?.allRemoved).toBe(false);
+        const writes = fake.requests.filter((r) => ['PUT', 'DELETE', 'POST', 'MKCALENDAR'].includes(r.method));
+        expect(writes.every((r) => /\/caldav-mcp-probe-[0-9a-f]{8}\//.test(r.url.pathname))).toBe(true);
+        const left = [...fake.calendars.values()].filter((c) => c.id.startsWith('caldav-mcp-probe-'));
+        expect(Math.max(...left.map((c) => c.events.size))).toBeGreaterThan(50);
+        expect(Math.max(...left.map((c) => c.events.size))).toBeLessThanOrEqual(100);
+        fake.behaviour.deleteCollection = 'works';
+        const cleaned = await probe(fake, { write: false, invite: false, cleanup: true }, creds, { confirmCleanup: async () => true });
+        expect(check(cleaned, 'cleanup-leftovers').evidence).toMatchObject({ found: 2, candidates: 2, removalVerified: 2 });
+        expect([...fake.calendars.keys()].filter((id) => id.startsWith('caldav-mcp-probe-'))).toEqual([]);
+    });
+});
+
 describe('census-recurrence-shapes (P3A-10, read-only)', () => {
     const lines = (...l: string[]): string => `${['BEGIN:VCALENDAR', 'VERSION:2.0', ...l, 'END:VCALENDAR'].join('\r\n')}\r\n`;
 
