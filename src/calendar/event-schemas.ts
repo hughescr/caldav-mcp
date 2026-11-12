@@ -113,6 +113,8 @@ export const fullEventSchema = z.strictObject({
     attendees: z.array(attendeeSchema, FIXED).max(MAX_ATTENDEES, FIXED),
     attendees_truncated: flag,
     omitted: z.strictObject({ alarms: count, extension_properties: count }, FIXED),
+    travel_time: z.string(FIXED).max(64, FIXED).regex(/^[+-]?P[0-9WDTHMS]{1,62}$/u, FIXED).optional()
+        .describe('Apple Calendar travel time: the stored X-APPLE-TRAVEL-DURATION text (an ISO 8601 duration such as PT30M), present only when the event has one.'),
 }, FIXED);
 
 // ---- Statuses and the list/search output ----

@@ -1,8 +1,8 @@
 import { describe, expect, test } from 'bun:test';
 import {
-    buildCreateResource, displayAlarm, escapeText, foldLine, IcsWriteError, isWrittenComponent, isWrittenProperty, parseAlarmOffset, parseRrule,
+    buildCreateResource, displayAlarm, escapeText, foldLine, IcsWriteError, isWrittenComponent, isWrittenProperty, parseAlarmOffset, parseRrule, parseTravelDuration,
     quoteParameterValue, rruleProperty, sequenceProperty, serializeLines, serializeRrule, statusProperty, textProperty, timeProperty, transparencyProperty,
-    type CreateEventInput, type IcsTime,
+    travelDurationProperty, type CreateEventInput, type IcsTime,
 } from '../src/calendar/ics-write';
 import { parseOriginalResource } from '../src/calendar/ical';
 import type { EventComponent, RawProperty } from '../src/calendar/model';
@@ -871,5 +871,75 @@ describe('escape pairs split at every fold boundary still round-trip', () => {
             const event = master(text);
             for (const name of ['summary', 'location', 'description']) { expect<unknown>([pad, name, one(event, name).values]).toEqual([pad, name, [value]]); }
         }
+    });
+});
+
+describe('travel time (addendum 1): X-APPLE-TRAVEL-DURATION;VALUE=DURATION and nothing else', () => {
+    test('travelDurationProperty writes the exact Apple line for positive durations up to 12 hours', () => {
+        const cases: [string, string][] = [
+            ['PT17M', 'X-APPLE-TRAVEL-DURATION;VALUE=DURATION:PT17M'],
+            ['PT30M', 'X-APPLE-TRAVEL-DURATION;VALUE=DURATION:PT30M'],
+            ['PT1H', 'X-APPLE-TRAVEL-DURATION;VALUE=DURATION:PT1H'],
+            ['PT1H30M', 'X-APPLE-TRAVEL-DURATION;VALUE=DURATION:PT1H30M'],
+            ['PT12H', 'X-APPLE-TRAVEL-DURATION;VALUE=DURATION:PT12H'],
+            ['PT720M', 'X-APPLE-TRAVEL-DURATION;VALUE=DURATION:PT720M'],
+            ['PT2700S', 'X-APPLE-TRAVEL-DURATION;VALUE=DURATION:PT2700S'],
+            ['PT11H59M60S', 'X-APPLE-TRAVEL-DURATION;VALUE=DURATION:PT11H59M60S'],
+            ['PT1S', 'X-APPLE-TRAVEL-DURATION;VALUE=DURATION:PT1S'],
+            ['P0DT2H', 'X-APPLE-TRAVEL-DURATION;VALUE=DURATION:P0DT2H'],
+        ];
+        for (const [value, line] of cases) {
+            const written = travelDurationProperty(value);
+            expect<unknown>([value, written.name, written.line, isWrittenProperty(written)]).toEqual([value, 'X-APPLE-TRAVEL-DURATION', line, true]);
+            expect(parseTravelDuration(value)).toBe(value);
+        }
+    });
+
+    test('zero, over 12 hours, signs, weeks, days, lower case, fractions and breakouts are refused', () => {
+        for (const value of ['PT0M', 'PT0S', 'P0D', 'PT12H1S', 'PT721M', 'PT43200S', 'PT11H59M61S', 'P1D', 'P1W', 'P0W', '-PT30M', '+PT30M', 'pt30m', 'PT30', 'PT', 'P', '', 'PT0.5H', 'PT30M\r\nATTENDEE:mailto:x@example.test', 'PT30M;X=1', ' PT30M', 'PT30M ', 'PT99999M']) {
+            expect<unknown>([value, reasonOf(() => travelDurationProperty(value))]).toEqual([value, 'travel_invalid']);
+            expect<unknown>([value, reasonOf(() => parseTravelDuration(value))]).toEqual([value, 'travel_invalid']);
+        }
+        expect(reasonOf(() => travelDurationProperty(30 as unknown as string))).toBe('travel_invalid');
+        expect(fieldOf(() => travelDurationProperty('PT13H', 'travel_time'))).toBe('travel_time');
+    });
+
+    test('create writes the line after TRANSP and before the alarms; it reads back as a duration', () => {
+        const text = buildCreateResource({ ...BASE, location: 'Office', transparency: 'OPAQUE', travelDuration: 'PT25M', alarms: [{ before_start: 'PT5M' }] });
+        expect(text).toBe(crlf([
+            'BEGIN:VCALENDAR',
+            'VERSION:2.0',
+            'PRODID:-//caldav-mcp//EN',
+            'CALSCALE:GREGORIAN',
+            'BEGIN:VEVENT',
+            'UID:cmcp1-Qm9yZWQtZXhhbXBsZS11aWQtdmFs',
+            'DTSTAMP:20261112T181500Z',
+            'CREATED:20261112T181500Z',
+            'LAST-MODIFIED:20261112T181500Z',
+            'SEQUENCE:0',
+            'DTSTART;TZID=America/New_York:20261201T100000',
+            'DTEND;TZID=America/New_York:20261201T103000',
+            'SUMMARY:Weekly sync',
+            'LOCATION:Office',
+            'TRANSP:OPAQUE',
+            'X-APPLE-TRAVEL-DURATION;VALUE=DURATION:PT25M',
+            'BEGIN:VALARM',
+            'ACTION:DISPLAY',
+            'DESCRIPTION:Reminder',
+            'TRIGGER:-PT5M',
+            'END:VALARM',
+            'END:VEVENT',
+            'END:VCALENDAR',
+        ]));
+        const travel = one(master(text), 'x-apple-travel-duration');
+        expect<unknown>([travel.type, travel.values, [...travel.params]]).toEqual(['duration', ['PT25M'], []]);
+        // No routing, geocoding or travel-start line is ever generated.
+        expect(text).not.toContain('X-APPLE-TRAVEL-START');
+        expect(text).not.toContain('X-APPLE-STRUCTURED-LOCATION');
+    });
+
+    test('create without travel time writes no travel line; an invalid one fails the whole build', () => {
+        expect(buildCreateResource(BASE)).not.toContain('TRAVEL');
+        expect<unknown>([reasonOf(() => buildCreateResource({ ...BASE, travelDuration: 'PT13H' })), fieldOf(() => buildCreateResource({ ...BASE, travelDuration: 'PT13H' }))]).toEqual(['travel_invalid', 'travel_time']);
     });
 });

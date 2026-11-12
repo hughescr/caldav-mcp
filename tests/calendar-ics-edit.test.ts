@@ -5,7 +5,7 @@ import {
     describeEvents, editResource, IcsEditError, verifyUntouched, type ComponentEdit, type EditPlan, type EditReport, type EventOutline, type NewComponentItem, type ResourceEdit,
 } from '../src/calendar/ics-edit';
 import {
-    displayAlarm, rruleProperty, sequenceProperty, statusProperty, textProperty, timeProperty, transparencyProperty, uidProperty, type WrittenProperty,
+    displayAlarm, rruleProperty, sequenceProperty, statusProperty, textProperty, timeProperty, transparencyProperty, travelDurationProperty, uidProperty, type WrittenProperty,
 } from '../src/calendar/ics-write';
 import { parseOriginalResource } from '../src/calendar/ical';
 import type { EventComponent, OriginalResource } from '../src/calendar/model';
@@ -906,5 +906,73 @@ describe('stored escape pairs split at every fold boundary survive untouched (fi
             const result = editResource(FIXTURE, { target: { kind: 'master' }, edits: [{ op: 'set', property: textProperty('SUMMARY', wanted) }] });
             expect<unknown>([pad, valueOf(masterOf(parse(result.text)), 'summary')]).toEqual([pad, wanted]);
         }
+    });
+});
+
+describe('travel time (addendum 1): X-APPLE-TRAVEL-DURATION is settable and removable; the other X-APPLE-TRAVEL lines stay', () => {
+    // Shaped like the owner's measured event: a structured location, a travel start, an advisory behaviour and a duration.
+    const TRAVEL = crlf([
+        'BEGIN:VCALENDAR',
+        'VERSION:2.0',
+        'PRODID:-//Apple Inc.//macOS 15.1//EN',
+        'BEGIN:VEVENT',
+        'UID:travel-1',
+        'DTSTAMP:20261101T120000Z',
+        'SEQUENCE:2',
+        'DTSTART:20270111T150000Z',
+        'DTEND:20270111T160000Z',
+        'SUMMARY:Dentist',
+        'LOCATION:Main St 1',
+        'X-APPLE-STRUCTURED-LOCATION;VALUE=URI;X-TITLE="Main St 1":geo:52.5,13.4',
+        'X-APPLE-TRAVEL-START;ROUTING=CAR;VALUE=URI;X-ADDRESS=Home:geo:52.4,13.3',
+        'X-APPLE-TRAVEL-ADVISORY-BEHAVIOR:AUTOMATIC',
+        'X-APPLE-TRAVEL-DURATION;VALUE=DURATION:PT17M',
+        'END:VEVENT',
+        'END:VCALENDAR',
+    ]);
+    const WITHOUT = TRAVEL.replace('X-APPLE-TRAVEL-DURATION;VALUE=DURATION:PT17M\r\n', '');
+
+    test('set replaces the stored duration in place', () => {
+        const result = editResource(TRAVEL, { target: { kind: 'master' }, edits: [{ op: 'set', property: travelDurationProperty('PT45M') }] });
+        expect(result.text).toBe(TRAVEL.replace('DURATION:PT17M', 'DURATION:PT45M'));
+        expect<unknown>(result.report.changes).toEqual([{ action: 'replaced', name: 'X-APPLE-TRAVEL-DURATION', reason: 'requested', original: 14, output: 14 }]);
+    });
+
+    test('set adds it before END when the event has none', () => {
+        const result = editResource(WITHOUT, { target: { kind: 'master' }, edits: [{ op: 'set', property: travelDurationProperty('PT30M') }] });
+        expect(result.text).toBe(crlf([
+            'BEGIN:VCALENDAR', 'VERSION:2.0', 'PRODID:-//Apple Inc.//macOS 15.1//EN', 'BEGIN:VEVENT', 'UID:travel-1', 'DTSTAMP:20261101T120000Z', 'SEQUENCE:2',
+            'DTSTART:20270111T150000Z', 'DTEND:20270111T160000Z', 'SUMMARY:Dentist', 'LOCATION:Main St 1',
+            'X-APPLE-STRUCTURED-LOCATION;VALUE=URI;X-TITLE="Main St 1":geo:52.5,13.4',
+            'X-APPLE-TRAVEL-START;ROUTING=CAR;VALUE=URI;X-ADDRESS=Home:geo:52.4,13.3',
+            'X-APPLE-TRAVEL-ADVISORY-BEHAVIOR:AUTOMATIC',
+            'X-APPLE-TRAVEL-DURATION;VALUE=DURATION:PT30M',
+            'END:VEVENT', 'END:VCALENDAR',
+        ]));
+    });
+
+    test('remove deletes only the duration line; travel start and advisory behaviour are kept', () => {
+        const result = editResource(TRAVEL, { target: { kind: 'master' }, edits: [{ op: 'remove', name: 'X-APPLE-TRAVEL-DURATION' }] });
+        expect(result.text).toBe(WITHOUT);
+        expect(editResource(WITHOUT, { target: { kind: 'master' }, edits: [{ op: 'remove', name: 'X-APPLE-TRAVEL-DURATION' }] }).text).toBe(WITHOUT);
+    });
+
+    test('a LOCATION change removes the stale map pin but keeps every X-APPLE-TRAVEL line', () => {
+        const result = editResource(TRAVEL, { target: { kind: 'master' }, edits: [{ op: 'set', property: textProperty('LOCATION', 'Side St 2') }] });
+        expect(result.text).toBe(crlf([
+            'BEGIN:VCALENDAR', 'VERSION:2.0', 'PRODID:-//Apple Inc.//macOS 15.1//EN', 'BEGIN:VEVENT', 'UID:travel-1', 'DTSTAMP:20261101T120000Z', 'SEQUENCE:2',
+            'DTSTART:20270111T150000Z', 'DTEND:20270111T160000Z', 'SUMMARY:Dentist', 'LOCATION:Side St 2',
+            'X-APPLE-TRAVEL-START;ROUTING=CAR;VALUE=URI;X-ADDRESS=Home:geo:52.4,13.3',
+            'X-APPLE-TRAVEL-ADVISORY-BEHAVIOR:AUTOMATIC',
+            'X-APPLE-TRAVEL-DURATION;VALUE=DURATION:PT17M',
+            'END:VEVENT', 'END:VCALENDAR',
+        ]));
+        expect<unknown>(result.report.changes.map(change => [change.action, change.name, change.reason])).toEqual([['replaced', 'LOCATION', 'requested'], ['removed', 'X-APPLE-STRUCTURED-LOCATION', 'paired']]);
+    });
+
+    test('a duplicated duration line makes the edit an error', () => {
+        const doubled = TRAVEL.replace('X-APPLE-TRAVEL-DURATION;VALUE=DURATION:PT17M\r\n', 'X-APPLE-TRAVEL-DURATION;VALUE=DURATION:PT17M\r\nX-APPLE-TRAVEL-DURATION;VALUE=DURATION:PT18M\r\n');
+        expect(reasonOf(() => editResource(doubled, { target: { kind: 'master' }, edits: [{ op: 'set', property: travelDurationProperty('PT5M') }] }))).toBe('duplicate_property');
+        expect(reasonOf(() => editResource(doubled, { target: { kind: 'master' }, edits: [{ op: 'remove', name: 'X-APPLE-TRAVEL-DURATION' }] }))).toBe('duplicate_property');
     });
 });

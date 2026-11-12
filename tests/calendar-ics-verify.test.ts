@@ -4,7 +4,7 @@ import { join } from 'node:path';
 import { describeEvents, editResource, verifyUntouched, type ComponentEdit, type EditPlan, type EventOutline, type NewComponentItem } from '../src/calendar/ics-edit';
 import { verifyCreateOutcome, verifyEditOutcome, type CreateExpectation, type EditExpectation, type ExpectedProperty, type OutcomeVerdict } from '../src/calendar/ics-verify';
 import {
-    buildCreateResource, displayAlarm, rruleProperty, sequenceProperty, statusProperty, textProperty, timeProperty, transparencyProperty, type CreateEventInput,
+    buildCreateResource, displayAlarm, rruleProperty, sequenceProperty, statusProperty, textProperty, timeProperty, transparencyProperty, travelDurationProperty, type CreateEventInput,
 } from '../src/calendar/ics-write';
 
 // Expectations are written by hand from the request, the way the write path must derive them; the editor's report is never
@@ -484,6 +484,58 @@ describe('verifyCreateOutcome', () => {
         for (const [resource, expectation, reason] of table) { expect<unknown>(failure(verifyCreateOutcome(resource, expectation))).toBe(reason); }
         const zone = insertAfter(created, 'CALSCALE:GREGORIAN', 'BEGIN:VTIMEZONE', 'TZID:America/New_York', 'END:VTIMEZONE');
         expect<unknown>(verifyCreateOutcome(zone, { ...EXPECTED, vtimezoneCount: 1 })).toEqual({ ok: true });
+    });
+
+    test('travel time (addendum 1): the expected X-APPLE-TRAVEL-DURATION is a duration value; any other value or line is refused', () => {
+        const travel: ExpectedProperty = { name: 'X-APPLE-TRAVEL-DURATION', type: 'duration', values: ['PT25M'] };
+        const withTravel = buildCreateResource({ ...INPUT, travelDuration: 'PT25M' });
+        const expected: CreateExpectation = { ...EXPECTED, properties: [...EXPECTED.properties, travel] };
+        expect<unknown>(verifyCreateOutcome(withTravel, expected)).toEqual({ ok: true });
+        const line = 'X-APPLE-TRAVEL-DURATION;VALUE=DURATION:PT25M';
+        const table: [string, CreateExpectation, string][] = [
+            [swapLine(withTravel, line, 'X-APPLE-TRAVEL-DURATION;VALUE=DURATION:PT26M'), expected, 'property_mismatch'],
+            [swapLine(withTravel, line, 'X-APPLE-TRAVEL-DURATION:PT25M'), expected, 'property_mismatch'],
+            [swapLine(withTravel, line, line, 'X-APPLE-TRAVEL-START;ROUTING=CAR;VALUE=URI:geo:1,2'), expected, 'unexpected_property'],
+            [swapLine(withTravel, line, line, line), expected, 'property_mismatch'],
+            [withTravel, EXPECTED, 'unexpected_property'],
+            [created, expected, 'property_mismatch'],
+        ];
+        for (const [resource, expectation, reason] of table) { expect<unknown>(failure(verifyCreateOutcome(resource, expectation))).toBe(reason); }
+    });
+});
+
+describe('verifyEditOutcome with travel time (addendum 1)', () => {
+    const BEFORE = crlf([
+        'BEGIN:VCALENDAR', 'VERSION:2.0', 'PRODID:-//Apple Inc.//macOS 15.1//EN', 'BEGIN:VEVENT', 'UID:travel-1', 'DTSTAMP:20261101T120000Z', 'SEQUENCE:2',
+        'DTSTART:20270111T150000Z', 'DTEND:20270111T160000Z', 'SUMMARY:Dentist', 'LOCATION:Main St 1',
+        'X-APPLE-STRUCTURED-LOCATION;VALUE=URI;X-TITLE="Main St 1":geo:52.5,13.4',
+        'X-APPLE-TRAVEL-START;ROUTING=CAR;VALUE=URI;X-ADDRESS=Home:geo:52.4,13.3',
+        'X-APPLE-TRAVEL-ADVISORY-BEHAVIOR:AUTOMATIC',
+        'X-APPLE-TRAVEL-DURATION;VALUE=DURATION:PT17M',
+        'END:VEVENT', 'END:VCALENDAR',
+    ]);
+    const stamps = [stamp('DTSTAMP'), stamp('LAST-MODIFIED'), integer('SEQUENCE', 3)];
+    const edits: ComponentEdit[] = [
+        { op: 'set', property: travelDurationProperty('PT40M') },
+        { op: 'set', property: timeProperty('DTSTAMP', NOW) }, { op: 'set', property: timeProperty('LAST-MODIFIED', NOW) }, { op: 'set', property: sequenceProperty(3) },
+    ];
+    const expectation: EditExpectation = { target: { component: { kind: 'master' }, properties: [{ name: 'X-APPLE-TRAVEL-DURATION', type: 'duration', values: ['PT40M'] }, ...stamps] } };
+
+    test('a replaced duration passes; a changed travel start or a wrong duration is refused', () => {
+        const after = editResource(BEFORE, { target: { kind: 'master' }, edits }).text;
+        expect<unknown>(verifyEditOutcome(BEFORE, after, expectation)).toEqual({ ok: true });
+        expect(failure(verifyEditOutcome(BEFORE, swapLine(after, 'X-APPLE-TRAVEL-DURATION;VALUE=DURATION:PT40M', 'X-APPLE-TRAVEL-DURATION;VALUE=DURATION:PT41M'), expectation))).toBe('property_mismatch');
+        expect(failure(verifyEditOutcome(BEFORE, swapLine(after, 'X-APPLE-TRAVEL-START;ROUTING=CAR;VALUE=URI;X-ADDRESS=Home:geo:52.4,13.3'), expectation))).toBe('property_changed');
+        expect(failure(verifyEditOutcome(BEFORE, swapLine(after, 'X-APPLE-TRAVEL-ADVISORY-BEHAVIOR:AUTOMATIC', 'X-APPLE-TRAVEL-ADVISORY-BEHAVIOR:DISABLED'), expectation))).toBe('property_changed');
+    });
+
+    test('a removed duration passes as an absence; a removal that also took the travel start is refused', () => {
+        const removal: ComponentEdit[] = [{ op: 'remove', name: 'X-APPLE-TRAVEL-DURATION' }, ...edits.slice(1)];
+        const absent: EditExpectation = { target: { component: { kind: 'master' }, properties: [{ name: 'X-APPLE-TRAVEL-DURATION', absent: true }, ...stamps] } };
+        const after = editResource(BEFORE, { target: { kind: 'master' }, edits: removal }).text;
+        expect<unknown>(verifyEditOutcome(BEFORE, after, absent)).toEqual({ ok: true });
+        expect(failure(verifyEditOutcome(BEFORE, swapLine(after, 'X-APPLE-TRAVEL-START;ROUTING=CAR;VALUE=URI;X-ADDRESS=Home:geo:52.4,13.3'), absent))).toBe('property_changed');
+        expect(failure(verifyEditOutcome(BEFORE, after, expectation))).toBe('property_mismatch');
     });
 });
 
