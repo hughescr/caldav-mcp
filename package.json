@@ -39,7 +39,7 @@
     "lint": "oxlint --deny-warnings .",
     "test": "bun test",
     "build": "bun scripts/build.ts",
-    "smoke": "node scripts/smoke.mjs",
+    "smoke": "node scripts/smoke.mjs && node scripts/transport-check.mjs",
     "validate": "bun check --no-script && bun run lint && bun test && bun run build && bun run smoke",
     "package": "serverless package --stage prod",
     "deploy": "bash scripts/deploy.sh",

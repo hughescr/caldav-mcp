@@ -10,11 +10,11 @@ import { createDownloadBudget, createReadBudget, type ReadBudget } from './budge
 import type { DownloadStore } from './downloads';
 import type { DownloadArgs, DownloadOutput, GetEventArgs, ListEventsArgs, SearchEventsArgs } from './event-schemas';
 import { BudgetError } from './model';
-import { getEvent, listEvents, ReadError, searchEvents, type DetailReadResult, type EventsReadResult, type ReadDeps } from './read';
+import { getEvent, listEvents, ReadError, searchEvents, type DetailReadResult, type ErrorDetail, type EventsReadResult, type ReadDeps } from './read';
 
 /** A fixed, sanitized tool failure. It never carries upstream text. */
 export class CalendarError extends Error {
-    constructor(public readonly code: ToolErrorCode) { super(code); }
+    constructor(public readonly code: ToolErrorCode, public readonly detail?: ErrorDetail) { super(code); }
 }
 
 export interface BoundCalendarService {
@@ -82,7 +82,7 @@ export function bindCalendarService(binding: CalendarBinding): BoundCalendarServ
         try {
             return await call(credentials, unauthorized);
         } catch (error) {
-            if (read && (error instanceof ReadError || error instanceof CalendarError)) { throw new CalendarError(error.code); }
+            if (read && (error instanceof ReadError || error instanceof CalendarError)) { throw new CalendarError(error.code, error.detail); }
             if (read && error instanceof BudgetError) { throw new CalendarError(error.kind === 'deadline' ? 'temporarily_unavailable' : 'result_too_large'); }
             if (!(error instanceof CalDavError)) { throw new CalendarError('temporarily_unavailable'); }
             if (error.code === 'unauthorized') {

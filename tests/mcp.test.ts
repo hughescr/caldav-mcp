@@ -186,13 +186,72 @@ test('a download result that breaks the output contract is upstream_error, not p
 
 test('download errors use attachment wording', async () => {
     const f = fixture();
-    for (const [code, phrase] of [['not_found', 'attachment was not found'], ['result_too_large', '20 MiB'], ['unsupported_attachment', 'cannot be downloaded']] as const) {
+    for (const [code, phrase] of [['not_found', 'attachment was not found'], ['unsupported_attachment', 'cannot be downloaded']] as const) {
         f.service.get_event_attachment_download = async () => { throw new CalendarError(code); };
         const result = (await f.rpc('tools/call', { name: 'get_event_attachment_download', arguments: downloadArgs })).result;
         expect(result.structuredContent.error.code).toBe(code);
         expect(result.structuredContent.error.message).toContain(phrase);
     }
 });
+
+test('download result_too_large names the 20 MiB limit only when the attachment itself was too large', async () => {
+    const f = fixture();
+    const message = async (error: CalendarError): Promise<{ code: string; message: string }> => {
+        f.service.get_event_attachment_download = async () => { throw error; };
+        return (await f.rpc('tools/call', { name: 'get_event_attachment_download', arguments: downloadArgs })).result.structuredContent.error;
+    };
+    const attachment = await message(new CalendarError('result_too_large', 'attachment_size'));
+    expect(attachment.code).toBe('result_too_large');
+    expect(attachment.message).toContain('larger than the 20 MiB download limit');
+    // Any other size overflow (the calendar read, or the response) keeps the code but not the attachment wording.
+    const other = await message(new CalendarError('result_too_large'));
+    expect(other.code).toBe('result_too_large');
+    expect(other.message).not.toContain('20 MiB');
+    expect(other.message).toContain('size limit');
+    // The detail never changes another tool's wording.
+    f.service.get_event = async () => { throw new CalendarError('result_too_large', 'attachment_size'); };
+    const detail = (await f.rpc('tools/call', { name: 'get_event', arguments: { calendar_id: '/1/calendars/home/', resource_href: '/1/calendars/home/e.ics' } })).result.structuredContent.error;
+    expect(detail.message).not.toContain('20 MiB');
+});
+
+/** A schema-valid download result at every field's maximum serialized size. */
+function worstCaseDownloads(): DownloadOutput[] {
+    // ETag: 1024 characters, the quoted body all backslashes (escaped once in structured content, twice in the text copy).
+    const etag = `"${'\\'.repeat(1022)}"`;
+    // Filename: 255 control characters, each a six-byte \u escape in JSON and seven in the text copy.
+    const filename = '\u0001'.repeat(255);
+    const contentType = `${'a'.repeat(127)}/${'b'.repeat(127)}`;
+    // download_url: 8192 characters, the most stageDownload passes, all of the allowed set.
+    const downloadUrl = `https://${'%'.repeat(8192 - 8)}`;
+    // url: 8192 characters is the schema maximum, though external links are cut at 4096; backslashes are the worst JSON case.
+    const externalUrl = `https://${'\\'.repeat(8192 - 8)}`;
+    return [
+        { form: 'managed', attachment_ref: attachmentRef, expected_version: etag, filename, content_type: contentType, size: 20 * 1024 * 1024, download_url: downloadUrl, expires_at: '2027-01-11T10:05:00Z', fetched_by_server: true },
+        { form: 'external', attachment_ref: attachmentRef, expected_version: etag, filename, content_type: filename, url: externalUrl, fetched_by_server: false },
+    ];
+}
+
+for (const protocol of ['2025-11-25', '2026-07-28']) {
+    test(`${protocol}: a worst-case download result, with the longest request id, fits the wire cap and is not cut`, async () => {
+        for (const worst of worstCaseDownloads()) {
+            expect(downloadOutputSchema.safeParse(worst).success).toBe(true);
+            const f = fixture();
+            f.service.get_event_attachment_download = async () => worst;
+            // The longest id the boundary accepts, of characters JSON escapes to six bytes.
+            const id = '\u0001'.repeat(128);
+            const authInfo: AuthInfo = { token: 'synthetic-oauth-token', clientId: 'verified-client', scopes: ['calendar:read'], resource: new URL('https://service.example/mcp') };
+            const response = await handleMcp(rpcRequest('tools/call', { name: 'get_event_attachment_download', arguments: downloadArgs }, protocol, id), authInfo, f.service);
+            expect(response.status).toBe(200);
+            const body = await response.text();
+            const reply = JSON.parse(body);
+            expect(reply.id).toBe(id);
+            expect(reply.result.isError).toBeUndefined();
+            expect(reply.result.structuredContent).toEqual(worst);
+            expect(JSON.parse(reply.result.content[0].text)).toEqual(worst);
+            expect(Buffer.byteLength(body)).toBeLessThanOrEqual(MAX_WIRE_BYTES);
+        }
+    });
+}
 
 test('raw text descriptions advertise the 16 KiB prefix and truncation flag', async () => {
     const f = fixture();

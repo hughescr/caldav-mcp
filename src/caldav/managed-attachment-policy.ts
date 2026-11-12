@@ -92,9 +92,34 @@ export function checkManagedAttachmentUrl(candidate: ManagedCandidate, policy: M
     return { allowed: true, url };
 }
 
+/** The list elements of a header value, split at commas outside quoted strings (RFC 9110 sections 5.6.1 and 5.6.4). */
+function listElements(header: string): string[] {
+    const elements: string[] = [];
+    let start = 0;
+    let quoted = false;
+    for (let index = 0; index < header.length; index++) {
+        const character = header[index];
+        if (quoted) {
+            // A backslash escapes the next character, including a quote; an unterminated string runs to the end.
+            if (character === '\\') { index++; } else if (character === '"') { quoted = false; }
+        } else if (character === '"') {
+            quoted = true;
+        } else if (character === ',') {
+            elements.push(header.slice(start, index));
+            start = index + 1;
+        }
+    }
+    elements.push(header.slice(start));
+    return elements;
+}
+
+/** An element that starts a challenge: an auth-scheme token not followed by `=` (that would be an auth-param). */
+const CHALLENGE_START = /^[ \t]*([!#$%&'*+.^_`|~0-9A-Za-z-]+)(?![ \t]*=)(?:[ \t]|$)/u;
+
 /** True when a WWW-Authenticate value offers the Basic scheme in any of its challenges. */
 export function offersBasicChallenge(header: string | null): boolean {
-    return header !== null && /(?:^|,)\s*basic(?:\s|,|$)/iu.test(header);
+    if (header === null) { return false; }
+    return listElements(header).some(element => CHALLENGE_START.exec(element)?.[1]?.toLowerCase() === 'basic');
 }
 
 /**

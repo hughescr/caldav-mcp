@@ -12,6 +12,7 @@ import {
 } from './calendar/event-schemas';
 import { DEFAULT_EVENTS, EDGE_INCLUSION_SENTENCE } from './calendar/limits';
 import { RESPONSE_TOO_LARGE_MESSAGE, shapeDownloadResult, shapeEventDetail, shapeEventsResult, type WireContext } from './calendar/shape';
+import type { ErrorDetail } from './calendar/read';
 
 type ToolName = keyof BoundCalendarService;
 const DOWNLOAD_TOOL = 'get_event_attachment_download';
@@ -21,14 +22,18 @@ const requiredScope: Record<ToolName, string> = {
 const annotations = { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true } as const;
 const objectRoot = { type: 'object' } as const;
 
-const messages: Record<ToolErrorCode, (name: ToolName) => string> = {
+const messages: Record<ToolErrorCode, (name: ToolName, detail: ErrorDetail | undefined) => string> = {
     reconnect_required: () => 'Reconnect your iCloud account before using this tool.',
     temporarily_unavailable: () => 'iCloud Calendar is temporarily unavailable. Please try again later.',
     insufficient_scope: name => `Access denied. This tool requires ${requiredScope[name]}; reconnect and authorize that scope if it is missing.`,
     upstream_error: () => 'iCloud returned a response this server could not use safely. Please try again later.',
     invalid_input: () => INVALID_INPUT_MESSAGE,
     not_found: name => (name === DOWNLOAD_TOOL ? 'The requested calendar, event or attachment was not found.' : 'The requested calendar, event or occurrence was not found.'),
-    result_too_large: name => (name === DOWNLOAD_TOOL ? 'The attachment is larger than the 20 MiB download limit.' : RESPONSE_TOO_LARGE_MESSAGE),
+    result_too_large: (name, detail) => {
+        if (name !== DOWNLOAD_TOOL) { return RESPONSE_TOO_LARGE_MESSAGE; }
+        // Only the attachment's own size is the 20 MiB limit; the event read or the response can also be too large.
+        return detail === 'attachment_size' ? 'The attachment is larger than the 20 MiB download limit.' : 'The event or the download result exceeded a size limit of this server.';
+    },
     calendar_changed: () => 'The calendar event changed between reads. List or get the event again before retrying.',
     unsupported_calendar_data: () => 'The calendar event contains data this server cannot read safely.',
     unsupported_attachment: () => 'This attachment cannot be downloaded safely by this server.',
@@ -38,7 +43,7 @@ const messages: Record<ToolErrorCode, (name: ToolName) => string> = {
 function failure(error: unknown, name: ToolName, requestId: string): CallToolResult {
     const parsed = error instanceof CalendarError ? toolErrorCodeSchema.safeParse(error.code) : undefined;
     const code: ToolErrorCode = parsed?.success ? parsed.data : 'temporarily_unavailable';
-    const message = `${messages[code](name)} Request ID: ${requestId}.`;
+    const message = `${messages[code](name, error instanceof CalendarError ? error.detail : undefined)} Request ID: ${requestId}.`;
     // Only fixed messages and a server UUID: with the boundary's 128-unit id cap, either wire codec fits 4 KiB.
     const payload = { error: { code, message, request_id: requestId } };
     // eslint-disable-next-line no-console -- Only the tool name, a server-generated ID and an allowlisted code are logged.

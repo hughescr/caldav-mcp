@@ -45,6 +45,11 @@ function lazyBody(total: number, chunk = 64 * 1024) {
     return { stream, produced: () => produced, cancelled: () => cancelled };
 }
 
+/** A Response whose type and status are overridden: the Response constructor cannot make status 0 or opaqueredirect. */
+function opaque(response: Response, type: ResponseType, status: number): Response {
+    return Object.defineProperties(response, { type: { value: type }, status: { value: status } });
+}
+
 describe('streaming cap', () => {
     test('the cap is 20 MiB, or SIZE when smaller; SIZE above the cap is too large before anything is sent', () => {
         expect(byteLimit(null)).toEqual({ maxBytes: MAX_DOWNLOAD_BYTES, overflow: 'too_large' });
@@ -93,6 +98,39 @@ describe('streaming cap', () => {
         expect(cancelled).toBe(true);
     });
 
+    test('bytes arrive intact across buffer growth, with or without a Content-Length hint', async () => {
+        const sizes = [1, 65_535, 2, 70_000, 131_072, 3, 400_000, 17];
+        const total = sizes.reduce((sum, size) => sum + size, 0);
+        const expected = new Uint8Array(total);
+        for (let index = 0; index < total; index++) { expected[index] = (index * 31 + 7) % 251; }
+        const stream = () => {
+            let offset = 0;
+            const queue = [...sizes];
+            return new ReadableStream<Uint8Array>({
+                pull(controller) {
+                    const size = queue.shift();
+                    if (size === undefined) { controller.close(); return; }
+                    controller.enqueue(expected.slice(offset, offset + size));
+                    offset += size;
+                },
+            });
+        };
+        for (const hint of [null, total, 10, total * 2]) {
+            const bytes = await readCappedBody(stream(), byteLimit(null), new AbortController().signal, hint);
+            expect([hint, bytes.byteLength]).toEqual([hint, total]);
+            expect(Buffer.from(bytes).equals(Buffer.from(expected))).toBe(true);
+        }
+    });
+
+    test('the buffer never grows past the cap, even with a larger hint', async () => {
+        const bytes = await readCappedBody(lazyBody(100).stream, byteLimit(100), new AbortController().signal, MAX_DOWNLOAD_BYTES);
+        expect(bytes.byteLength).toBe(100);
+        expect(bytes.buffer.byteLength).toBe(100);
+        const capped = await readCappedBody(lazyBody(MAX_DOWNLOAD_BYTES, 1024 * 1024 - 1).stream, byteLimit(null), new AbortController().signal);
+        expect(capped.byteLength).toBe(MAX_DOWNLOAD_BYTES);
+        expect(capped.buffer.byteLength).toBe(MAX_DOWNLOAD_BYTES);
+    });
+
     test('a null body is empty', async () => {
         expect((await readCappedBody(null, byteLimit(0), new AbortController().signal)).byteLength).toBe(0);
     });
@@ -122,6 +160,24 @@ describe('managed fetch', () => {
             expect(await code(createManagedAttachmentFetcher({ fetch: r.fetch })(request()))).toBe('redirect');
             expect(r.sent).toHaveLength(1);
         }
+    });
+
+    test('an opaqueredirect response (what fetch returns for a redirect under redirect: manual) is a redirect failure', async () => {
+        const body = lazyBody(1024);
+        const r = recorder(opaque(new Response(body.stream), 'opaqueredirect', 0));
+        expect(await code(createManagedAttachmentFetcher({ fetch: r.fetch })(request()))).toBe('redirect');
+        expect(r.sent).toHaveLength(1);
+        expect(body.cancelled()).toBe(true);
+    });
+
+    test('a status 0 response is refused, whatever its type', async () => {
+        const error = recorder(Response.error());
+        expect(await code(createManagedAttachmentFetcher({ fetch: error.fetch })(request()))).toBe('upstream');
+        const body = lazyBody(1024);
+        const basic = recorder(opaque(new Response(body.stream), 'basic', 0));
+        expect(await code(createManagedAttachmentFetcher({ fetch: basic.fetch })(request()))).toBe('upstream');
+        expect(basic.sent).toHaveLength(1);
+        expect(body.cancelled()).toBe(true);
     });
 
     test('statuses map to fixed codes', async () => {

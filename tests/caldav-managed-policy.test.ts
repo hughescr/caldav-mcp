@@ -129,4 +129,30 @@ describe('credential retry (OD9)', () => {
         expect(offersBasicChallenge('')).toBe(false);
         expect(offersBasicChallenge(null)).toBe(false);
     });
+    test('Basic challenge detection respects quoted strings and escapes', () => {
+        // A comma inside a quoted auth-param value does not start a new challenge.
+        expect(offersBasicChallenge('Bearer realm="files, Basic example"')).toBe(false);
+        expect(offersBasicChallenge('Bearer realm="files,Basic"')).toBe(false);
+        // An escaped quote does not close the quoted string, so the comma after it is still inside.
+        expect(offersBasicChallenge('Bearer realm="a\\", Basic realm=b"')).toBe(false);
+        expect(offersBasicChallenge('Bearer error_description="x \\"quoted\\", Basic y"')).toBe(false);
+        // An unterminated quoted string swallows the rest of the header.
+        expect(offersBasicChallenge('Bearer realm="open, Basic')).toBe(false);
+        // An auth-param named Basic, or a token68 / param value of Basic, is not a challenge.
+        expect(offersBasicChallenge('Bearer basic=1')).toBe(false);
+        expect(offersBasicChallenge('Bearer realm="x", basic = "y"')).toBe(false);
+        expect(offersBasicChallenge('Bearer realm=Basic')).toBe(false);
+    });
+    test('Basic challenge detection finds Basic among several real challenges', () => {
+        // RFC 9110 section 11.6.1's example, with escaped quotes in a title.
+        expect(offersBasicChallenge('Newauth realm="apps", type=1, title="Login to \\"apps\\"", Basic realm="simple"')).toBe(true);
+        expect(offersBasicChallenge('Bearer realm="a", error="invalid_token", Basic realm="b", charset="UTF-8"')).toBe(true);
+        // An escaped backslash closes the quoted string normally.
+        expect(offersBasicChallenge('Bearer realm="a\\\\", Basic')).toBe(true);
+        expect(offersBasicChallenge('Negotiate abc123==, BASIC realm="x"')).toBe(true);
+        expect(offersBasicChallenge(' ,  Basic')).toBe(true);
+    });
+    test('the shipped credentialed-host list stays empty', () => {
+        expect(MANAGED_ATTACHMENT_POLICY.credentialedHosts).toEqual([]);
+    });
 });

@@ -60,9 +60,12 @@ export interface DetailReadResult {
     rawIcs: string | null;
 }
 
+/** Why a result_too_large happened, when the message should say so. Only `attachment_size` exists: the attachment itself is over the download cap. */
+export type ErrorDetail = 'attachment_size';
+
 /** A whole-tool read failure with one fixed code. It never carries upstream text, values or causes. */
 export class ReadError extends Error {
-    constructor(public readonly code: ReadToolErrorCode) { super(code); }
+    constructor(public readonly code: ReadToolErrorCode, public readonly detail?: ErrorDetail) { super(code); }
 }
 
 type CalendarStatusCode = CalendarStatus['status'];

@@ -7,7 +7,7 @@
 import { GetObjectCommand, PutObjectCommand, S3Client } from '@aws-sdk/client-s3';
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 import { isValidBucketName } from '../config';
-import type { DownloadStore } from './downloads';
+import { untilAborted, type DownloadStore } from './downloads';
 
 /** The S3Client surface this store uses, so tests can stub it without any network. */
 export interface S3ClientLike {
@@ -46,15 +46,18 @@ export function createS3DownloadStore(options: S3DownloadStoreOptions): Download
                 ServerSideEncryption: 'AES256',
             }), { abortSignal: signal });
         },
-        async presignGet(key, maxTtlSeconds) {
+        async presignGet(key, maxTtlSeconds, signal) {
             const signer = lazyClient();
-            const credentials = await signer.config.credentials();
+            // The credential provider and the presigner take no abort signal: race the provider, and re-check afterwards.
+            const credentials = await untilAborted(signer.config.credentials(), signal);
+            if (signal.aborted) { throw new Error('download deadline passed'); }
             const start = now();
             // A presigned URL stops working when the signing credentials expire, so never promise longer than they last.
             const credentialSeconds = credentials.expiration === undefined ? maxTtlSeconds : Math.floor((credentials.expiration.getTime() - start) / 1000) - 5;
             const expiresIn = Math.min(maxTtlSeconds, credentialSeconds);
             if (!Number.isSafeInteger(expiresIn) || expiresIn < 1) { throw new Error('signing credentials expire too soon'); }
-            const url = await presign(signer, new GetObjectCommand({ Bucket: bucketName, Key: key }), { expiresIn, signingDate: new Date(start) });
+            const url = await untilAborted(presign(signer, new GetObjectCommand({ Bucket: bucketName, Key: key }), { expiresIn, signingDate: new Date(start) }), signal);
+            if (signal.aborted) { throw new Error('download deadline passed'); }
             return { url, expiresAt: new Date(start + expiresIn * 1000) };
         },
     };

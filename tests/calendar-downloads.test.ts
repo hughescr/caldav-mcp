@@ -130,10 +130,68 @@ describe('stageDownload', () => {
         expect(await stageDownload(plain, request, new AbortController().signal).catch((caught: DownloadStageError) => caught.code)).toBe('verification_failed');
     });
 
+    test('a link with characters a presigned URL never has, or longer than 8192, is refused', async () => {
+        for (const url of ['https://s3.example/a"b', 'https://s3.example/a\\b', 'https://s3.example/a b', 'https://s3.example/é', 'https://s3.example/a\u0001', 'https://', `https://s3.example/${'a'.repeat(8192)}`]) {
+            const store = new FakeDownloadStore();
+            store.presignGet = async () => ({ url, expiresAt: new Date(Date.now() + 60_000) });
+            expect([url.slice(0, 40), await stageDownload(store, request, new AbortController().signal).catch((caught: DownloadStageError) => caught.code)]).toEqual([url.slice(0, 40), 'verification_failed']);
+        }
+        const exact = new FakeDownloadStore();
+        const longest = `https://s3.example/${'a'.repeat(8192 - 19)}`;
+        exact.presignGet = async () => ({ url: longest, expiresAt: new Date(Date.now() + 60_000) });
+        expect((await stageDownload(exact, request, new AbortController().signal)).url).toHaveLength(8192);
+    });
+
     test('an aborted signal writes nothing', async () => {
         const store = new FakeDownloadStore();
         expect(await stageDownload(store, request, AbortSignal.abort()).catch((caught: DownloadStageError) => caught.code)).toBe('temporarily_unavailable');
         expect(store.objects.size).toBe(0);
+    });
+
+    test('the signer gets the deadline signal', async () => {
+        const store = new FakeDownloadStore();
+        const signals: AbortSignal[] = [];
+        const sign = store.presignGet.bind(store);
+        store.presignGet = async (key, maxTtlSeconds, signal) => { signals.push(signal); return sign(key, maxTtlSeconds, signal); };
+        const controller = new AbortController();
+        await stageDownload(store, request, controller.signal);
+        expect(signals).toEqual([controller.signal]);
+    });
+
+    test('a signer that never resolves is cut off by the deadline', async () => {
+        const store = new FakeDownloadStore();
+        store.presignGet = () => new Promise(() => {});
+        const controller = new AbortController();
+        const pending = stageDownload(store, request, controller.signal).catch((caught: DownloadStageError) => caught.code);
+        // Let the put finish and the signer start before the deadline passes.
+        await Bun.sleep(0);
+        controller.abort();
+        expect(await pending).toBe('temporarily_unavailable');
+    });
+
+    test('a put that never resolves is cut off by the deadline', async () => {
+        const store = new FakeDownloadStore();
+        store.putObject = () => new Promise(() => {});
+        const controller = new AbortController();
+        const pending = stageDownload(store, request, controller.signal).catch((caught: DownloadStageError) => caught.code);
+        controller.abort();
+        expect(await pending).toBe('temporarily_unavailable');
+        expect(store.signed).toHaveLength(0);
+    });
+
+    test('a signer that resolves after cancellation is not a success', async () => {
+        const controller = new AbortController();
+        const store = new FakeDownloadStore();
+        const sign = store.presignGet.bind(store);
+        // Cancellation lands while the signer is working; the signer still answers with a valid link.
+        store.presignGet = async (key, maxTtlSeconds, signal) => { const answer = await sign(key, maxTtlSeconds, signal); controller.abort(); await Bun.sleep(0); return answer; };
+        expect(await stageDownload(store, request, controller.signal).catch((caught: DownloadStageError) => caught.code)).toBe('temporarily_unavailable');
+        // Synchronous variant: the abort and the answer happen in the same turn, so only the re-check after signing catches it.
+        const second = new AbortController();
+        const quick = new FakeDownloadStore();
+        const quickSign = quick.presignGet.bind(quick);
+        quick.presignGet = (key, maxTtlSeconds, signal) => { const answer = quickSign(key, maxTtlSeconds, signal); second.abort(); return answer; };
+        expect(await stageDownload(quick, request, second.signal).catch((caught: DownloadStageError) => caught.code)).toBe('temporarily_unavailable');
     });
 });
 
@@ -171,20 +229,44 @@ describe('S3 download store', () => {
             client: () => ({ send: async () => ({}), config: { credentials: async () => (expiration === undefined ? {} : { expiration }) } }),
             presign: async (_client, command: GetObjectCommand, options) => { calls.push({ key: command.input.Key, expiresIn: options.expiresIn }); return 'https://signed.example/x'; },
         });
-        expect(await make().presignGet('k1', 300)).toEqual({ url: 'https://signed.example/x', expiresAt: new Date(now + 300_000) });
-        expect(await make(new Date(now + 120_000)).presignGet('k2', 300)).toEqual({ url: 'https://signed.example/x', expiresAt: new Date(now + 115_000) });
-        await expect(make(new Date(now + 5_000)).presignGet('k3', 300)).rejects.toThrow();
+        const signal = new AbortController().signal;
+        expect(await make().presignGet('k1', 300, signal)).toEqual({ url: 'https://signed.example/x', expiresAt: new Date(now + 300_000) });
+        expect(await make(new Date(now + 120_000)).presignGet('k2', 300, signal)).toEqual({ url: 'https://signed.example/x', expiresAt: new Date(now + 115_000) });
+        await expect(make(new Date(now + 5_000)).presignGet('k3', 300, signal)).rejects.toThrow();
         expect(calls).toEqual([{ key: 'k1', expiresIn: 300 }, { key: 'k2', expiresIn: 115 }]);
+    });
+
+    test('presigning is bounded by the signal: stalled credentials are cut off and an aborted signal signs nothing', async () => {
+        let signed = 0;
+        const make = (credentials: () => Promise<{ expiration?: Date }>) => createS3DownloadStore({
+            bucketName: 'download-bucket',
+            client: () => ({ send: async () => ({}), config: { credentials } }),
+            presign: async () => { signed++; return 'https://signed.example/x'; },
+        });
+        const controller = new AbortController();
+        const pending = make(() => new Promise(() => {})).presignGet('k', 300, controller.signal);
+        controller.abort();
+        await expect(pending).rejects.toThrow();
+        // Credentials that resolve only after the deadline passed do not lead to a signature.
+        const late = new AbortController();
+        await expect(make(async () => { late.abort(); return {}; }).presignGet('k', 300, late.signal)).rejects.toThrow();
+        await expect(make(async () => ({})).presignGet('k', 300, AbortSignal.abort())).rejects.toThrow();
+        expect(signed).toBe(0);
     });
 
     test('the real presigner signs locally, without any network, an https GET with the requested lifetime', async () => {
         const client = new S3Client({ region: 'us-west-2', credentials: { accessKeyId: 'AKIDEXAMPLE', secretAccessKey: 'wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY' }, maxAttempts: 1 });
         const store = createS3DownloadStore({ bucketName: 'download-bucket', client: () => client });
-        const { url } = await store.presignGet('downloads/v1/n/k', 300);
+        const { url } = await store.presignGet('downloads/v1/n/k', 300, new AbortController().signal);
         const parsed = new URL(url);
         expect(parsed.protocol).toBe('https:');
         expect(parsed.pathname.endsWith('/downloads/v1/n/k')).toBe(true);
         expect(parsed.searchParams.get('X-Amz-Expires')).toBe('300');
         expect(parsed.searchParams.get('X-Amz-Signature')).toMatch(/^[0-9a-f]{64}$/u);
+        // stageDownload accepts what the real presigner produces, and returns it unchanged.
+        // The put is stubbed: this test must not send anything to S3.
+        const signOnly = { putObject: async () => {}, presignGet: store.presignGet.bind(store) };
+        const staged = await stageDownload(signOnly, { accountId, bytes: new Uint8Array(1), filename: 'a.txt', url: null, declaredContentType: null }, new AbortController().signal);
+        expect(new URL(staged.url).searchParams.get('X-Amz-Expires')).toBe('300');
     });
 });

@@ -330,7 +330,8 @@ result:
   is empty, because no host has been seen to need a login.
 - Any other link is not fetched, so the server cannot be used to reach other hosts. Its URL
   is returned as an external link with `fetched_by_server: false`. A `MANAGED-ID` link that
-  the policy refuses is treated the same way.
+  the policy refuses is treated the same way. A link with a user name or password (even an
+  empty one) is refused as `unsupported_attachment`, not returned with them stripped.
 
 A staged copy is at most 20 MiB. It is written under a new random key in a private S3
 bucket and served with a presigned link that lasts at most five minutes, always as a file

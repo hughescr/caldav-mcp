@@ -4,9 +4,10 @@
  *
  * - inline: VALUE=BINARY;ENCODING=BASE64 that passed the structural pre-scan: decoded and staged.
  * - managed: MANAGED-ID with a URL the reviewed managed policy approves: fetched anonymously and staged.
- * - external: any other http(s) URL, including a MANAGED-ID URL the policy refuses. Never fetched (no SSRF): the link
- *   itself is returned, marked as not fetched by the server.
- * - unsupported: duplicate or conflicting structural parameters, invalid base64, or no usable http(s) URL.
+ * - external: any other http(s) URL without userinfo, including a MANAGED-ID URL the policy refuses. Never fetched (no
+ *   SSRF): the link itself is returned, marked as not fetched by the server.
+ * - unsupported: duplicate or conflicting structural parameters, invalid base64, a URL with userinfo, or no usable
+ *   http(s) URL.
  */
 import { checkManagedAttachmentUrl, MANAGED_ATTACHMENT_POLICY, type ManagedAttachmentPolicy } from '../caldav/managed-attachment-policy';
 import { MAX_DOWNLOAD_BYTES } from './limits';
@@ -23,12 +24,17 @@ export type AttachmentAccess =
 
 // oxlint-disable-next-line no-control-regex -- matching control characters is the point
 const UNSAFE_RAW = /[\u0000- \u007F]/u;
+/** The raw authority of an http(s) URL; the URL parser treats backslashes as slashes there. */
+const RAW_AUTHORITY = /^[A-Za-z][A-Za-z0-9+.-]*:[/\\]*([^/\\?#]*)/u;
 
 function externalLink(text: string | null): AttachmentAccess {
     if (text === null || text === '' || text.length > EXTERNAL_URL_MAX || UNSAFE_RAW.test(text)) { return { kind: 'unsupported' }; }
     let url: URL;
     try { url = new URL(text); } catch { return { kind: 'unsupported' }; }
     if ((url.protocol !== 'https:' && url.protocol !== 'http:') || url.href.length > EXTERNAL_URL_MAX) { return { kind: 'unsupported' }; }
+    // A link with userinfo is refused, not stripped: it may carry a credential, and a stripped link is not what the event says.
+    // The raw check also catches an empty userinfo (`https://@host/`), which the parser drops silently.
+    if (url.username !== '' || url.password !== '' || (RAW_AUTHORITY.exec(text)?.[1] ?? '').includes('@')) { return { kind: 'unsupported' }; }
     return { kind: 'external', url: url.href };
 }
 

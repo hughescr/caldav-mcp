@@ -30,8 +30,24 @@ export interface StagedObject {
 export interface DownloadStore {
     /** Writes one private object. Rejects on any failure. */
     putObject(object: StagedObject, signal: AbortSignal): Promise<void>;
-    /** A presigned GET for the key, valid for at most maxTtlSeconds. */
-    presignGet(key: string, maxTtlSeconds: number): Promise<{ url: string; expiresAt: Date }>;
+    /** A presigned GET for the key, valid for at most maxTtlSeconds. Rejects once the signal has aborted. */
+    presignGet(key: string, maxTtlSeconds: number, signal: AbortSignal): Promise<{ url: string; expiresAt: Date }>;
+}
+
+/** Rejects when the signal aborts. The listener is removed once `work` settles. */
+export async function untilAborted<T>(work: Promise<T>, signal: AbortSignal): Promise<T> {
+    if (signal.aborted) {
+        work.catch(() => undefined);
+        throw new DownloadStageError('temporarily_unavailable');
+    }
+    let onAbort: (() => void) | undefined;
+    const abort = new Promise<never>((_resolve, reject) => {
+        onAbort = () => reject(new DownloadStageError('temporarily_unavailable'));
+        signal.addEventListener('abort', onAbort, { once: true });
+    });
+    // The losing side must never surface as an unhandled rejection.
+    work.catch(() => undefined);
+    try { return await Promise.race([work, abort]); } finally { if (onAbort !== undefined) { signal.removeEventListener('abort', onAbort); } }
 }
 
 export class DownloadStageError extends Error {
@@ -126,7 +142,14 @@ function wholeSecondsUtc(date: Date): string {
     return date.toISOString().replace(/\.\d{3}Z$/u, 'Z');
 }
 
-/** Writes one private object and presigns a short-lived GET for it. Never logs or returns the key. */
+/** Characters a presigned S3 URL is made of (RFC 3986 unreserved, reserved and `%`); none needs escaping in JSON. */
+const PRESIGNED_URL_RE = /^https:\/\/[A-Za-z0-9\-._~:/?#[\]@!$&'()*+,;=%]+$/u;
+
+/**
+ * Writes one private object and presigns a short-lived GET for it. Never logs or returns the key. The signal bounds the
+ * whole of it, signing included: a store call still pending at the deadline is abandoned, and nothing that finishes
+ * after the deadline counts as a success.
+ */
 export async function stageDownload(store: DownloadStore, request: StageRequest, signal: AbortSignal, now: () => number = Date.now): Promise<StagedDownload> {
     const filename = downloadFilename(request.filename, request.url);
     const contentType = safeContentType(request.declaredContentType);
@@ -134,16 +157,20 @@ export async function stageDownload(store: DownloadStore, request: StageRequest,
     if (signal.aborted) { throw new DownloadStageError('temporarily_unavailable'); }
     let signed: { url: string; expiresAt: Date };
     try {
-        await store.putObject({ key, body: request.bytes, contentType, contentDisposition: contentDisposition(filename) }, signal);
-        if (signal.aborted) { throw new DownloadStageError('temporarily_unavailable'); }
-        signed = await store.presignGet(key, DOWNLOAD_URL_TTL_SECONDS);
+        signed = await untilAborted((async () => {
+            await store.putObject({ key, body: request.bytes, contentType, contentDisposition: contentDisposition(filename) }, signal);
+            if (signal.aborted) { throw new DownloadStageError('temporarily_unavailable'); }
+            return store.presignGet(key, DOWNLOAD_URL_TTL_SECONDS, signal);
+        })(), signal);
     } catch {
         // Store errors can carry AWS request details; only the fixed code leaves this function.
         throw new DownloadStageError('temporarily_unavailable');
     }
+    // A signer can answer in the same turn as the deadline passes; that answer is too late.
+    if (signal.aborted) { throw new DownloadStageError('temporarily_unavailable'); }
     const expiry = Math.floor(signed.expiresAt.getTime() / 1000) * 1000;
     const start = now();
-    if (typeof signed.url !== 'string' || !signed.url.startsWith('https://') || signed.url.length > URL_MAX
+    if (typeof signed.url !== 'string' || signed.url.length > URL_MAX || !PRESIGNED_URL_RE.test(signed.url)
         || !Number.isFinite(expiry) || expiry <= start || expiry > start + (DOWNLOAD_URL_TTL_SECONDS + 1) * 1000) {
         throw new DownloadStageError('verification_failed');
     }

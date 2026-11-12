@@ -208,6 +208,19 @@ describe('get_event_attachment_download end to end over the fake backend', () =>
         expect(g.store?.objects.size).toBe(0);
     });
 
+    test('only an attachment over 20 MiB carries the attachment_size detail; an oversized calendar read does not', async () => {
+        const detailOf = async (promise: Promise<unknown>): Promise<[string, unknown]> => {
+            try { await promise; return ['resolved', undefined]; } catch (error) { return [(error as { code: string }).code, (error as { detail?: unknown }).detail]; }
+        };
+        const f = setup();
+        expect(await detailOf(f.download(await f.refOf('oversize')))).toEqual(['result_too_large', 'attachment_size']);
+        const g = setup({ responses: [new Response(new Uint8Array(MAX_DOWNLOAD_BYTES + 1))] });
+        expect(await detailOf(g.download(await g.refOf('unsized')))).toEqual(['result_too_large', 'attachment_size']);
+        const ref = await f.refOf('inline');
+        f.backend.scriptMultiget(calendarId, new CalDavError('too_large'));
+        expect(await detailOf(f.service.get_event_attachment_download({ calendar_id: calendarId, resource_href: href, attachment_ref: ref }))).toEqual(['result_too_large', undefined]);
+    });
+
     test('a body longer than SIZE, or inline bytes longer than SIZE, fail verification', async () => {
         const f = setup({ responses: [new Response('x'.repeat(33))] });
         expect(await codeOf(f.download(await f.refOf('managed')))).toBe('verification_failed');
@@ -220,6 +233,17 @@ describe('get_event_attachment_download end to end over the fake backend', () =>
         expect(await codeOf(f.download(await f.refOf('managed')))).toBe('upstream_error');
         expect(f.sent).toHaveLength(1);
         expect(f.store?.objects.size).toBe(0);
+    });
+
+    test('an opaqueredirect or status 0 answer is refused and stages nothing', async () => {
+        const reshape = (type: ResponseType, status: number) => (): Response => Object.defineProperties(new Response('upstream body canary'), { type: { value: type }, status: { value: status } });
+        for (const answer of [reshape('opaqueredirect', 0), reshape('basic', 0), () => Response.error()]) {
+            const f = setup({ responses: [answer] });
+            expect(await codeOf(f.download(await f.refOf('managed')))).toBe('upstream_error');
+            expect(f.sent).toHaveLength(1);
+            expect(f.store?.objects.size).toBe(0);
+            expect(f.store?.signed).toHaveLength(0);
+        }
     });
 
     test('upstream errors map to fixed codes and stage nothing', async () => {
@@ -291,6 +315,20 @@ describe('get_event_attachment_download end to end over the fake backend', () =>
         expect(performance.now() - started).toBeGreaterThanOrEqual(200);
         expect(performance.now() - started).toBeLessThan(3000);
         expect(f.store?.objects.size).toBe(0);
+    });
+
+    test('presigning is bounded by the download deadline: a signer that never answers ends as temporarily_unavailable', async () => {
+        const store = new FakeDownloadStore();
+        store.presignGet = () => new Promise(() => {});
+        const f = setup({ store });
+        const ref = await f.refOf('inline');
+        f.backend.scriptMultiget(calendarId, [{ kind: 'found', resource: resource() }]);
+        // 3 s Lambda reserve + 250 ms of work time for staging.
+        const started = performance.now();
+        const code = await codeOf(withRequestBudget(() => 3250, () => f.service.get_event_attachment_download({ calendar_id: calendarId, resource_href: href, attachment_ref: ref })));
+        expect(code).toBe('temporarily_unavailable');
+        expect(store.objects.size).toBe(1);
+        expect(performance.now() - started).toBeLessThan(3000);
     });
 
     test('through MCP: a staged copy comes back as structured data plus one resource_link', async () => {

@@ -62,7 +62,7 @@ export async function getAttachmentDownload(deps: DownloadDeps, input: DownloadA
             filename: displayText(descriptor.filename, FILENAME_MAX), content_type: displayText(descriptor.contentType, MIME_MAX),
         };
     }
-    if (access.kind === 'managed' && descriptor.declaredSize !== null && descriptor.declaredSize > MAX_DOWNLOAD_BYTES) { throw new ReadError('result_too_large'); }
+    if (access.kind === 'managed' && descriptor.declaredSize !== null && descriptor.declaredSize > MAX_DOWNLOAD_BYTES) { throw new ReadError('result_too_large', 'attachment_size'); }
     // Checked before any fetch: without a bucket there is nowhere to stage, so nothing is fetched.
     const { store } = deps;
     if (store === undefined) { throw new ReadError('temporarily_unavailable'); }
@@ -71,7 +71,7 @@ export async function getAttachmentDownload(deps: DownloadDeps, input: DownloadA
     if (access.kind === 'inline') {
         // The pre-scan accepted only canonical base64, so this decoding is exact; the 2 MiB resource cap bounds it.
         bytes = new Uint8Array(Buffer.from(access.base64, 'base64'));
-        if (bytes.byteLength > MAX_DOWNLOAD_BYTES) { throw new ReadError('result_too_large'); }
+        if (bytes.byteLength > MAX_DOWNLOAD_BYTES) { throw new ReadError('result_too_large', 'attachment_size'); }
         // SIZE is an upper bound, never trusted as exact.
         if (descriptor.declaredSize !== null && bytes.byteLength > descriptor.declaredSize) { throw new ReadError('verification_failed'); }
     } else {
@@ -83,7 +83,7 @@ export async function getAttachmentDownload(deps: DownloadDeps, input: DownloadA
                 credentials: () => deps.auth,
             });
         } catch (error) {
-            if (error instanceof AttachmentFetchError) { throw new ReadError(FETCH_CODES[error.code]); }
+            if (error instanceof AttachmentFetchError) { throw error.code === 'too_large' ? new ReadError('result_too_large', 'attachment_size') : new ReadError(FETCH_CODES[error.code]); }
             if (error instanceof ReadError) { throw error; }
             throw new ReadError('temporarily_unavailable');
         }

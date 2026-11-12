@@ -16,7 +16,8 @@ export class FakeDownloadStore implements DownloadStore {
         this.objects.set(object.key, { ...object, body: object.body.slice() });
     }
 
-    async presignGet(key: string, maxTtlSeconds: number): Promise<{ url: string; expiresAt: Date }> {
+    async presignGet(key: string, maxTtlSeconds: number, signal: AbortSignal): Promise<{ url: string; expiresAt: Date }> {
+        if (signal.aborted) { throw new Error('aborted'); }
         if (this.signError !== null) { throw this.signError; }
         this.signed.push({ key, maxTtlSeconds });
         const seconds = this.grantSeconds ?? maxTtlSeconds;

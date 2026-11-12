@@ -57,16 +57,21 @@ function aborted(signal: AbortSignal): Promise<never> {
     });
 }
 
+const INITIAL_BODY_CAPACITY = 64 * 1024;
+
 /**
- * Reads a body into memory, charging the cap before each chunk is kept. Stops and cancels the source as soon as the cap
- * is crossed or the signal aborts; never holds more than the cap.
+ * Reads a body into one buffer, charging the cap before each chunk is copied in. Stops and cancels the source as soon as
+ * the cap is crossed or the signal aborts. The buffer starts at `expectedBytes` (a validated Content-Length) when given,
+ * else 64 KiB, and doubles up to the cap; it never grows past the cap. Peak memory is the final buffer plus the one it
+ * replaced and the chunk being copied: at most about 1.5 times the cap (30 MiB for 20 MiB), and only the cap once the
+ * last growth step is collected. A body whose Content-Length is right needs no growth at all.
  */
-export async function readCappedBody(body: ReadableStream<Uint8Array> | null, limit: ByteLimit, signal: AbortSignal): Promise<Uint8Array> {
+export async function readCappedBody(body: ReadableStream<Uint8Array> | null, limit: ByteLimit, signal: AbortSignal, expectedBytes: number | null = null): Promise<Uint8Array> {
     if (body === null) { return new Uint8Array(0); }
     const reader = body.getReader();
     const abort = aborted(signal);
     abort.catch(() => undefined);
-    const chunks: Uint8Array[] = [];
+    let buffer = new Uint8Array(Math.min(limit.maxBytes, expectedBytes ?? INITIAL_BODY_CAPACITY));
     let total = 0;
     let empty = 0;
     try {
@@ -77,9 +82,15 @@ export async function readCappedBody(body: ReadableStream<Uint8Array> | null, li
             if (!(chunk instanceof Uint8Array)) { throw new AttachmentFetchError('upstream'); }
             // Synchronously produced empty chunks never grow the total and would starve the deadline timer.
             if (chunk.byteLength === 0 && ++empty > MAX_EMPTY_STREAM_CHUNKS) { throw new AttachmentFetchError('upstream'); }
-            total += chunk.byteLength;
-            if (total > limit.maxBytes) { throw new AttachmentFetchError(limit.overflow); }
-            chunks.push(chunk);
+            const needed = total + chunk.byteLength;
+            if (needed > limit.maxBytes) { throw new AttachmentFetchError(limit.overflow); }
+            if (needed > buffer.byteLength) {
+                const grown = new Uint8Array(Math.min(limit.maxBytes, Math.max(needed, buffer.byteLength * 2)));
+                grown.set(buffer.subarray(0, total));
+                buffer = grown;
+            }
+            buffer.set(chunk, total);
+            total = needed;
         }
     } catch (error) {
         reader.cancel().catch(() => undefined);
@@ -87,13 +98,7 @@ export async function readCappedBody(body: ReadableStream<Uint8Array> | null, li
     } finally {
         reader.releaseLock();
     }
-    const bytes = new Uint8Array(total);
-    let offset = 0;
-    for (const chunk of chunks) {
-        bytes.set(chunk, offset);
-        offset += chunk.byteLength;
-    }
-    return bytes;
+    return buffer.subarray(0, total);
 }
 
 export interface ManagedFetchRequest {
@@ -187,7 +192,7 @@ export function createManagedAttachmentFetcher(options: ManagedFetcherOptions = 
                 throw new AttachmentFetchError(declaredLength > MAX_DOWNLOAD_BYTES ? 'too_large' : limit.overflow);
             }
         }
-        const bytes = await readCappedBody(response.body, limit, signal);
+        const bytes = await readCappedBody(response.body, limit, signal, declaredLength);
         if (declaredLength !== null && bytes.byteLength !== declaredLength) { throw new AttachmentFetchError('verification'); }
         return bytes;
     };
