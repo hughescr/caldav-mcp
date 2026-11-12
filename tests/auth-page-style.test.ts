@@ -4,6 +4,10 @@ import { TemporaryUnavailable } from '../src/auth/contracts';
 import { PAGE_STYLE, PAGE_STYLE_SOURCE } from '../src/auth/page-style';
 import { setup, start, submit, type Env } from './helpers/http-env';
 
+const APPLE_HELP_URL = 'https://support.apple.com/102654';
+/** The one allowed outbound link: a fixed constant, a new tab, no opener, no referrer. */
+const HELP_LINK = /<a [^>]*>How do I generate an app-specific password\?<\/a>/;
+
 let spies: Mock<(...args: unknown[]) => void>[] = [];
 beforeEach(() => {
     spies = (['log', 'info', 'warn', 'error', 'debug'] as const).map(method => spyOn(console, method).mockImplementation(() => {}));
@@ -57,9 +61,11 @@ describe('page style and its Content-Security-Policy hash', () => {
             const html = await response.text();
             const markup = html.replace(/<style>[^]*?<\/style>/, '');
             expect(markup, kind).not.toMatch(/\sstyle\s*=/i);
-            expect(html, kind).not.toMatch(/<script|<link|<img|<iframe|<object|<embed|<svg|<base|\ssrc\s*=|\shref\s*=|javascript:|\son[a-z]+\s*=/i);
+            // The only reference a page may carry is the one fixed help link, and only on the form (see the next test).
+            const unlinked = html.replace(HELP_LINK, '');
+            expect(unlinked, kind).not.toMatch(/<script|<link|<img|<iframe|<object|<embed|<svg|<base|\ssrc\s*=|\shref\s*=|javascript:|\son[a-z]+\s*=/i);
             // Hidden OAuth parameters legitimately hold URLs as values; nothing else may name one.
-            expect(html.replace(/ value="[^"]*"/g, ''), kind).not.toMatch(/https?:\/\/|\/\/[a-z]/i);
+            expect(unlinked.replace(/ value="[^"]*"/g, ''), kind).not.toMatch(/https?:\/\/|\/\/[a-z]/i);
             expect(html, kind).not.toMatch(/url\(|@import|@font-face/i);
         }
     });
@@ -80,5 +86,25 @@ describe('page style and its Content-Security-Policy hash', () => {
         expect(invite.match(/type="checkbox"/g)).toHaveLength(1);
         expect(invite).toContain('<em>Sensitive</em>');
         expect(plain).not.toContain('<em>Sensitive</em>');
+    });
+
+    test('only the sign-in form carries the app-specific password help link, and it is outside every label', async () => {
+        const all = await pages();
+        for (const [kind, response] of Object.entries(all)) {
+            const html = await response.text();
+            const anchors = html.match(/<a[\s>]/g) ?? [];
+            if (!kind.startsWith('form')) { expect(anchors, kind).toHaveLength(0); continue; }
+            expect(anchors, kind).toHaveLength(1);
+            expect(html.match(/\shref\s*=/g), kind).toHaveLength(1);
+            const link = HELP_LINK.exec(html)?.[0] ?? '';
+            expect(link, kind).toBe(`<a class="aside" href="${APPLE_HELP_URL}" target="_blank" rel="noopener noreferrer" referrerpolicy="no-referrer">How do I generate an app-specific password?</a>`);
+            // Not a descendant of any <label>: clicking it must not focus a field.
+            for (const label of html.matchAll(/<label\b[^]*?<\/label>/g)) { expect(label[0], kind).not.toContain('<a '); }
+            expect(html.match(/<\/?label\b/g)?.length, kind).toBe(2 * (html.match(/<label\b/g)?.length ?? 0));
+            // DOM order is Apple ID, password, link: tabbing out of the password field reaches the link last.
+            expect(html.indexOf('id="apple"'), kind).toBeLessThan(html.indexOf('id="password"'));
+            expect(html.indexOf('id="password"'), kind).toBeLessThan(html.indexOf(link));
+            expect(html, kind).toContain('<label for="password">App-specific password</label>');
+        }
     });
 });

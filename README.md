@@ -70,7 +70,7 @@ A short query can miss an occurrence that was moved more than 31 days away from 
 
 ## Account connection
 
-A client discovers this server's own OAuth endpoints and opens one page at `/authorize`. That page shows the client name, the client's redirect host, the scopes requested as a read-only list, and two fields: Apple ID and app-specific password. It is styled by one built-in stylesheet that the page's Content-Security-Policy allows by hash; the page loads no scripts or outside resources. There is no second consent page and no TOTP step. The form posts to `/auth/connect`.
+A client discovers this server's own OAuth endpoints and opens one page at `/authorize`. That page shows the client name, the client's redirect host, the scopes requested as a read-only list, and two fields: Apple ID and app-specific password. It is styled by one built-in stylesheet that the page's Content-Security-Policy allows by hash; the page loads no scripts or outside resources. Its one outbound link, beside the password label, opens Apple's article on creating an app-specific password (`https://support.apple.com/102654`) in a new tab without sending a referrer. There is no second consent page and no TOTP step. The form posts to `/auth/connect`.
 
 Use an app-specific password that you create only for this connector. Apple lets you revoke each one on its own.
 

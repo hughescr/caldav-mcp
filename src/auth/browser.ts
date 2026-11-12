@@ -19,7 +19,9 @@ const SCOPE_TEXT: Record<string, string> = {
     'calendar:write': 'Create, change and delete events',
     'calendar:invite': 'Save events with attendees, which can send invitations from your Apple Account',
 };
-const FAILED = 'Sign-in failed. Check the Apple ID and app-specific password, then start the connection again.';
+/** Apple's article on what app-specific passwords are and how to create one. A fixed constant: never built from request data. */
+const APPLE_HELP_URL = 'https://support.apple.com/102654';
+const FAILED ='Sign-in failed. Check the Apple ID and app-specific password, then start the connection again.';
 const THROTTLED = 'Too many failed sign-in attempts for this Apple ID. Wait 15 minutes, then start the connection again.';
 const UNAVAILABLE = 'iCloud sign-in is temporarily unavailable. Try again later.';
 function cookie(context: Context, runtime: AuthRuntime, flow?: Flow) {
@@ -61,8 +63,9 @@ function render(context: Context, runtime: AuthRuntime, auth: Authorization, flo
         `<form method="post" action="/auth/connect">${hidden}`,
         '<section class="section"><h2>Sign in to iCloud</h2>',
         '<label class="field" for="apple">Apple ID <input id="apple" name="apple_id" type="email" autocomplete="username" autocapitalize="none" spellcheck="false" maxlength="255" required></label>',
-        '<label class="field" for="password">App-specific password <input id="password" name="app_password" type="password" autocomplete="off" autocapitalize="none" spellcheck="false" maxlength="256" aria-describedby="password-help" required></label>',
-        '<p id="password-help" class="help">Create one at account.apple.com → Sign-In and Security → App-Specific Passwords, only for this connector. Never use your main Apple Account password.</p></section>',
+        // The help link sits after the input in the DOM so tabbing from the field never detours through it; CSS order puts it in the label row. It is outside the label so clicking it cannot focus the field.
+        `<div class="field row"><label for="password">App-specific password</label><input id="password" name="app_password" type="password" autocomplete="off" autocapitalize="none" spellcheck="false" maxlength="256" aria-describedby="password-help" required><a class="aside" href="${APPLE_HELP_URL}" target="_blank" rel="noopener noreferrer" referrerpolicy="no-referrer">How do I generate an app-specific password?</a></div>`,
+        '<p id="password-help" class="help">Use one made only for this connector. Never use your main Apple Account password.</p></section>',
         `<section class="permissions"><h2>Requested permissions</h2><div class="rows"><ul>${scopes}</ul>${invite}</div></section>`,
         '<p class="help">Keep this connection for up to 180 days. iCloud may require reconnection sooner, for example if the app-specific password is revoked.</p>',
         '<p class="privacy">Your password is stored encrypted and used only to talk to iCloud.</p>',
