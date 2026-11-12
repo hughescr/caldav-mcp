@@ -3,7 +3,7 @@ import { CLIENT_CAPABILITIES_META_KEY, CLIENT_INFO_META_KEY, PROTOCOL_VERSION_ME
 import { handleMcp, insufficientScopeMessage, missingScopes } from '../src/mcp';
 import { createApp } from '../src/app';
 import { bindCalendarService, CalendarError, type BoundCalendarService } from '../src/calendar/service';
-import { MAX_CALENDARS } from '../src/calendar/schemas';
+import { MAX_CALENDARS, toolErrorCodeSchema } from '../src/calendar/schemas';
 import { CalDavError, type CalendarSummary } from '../src/caldav/contracts';
 import { UnreadableCredentials, type UpstreamCredentials } from '../src/auth/contracts';
 import { currentRequestId } from '../src/request-id';
@@ -292,10 +292,10 @@ test('raw text descriptions advertise the 16 KiB prefix and truncation flag', as
     }
 });
 
-test('auth design lists every current read-tool error code', async () => {
+test('auth design lists every current tool error code, read and write', async () => {
     const text = await Bun.file(new URL('../docs/auth-design.md', import.meta.url)).text();
     const paragraph = text.split('\n').find(line => line.includes('Errors are structured')) ?? '';
-    for (const code of readToolErrorCodeSchema.options) { expect(paragraph).toContain(`\`${code}\``); }
+    for (const code of toolErrorCodeSchema.options) { expect(paragraph).toContain(`\`${code}\``); }
 });
 
 test('calendar data is returned as structured untrusted data', async () => {
