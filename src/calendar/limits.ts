@@ -60,6 +60,8 @@ export const DAV_REQUEST_MS = 10_000;
 export const DAV_LAMBDA_RESERVE_MS = 2000;
 export const MIN_CALENDAR_START_MS = 12_000;
 export const DOWNLOAD_CALL_MS = 30_000;
+/** Whole-call budget of a write tool (design 5.6): listing, multiget, the write and one re-read, 10 s each at most. */
+export const WRITE_CALL_MS = 40_000;
 export const CLEANUP_ABORT_MS = 1000;
 /** Yield to the event loop after this many normalized components. */
 export const YIELD_EVERY_COMPONENTS = 32;

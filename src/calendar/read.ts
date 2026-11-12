@@ -104,8 +104,11 @@ function isUnauthorized(error: unknown): boolean {
     return error instanceof CalDavError && error.code === 'unauthorized';
 }
 
+/** Reports a 401 once per invocation and lets the caller wait for the report to be recorded. */
+export interface UnauthorizedReporter { report(): void; settled(): Promise<void> }
+
 /** The single 401 reporter for one invocation: the callback runs at most once and its failure never changes the result. */
-function unauthorizedReporter(deps: ReadDeps): { report(): void; settled(): Promise<void> } {
+function unauthorizedReporter(deps: ReadDeps): UnauthorizedReporter {
     let pending: Promise<void> | null = null;
     return {
         report: () => {
@@ -142,7 +145,8 @@ async function readMembership(deps: ReadDeps, reporter: { report(): void; settle
     return members;
 }
 
-function calendarStatus(calendarId: string, summary: CalendarSummary | undefined, status: CalendarStatusCode): CalendarStatus {
+/** One calendar's public status, its untrusted display name sanitized and capped. */
+export function calendarStatus(calendarId: string, summary: CalendarSummary | undefined, status: CalendarStatusCode): CalendarStatus {
     const name = summary?.displayName ?? null;
     const display = name === null ? null : sanitizeDisplayText(name, DISPLAY_NAME_MAX);
     return {
@@ -455,26 +459,55 @@ export function detailTarget(calendarId: string, href: string, tokenText: string
     return token;
 }
 
+// ---- Seams shared with the write path (src/calendar/write.ts) ----
+
+/** One complete membership listing for an invocation, with that invocation's 401 reporter. Throws ReadError. */
+export async function readCalendarMembership(deps: ReadDeps): Promise<{ members: Map<string, CalendarSummary>; reporter: UnauthorizedReporter }> {
+    const reporter = unauthorizedReporter(deps);
+    return { members: await readMembership(deps, reporter), reporter };
+}
+
+/**
+ * One calendar-multiget of one original, validated like get_event's: the same href back, a strong ETag and text data.
+ * Null when iCloud reports the href absent. Throws ReadError.
+ */
+export async function readStoredResource(deps: ReadDeps, reporter: UnauthorizedReporter, calendarId: string, href: string): Promise<CalendarResource | null> {
+    const lookups = await detailRequest(reporter, () => deps.backend.multigetEvents(deps.auth, deps.discovery, { calendarId, hrefs: [href] }, callOptions(deps.budget, MAX_REPORT_BYTES)));
+    const [lookup, ...extra] = lookups;
+    if (lookup === undefined || extra.length > 0) { throw new ReadError('upstream_error'); }
+    if (lookup.kind === 'not_found') {
+        if (lookup.href !== href) { throw new ReadError('upstream_error'); }
+        return null;
+    }
+    const found = lookup.resource;
+    if (found.href !== href || !validEtag(found.etag) || typeof found.calendarData !== 'string') { throw new ReadError('upstream_error'); }
+    return found;
+}
+
+/**
+ * The get_event view of a parsed original without an occurrence token: the master or single event, or the sole stored
+ * occurrence of a detached resource. Throws ReadError (several detached occurrences need a token; a UID over the cap).
+ */
+export function originalEventView(calendarId: string, summary: CalendarSummary, resource: CalendarResource, original: OriginalResource): { calendars: [CalendarStatus]; event: FullEvent } {
+    const selected = nullTokenComponent(original);
+    return {
+        calendars: [calendarStatus(calendarId, summary, 'ok')],
+        event: fullEvent(selected.component, { calendar: 0, resourceHref: resource.href, etag: resource.etag, recurring: selected.recurring, calendarId, view: selected.view }),
+    };
+}
+
 /**
  * Membership, then one original multiget of the resource, then the optional expected_version check, then parse and the
  * attachment index. Shared by get_event and the download tool, so both authorize against current data the same way.
  */
 export async function readOriginal(deps: ReadDeps, calendarId: string, href: string, expectedVersion: string | undefined): Promise<OriginalRead> {
     const { budget } = deps;
-    const reporter = unauthorizedReporter(deps);
-    const members = await readMembership(deps, reporter);
+    const { members, reporter } = await readCalendarMembership(deps);
     const summary = members.get(calendarId);
     if (summary === undefined) { throw new ReadError('not_found'); }
 
-    const lookups = await detailRequest(reporter, () => deps.backend.multigetEvents(deps.auth, deps.discovery, { calendarId, hrefs: [href] }, callOptions(budget, MAX_REPORT_BYTES)));
-    const [lookup, ...extra] = lookups;
-    if (lookup === undefined || extra.length > 0) { throw new ReadError('upstream_error'); }
-    if (lookup.kind === 'not_found') {
-        if (lookup.href !== href) { throw new ReadError('upstream_error'); }
-        throw new ReadError('not_found');
-    }
-    const found = lookup.resource;
-    if (found.href !== href || !validEtag(found.etag) || typeof found.calendarData !== 'string') { throw new ReadError('upstream_error'); }
+    const found = await readStoredResource(deps, reporter, calendarId, href);
+    if (found === null) { throw new ReadError('not_found'); }
     if (expectedVersion !== undefined && expectedVersion !== found.etag) { throw new ReadError('calendar_changed'); }
 
     try {
