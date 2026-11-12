@@ -180,6 +180,23 @@ describe('create_event', () => {
         }
     });
 
+    test('uncertain send, create applied but rewritten by iCloud, or applied and then changed by another client: outcome_unknown', async () => {
+        const rewritten = harness();
+        rewritten.fake.rewrite = { tzid: 'Australia/Lord_Howe', to: local => ({ '20261215T100000': '20261215T233000', '20261215T110000': '20261216T003000' } as Record<string, string>)[local] ?? local };
+        rewritten.fake.failNextWrite({ kind: 'uncertain', apply: true });
+        expect(await failure(() => create(rewritten, { ...BASE_CREATE, start: { local: '2026-12-15T10:00', zone: 'Australia/Lord_Howe' }, end: { local: '2026-12-15T11:00', zone: 'Australia/Lord_Howe' } }))).toEqual({ code: 'outcome_unknown' });
+        expect<unknown>([rewritten.fake.count('putEvent'), rewritten.fake.hrefs(WORK).length]).toEqual([1, 1]);
+        const overwritten = harness();
+        const put = overwritten.fake.putEvent.bind(overwritten.fake);
+        overwritten.fake.putEvent = async (...args) => {
+            await put(...args);
+            overwritten.fake.externalEdit(WORK, `${WORK}${uidFor(BASE_CREATE.operation_id)}.ics`, text => text.replace('SUMMARY:Planning', 'SUMMARY:Theirs'));
+            return { kind: 'uncertain' };
+        };
+        expect(await failure(() => create(overwritten, BASE_CREATE))).toEqual({ code: 'outcome_unknown' });
+        expect(overwritten.fake.count('putEvent')).toBe(1);
+    });
+
     test('a 2xx whose read-back fails is still applied; the ETag comes from a strong header only, never invented', async () => {
         const h = harness();
         h.fake.failNextRead(new CalDavError('temporary'));
@@ -436,7 +453,7 @@ describe('update_event', () => {
         expect(await failure(() => update(gone, { calendar_id: WORK, resource_href: SINGLE_HREF, expected_version: goneEtag, changes: { title: 'Mine' } }))).toEqual({ code: 'not_found' });
     });
 
-    test('lost answers: saved → desired_state_present; not saved → outcome_unknown; not saved but changed by someone → calendar_changed', async () => {
+    test('lost answers: saved → desired_state_present; not saved → outcome_unknown; changed by someone after an uncertain send → still outcome_unknown', async () => {
         const saved = harness();
         const etag = saved.fake.seed(WORK, SINGLE_HREF, SINGLE);
         saved.fake.failNextWrite({ kind: 'uncertain', apply: true });
@@ -447,17 +464,52 @@ describe('update_event', () => {
         expect(await failure(() => update(lost, { calendar_id: WORK, resource_href: SINGLE_HREF, expected_version: lostEtag, changes: { title: 'Mine' } }))).toEqual({ code: 'outcome_unknown' });
         const raced = harness();
         const racedEtag = raced.fake.seed(WORK, SINGLE_HREF, SINGLE);
-        // No usable answer, and meanwhile someone else changed the event: the ETag moved without the requested values.
+        // No usable answer, and meanwhile someone else changed the event: the ETag moved without the requested values. That does
+        // not prove our PUT was refused (it may have been applied first and then overwritten), so the outcome stays unknown.
         raced.fake.putEvent = async () => {
             raced.fake.externalEdit(WORK, SINGLE_HREF, text => text.replace('SEQUENCE:3', 'SEQUENCE:9'));
             return { kind: 'uncertain' };
         };
-        expect(await failure(() => update(raced, { calendar_id: WORK, resource_href: SINGLE_HREF, expected_version: racedEtag, changes: { title: 'Mine' } }))).toEqual({ code: 'calendar_changed', reason: 'precondition_failed' });
+        expect(await failure(() => update(raced, { calendar_id: WORK, resource_href: SINGLE_HREF, expected_version: racedEtag, changes: { title: 'Mine' } }))).toEqual({ code: 'outcome_unknown' });
         const unknown = harness();
         const unknownEtag = unknown.fake.seed(WORK, SINGLE_HREF, SINGLE);
         unknown.fake.failNextWrite({ kind: 'status', status: 503, apply: false });
         expect(await failure(() => update(unknown, { calendar_id: WORK, resource_href: SINGLE_HREF, expected_version: unknownEtag, changes: { title: 'Mine' } }))).toEqual({ code: 'outcome_unknown' });
         expect(unknown.fake.count('putEvent')).toBe(1);
+    });
+
+    test('uncertain send, PUT applied but iCloud rewrote the values (the Lord_Howe case): outcome_unknown, never calendar_changed; one PUT', async () => {
+        const h = harness();
+        const etag = h.fake.seed(WORK, SINGLE_HREF, SINGLE);
+        h.fake.rewrite = { tzid: 'Australia/Lord_Howe', to: local => ({ '20270115T100000': '20270115T233000', '20270115T110000': '20270116T003000' } as Record<string, string>)[local] ?? local };
+        h.fake.failNextWrite({ kind: 'uncertain', apply: true });
+        const request = { calendar_id: WORK, resource_href: SINGLE_HREF, expected_version: etag, changes: { start: { local: '2027-01-15T10:00', zone: 'Australia/Lord_Howe' }, end: { local: '2027-01-15T11:00', zone: 'Australia/Lord_Howe' } } };
+        expect(await failure(() => update(h, request))).toEqual({ code: 'outcome_unknown' });
+        // The write did land: the ETag moved and the stored time is iCloud's rewrite.
+        expect<unknown>([h.fake.count('putEvent'), h.fake.get(WORK, SINGLE_HREF)?.etag === etag, h.fake.get(WORK, SINGLE_HREF)?.text.includes('20270115T233000')]).toEqual([1, false, true]);
+    });
+
+    test('uncertain send, PUT applied and then overwritten by another client before the re-read: outcome_unknown', async () => {
+        for (const fault of [{ kind: 'uncertain' as const }, { kind: 'status' as const, status: 503 }, { kind: 'status' as const, status: 202 }]) {
+            const h = harness();
+            const etag = h.fake.seed(WORK, SINGLE_HREF, SINGLE);
+            const put = h.fake.putEvent.bind(h.fake);
+            h.fake.putEvent = async (...args) => {
+                await put(...args);
+                h.fake.externalEdit(WORK, SINGLE_HREF, text => text.replace('SUMMARY:Mine', 'SUMMARY:Theirs'));
+                return fault.kind === 'uncertain' ? { kind: 'uncertain' } : { kind: 'status', status: fault.status, etag: null, upstream: { status: fault.status, content_type: 'none', preconditions: [], detail: null } };
+            };
+            expect<unknown>([fault, await failure(() => update(h, { calendar_id: WORK, resource_href: SINGLE_HREF, expected_version: etag, changes: { title: 'Mine' } }))]).toEqual([fault, { code: 'outcome_unknown' }]);
+            expect(h.fake.count('putEvent')).toBe(1);
+        }
+    });
+
+    test('a 412 is a definitive refusal: calendar_changed only when the re-read shows other values', async () => {
+        const h = harness();
+        const etag = h.fake.seed(WORK, SINGLE_HREF, SINGLE);
+        h.fake.failNextWrite({ kind: 'concurrent', change: fake => { fake.externalEdit(WORK, SINGLE_HREF, text => text.replace('SUMMARY:Dentist', 'SUMMARY:Theirs')); } });
+        expect(await failure(() => update(h, { calendar_id: WORK, resource_href: SINGLE_HREF, expected_version: etag, changes: { title: 'Mine' } }))).toEqual({ code: 'calendar_changed', reason: 'precondition_failed' });
+        expect<unknown>([h.fake.count('putEvent'), h.fake.get(WORK, SINGLE_HREF)?.text.includes('SUMMARY:Theirs')]).toEqual([1, true]);
     });
 
     test('a 2xx whose read-back fails is applied with readback unavailable', async () => {
@@ -567,6 +619,22 @@ describe('delete_event', () => {
             const run = () => remove(h, { calendar_id: WORK, resource_href: SINGLE_HREF, expected_version: etag });
             const outcome = typeof expected === 'string' ? (await run()).write_outcome : await failure(run);
             expect<unknown>([fault, outcome]).toEqual([fault, expected]);
+            expect(h.fake.count('deleteEvent')).toBe(1);
+        }
+    });
+
+    test('uncertain send and the event is still there, changed by another client: outcome_unknown, never calendar_changed', async () => {
+        for (const fault of [{ kind: 'uncertain', apply: false }, { kind: 'status', status: 503, apply: false }] as const) {
+            const h = harness();
+            const etag = h.fake.seed(WORK, SINGLE_HREF, SINGLE);
+            const send = h.fake.deleteEvent.bind(h.fake);
+            h.fake.failNextWrite(fault);
+            h.fake.deleteEvent = async (...args) => {
+                const answer = await send(...args);
+                h.fake.externalEdit(WORK, SINGLE_HREF, text => text.replace('SUMMARY:Dentist', 'SUMMARY:Theirs'));
+                return answer;
+            };
+            expect<unknown>([fault, await failure(() => remove(h, { calendar_id: WORK, resource_href: SINGLE_HREF, expected_version: etag }))]).toEqual([fault, { code: 'outcome_unknown' }]);
             expect(h.fake.count('deleteEvent')).toBe(1);
         }
     });

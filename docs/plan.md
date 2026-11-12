@@ -459,10 +459,13 @@ released (single-occurrence scopes and series moves are the next build).
   in any calendar of the account, is also refused (412), reported as `create_conflict`.
 - No write is ever repeated by the server. After a lost or unclear answer (a timeout, a
   network failure, a 5xx or a 202) the server reads the event once and compares it with the
-  request. It reports `desired_state_present` when the requested values are stored,
-  `calendar_changed` when the event changed in another way, and otherwise `outcome_unknown`;
-  an absent event or an unchanged ETag is never taken as proof that nothing was saved. A 2xx
-  is reported as applied even when the read-back fails.
+  request. It reports `desired_state_present` when the requested values are observed (which
+  says nothing about which call saved them), and otherwise `outcome_unknown`: an absent
+  event, an unchanged ETag or a changed one is never taken as proof that nothing was saved,
+  because iCloud may have saved the change and rewritten values (the `Australia/Lord_Howe`
+  case) or another client may have edited the event after it. Only a 412 is a definitive
+  refusal; then a stored event with other values is `calendar_changed`. A 2xx is reported as
+  applied even when the read-back fails.
 - Before every `PUT`, an independent check (`verifyCreateOutcome` or `verifyEditOutcome`)
   compares the text about to be sent with an expectation derived from the request; any
   difference, or any added `ATTENDEE`, `ORGANIZER`, `ATTACH` or non-display alarm, stops the

@@ -124,7 +124,7 @@ const guestFields = {
 
 export const writeEventResultSchema = z.strictObject({
     write_outcome: z.enum(['applied', 'desired_state_present'])
-        .describe('applied: this call saved the change. desired_state_present: the event already holds the requested values (for example a retry after a lost response); this call saved nothing and does not claim who did.'),
+        .describe('applied: iCloud accepted the save this call sent. desired_state_present: the requested state was observed in the calendar (the stored event holds the requested values, for example on a retry after a lost response); it does not say whether this call or an earlier one saved them.'),
     readback: z.enum(['ok', 'unavailable']).describe('ok: event is the stored event read back after the write. unavailable: the write outcome stands, but the event could not be read back or shown within the response limit; event is null. Use get_event to see it.'),
     calendar_id: pathSchema,
     resource_href: pathSchema,
@@ -148,7 +148,7 @@ export const writeEventResultSchema = z.strictObject({
 
 export const deleteEventResultSchema = z.strictObject({
     write_outcome: z.enum(['applied', 'desired_state_present'])
-        .describe('applied: this call deleted the event. desired_state_present: there is no event at this href (already deleted, for example a retry); nothing was sent.'),
+        .describe('applied: iCloud accepted the delete this call sent. desired_state_present: the requested state was observed in the calendar (no event at this href, for example on a retry); it does not say whether this call or an earlier one deleted it.'),
     deleted: z.literal('resource'),
     calendar_id: pathSchema,
     resource_href: pathSchema,

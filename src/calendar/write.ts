@@ -10,7 +10,8 @@
  * → ONE conditional request → classification. There is no server-side retry of a write, ever (ORCH B1): a 412 or an
  * uncertain answer is followed by one re-read and a comparison of the requested values with the stored raw text.
  * `write_outcome` is separate from the read-back (ORCH B2): a 2xx is `applied` even when the read-back fails, and after
- * a request was sent, absence or an unchanged ETag never proves that nothing was applied.
+ * a request was sent, absence or an unchanged ETag never proves that nothing was applied. Only a 412 is a definitive
+ * refusal (`calendar_changed`); after an uncertain answer, anything but the requested state observed is `outcome_unknown`.
  *
  * Identity of a create: UID and href derive from (account, operation_id), so a retry hits the same href and
  * `If-None-Match: *` makes it idempotent; no marker is stored in the event (ORCH B1).
@@ -648,12 +649,13 @@ export async function updateEvent(deps: WriteDeps, input: UpdateEventArgs): Prom
     }
     if (present && after.kind === 'found') { return eventResult(context, 'desired_state_present', after.resource, null); }
     if (answer === 'precondition') {
+        // A definitive refusal: this PUT saved nothing, and the re-read says what is stored instead.
         if (after.kind === 'absent') { throw new WriteError('not_found'); }
         if (after.kind === 'found') { throw new WriteError('calendar_changed', { reason: 'precondition_failed' }); }
         throw new WriteError('outcome_unknown');
     }
-    // Unknown: a changed ETag without the requested values is someone else's change; anything else stays unknown.
-    if (after.kind === 'found' && after.resource.etag !== expected) { throw new WriteError('calendar_changed', { reason: 'precondition_failed' }); }
+    // Unknown: the requested values are not observed, and nothing proves the PUT was refused. A changed ETag is no proof
+    // either: iCloud may have applied the write and rewritten values, or another client may have edited after it (ORCH B2).
     throw new WriteError('outcome_unknown');
 }
 

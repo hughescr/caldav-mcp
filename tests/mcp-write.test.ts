@@ -161,6 +161,29 @@ describe('the write tools through the MCP boundary, in both protocol eras', () =
             expect<unknown>([changed.code, changed.reason, changed.differs]).toEqual(['calendar_changed', 'existing_resource_differs', ['title']]);
         });
 
+        test(`${protocol}: outcome wording never claims more than was observed`, async () => {
+            const h = harness();
+            const etag = h.fake.seed(WORK, SINGLE_HREF, SINGLE);
+            h.fake.failNextWrite({ kind: 'uncertain', apply: true });
+            h.fake.putEvent = (put => async (...args: Parameters<typeof put>) => {
+                const answer = await put(...args);
+                h.fake.externalEdit(WORK, SINGLE_HREF, text => text.replace('SUMMARY:Mine', 'SUMMARY:Theirs'));
+                return answer;
+            })(h.fake.putEvent.bind(h.fake));
+            const unknown = (await h.call('update_event', { calendar_id: WORK, resource_href: SINGLE_HREF, expected_version: etag, changes: { title: 'Mine' } }, READ_WRITE, protocol)).reply.result.structuredContent.error;
+            expect(unknown.code).toBe('outcome_unknown');
+            expect(unknown.message).toContain('may or may not have been saved');
+            expect(unknown.message).toContain('before doing anything else');
+            expect(unknown.message).not.toContain('Retrying the same call is safe');
+            // calendar_changed says "nothing saved" only for this call, which a 412 or an unsent call makes true.
+            const changed = (await h.call('update_event', { calendar_id: WORK, resource_href: SINGLE_HREF, expected_version: etag, changes: { title: 'Other' } }, READ_WRITE, protocol)).reply.result.structuredContent.error;
+            expect<unknown>([changed.code, changed.message.includes('This call saved nothing')]).toEqual(['calendar_changed', true]);
+            const response = await handleMcp(request('tools/list', undefined, protocol), { token: 't', clientId: 'c', scopes: ['calendar:read'] }, h.service);
+            const listed = JSON.stringify((await response.json()).result.tools);
+            for (const claim of ['this call saved nothing', 'nothing was sent', 'Retrying the same call after a lost answer is safe']) { expect<unknown>([claim, listed.includes(claim)]).toEqual([claim, false]); }
+            expect(listed).toContain('the requested state was observed in the calendar');
+        });
+
         test(`${protocol}: iCloud's refusal text appears only in upstream.detail, never in the message or the logs`, async () => {
             const h = harness();
             h.fake.failNextWrite({ kind: 'status', status: 403, apply: false, upstream: { content_type: 'text', detail: CANARY } });
