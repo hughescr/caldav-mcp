@@ -34,15 +34,16 @@ function record(value: unknown): value is AuthRecord {
         common.push('clientId', 'connectionId', 'resource', 'scopes');
         if (!text(value.clientId) || !safeId(value.connectionId) || !text(value.resource) || !Array.isArray(value.scopes) || value.scopes.length < 1 || value.scopes.length > 16 || value.scopes.some(scope => typeof scope !== 'string' || !SCOPES.includes(scope))) { return false; }
         if (value.kind === 'code') {
-            fields = ['credentialGeneration', 'redirectUri', 'challenge', 'consumedGrantId', 'flow'];
-            if (!integer(value.credentialGeneration) || !text(value.redirectUri) || typeof value.challenge !== 'string' || !/^[A-Za-z0-9_-]{43}$/.test(value.challenge) || (value.consumedGrantId !== undefined && !safeId(value.consumedGrantId)) || (value.flow !== undefined && !digestText(value.flow))) { return false; }
+            // `epoch` is absent only on codes from before consent records, which exchange refuses.
+            fields = ['credentialGeneration', 'redirectUri', 'challenge', 'consumedGrantId', 'epoch'];
+            if (!integer(value.credentialGeneration) || !text(value.redirectUri) || typeof value.challenge !== 'string' || !/^[A-Za-z0-9_-]{43}$/.test(value.challenge) || (value.consumedGrantId !== undefined && !safeId(value.consumedGrantId)) || (value.epoch !== undefined && !digestText(value.epoch))) { return false; }
         } else {
             fields = ['credentialGeneration', 'status', 'tokenVersion', 'refreshGeneration', 'refreshHash', 'previousRefreshHash', 'receiptUntil', 'receipt', 'receiptBinding'];
             if (!integer(value.credentialGeneration) || (typeof value.status !== 'string' || !['active', 'revoked'].includes(value.status)) || !integer(value.tokenVersion) || !integer(value.refreshGeneration) || typeof value.refreshHash !== 'string' || !/^[A-Za-z0-9_-]{43}$/.test(value.refreshHash) || (value.previousRefreshHash !== undefined && (typeof value.previousRefreshHash !== 'string' || !/^[A-Za-z0-9_-]{43}$/.test(value.previousRefreshHash))) || (value.receiptUntil !== undefined && !integer(value.receiptUntil)) || (value.receipt !== undefined && !sealed(value.receipt)) || (value.receiptBinding !== undefined && !text(value.receiptBinding))) { return false; }
         }
     } else if (value.kind === 'consent') {
-        fields = ['clientId', 'flow', 'grantId'];
-        if (!text(value.clientId) || !digestText(value.flow) || (value.grantId !== undefined && !digestText(value.grantId))) { return false; }
+        fields = ['clientId', 'epoch', 'grantId'];
+        if (!text(value.clientId) || !digestText(value.epoch) || (value.grantId !== undefined && !digestText(value.grantId))) { return false; }
     } else if (value.kind === 'throttle') {
         fields = ['windowStart', 'failures'];
         if (value.accountId !== value.id || !integer(value.windowStart) || !integer(value.failures) || (value.failures as number) > 1000) { return false; }

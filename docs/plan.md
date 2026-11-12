@@ -486,7 +486,8 @@ No decisions are open.
   expire, the password is replaced or they are revoked. Installations that share one
   `client_id` count as one client: connecting one ends the other's grant. A consent whose
   code is never exchanged leaves that client without a working grant until it authorizes
-  again.
+  again. A rollback to a release without consent records makes superseded, unexpired grants
+  work again.
 - Calendar `id` values returned by `list_calendars` contain the account's numeric iCloud
   path.
 - A short `list_events` or `search_events` query can miss an occurrence that was moved more

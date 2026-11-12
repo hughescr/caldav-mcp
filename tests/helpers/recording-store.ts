@@ -11,6 +11,8 @@ export class RecordingStore implements AtomicStore {
     readonly writes: string[] = [];
     failGet: ((kind: AuthRecord['kind'], id: string) => Error | undefined) | undefined;
     failTransact: ((write: AtomicWrite) => Error | undefined) | undefined;
+    /** Runs before a transaction reaches the store; a returned promise suspends it at its commit point. */
+    beforeTransact: ((write: AtomicWrite) => Promise<void> | undefined) | undefined;
 
     async get(kind: AuthRecord['kind'], id: string): Promise<AuthRecord | undefined> {
         const failure = this.failGet?.(kind, id);
@@ -26,6 +28,7 @@ export class RecordingStore implements AtomicStore {
         if (failure) {
             throw failure;
         }
+        await this.beforeTransact?.(write);
         return this.inner.transact(write);
     }
 

@@ -4,6 +4,8 @@ import { SCOPES } from '../src/auth/http';
 import { insufficientScopeMessage, requiredScope } from '../src/mcp';
 import type { BoundCalendarService } from '../src/calendar/service';
 import { CALENDARS, callTool, connectOtherClient, issuer, post, setup, start, submit, tokenRequest, type Env } from './helpers/http-env';
+// Every accepted consent submission starts a fresh authorization epoch (see "One consent per client"
+// in docs/auth-design.md): the later submission wins, for a new flow and a resubmitted one alike.
 
 let spies: Mock<(...args: unknown[]) => void>[] = [];
 beforeEach(() => { spies = (['log', 'info', 'warn', 'error', 'debug'] as const).map(method => spyOn(console, method).mockImplementation(() => {})); });
@@ -15,9 +17,14 @@ interface Tokens { access_token: string; refresh_token: string; scope: string }
 
 const codeOf = (redirect: Response) => new URL(redirect.headers.get('location') ?? '').searchParams.get('code') ?? '';
 
+/** Posts the consent page with exactly these ticks and returns the response, whatever it is. */
+async function consentPost(env: Env, form: Awaited<ReturnType<typeof start>>, grants: string[]) {
+    return submit(env, form, { grants });
+}
+
 /** Completes the consent page with exactly these ticks and returns the redirect, without exchanging the code. */
 async function consent(env: Env, grants: string[], form?: Awaited<ReturnType<typeof start>>) {
-    const redirect = await submit(env, form ?? await start(env), { grants });
+    const redirect = await consentPost(env, form ?? await start(env), grants);
     expect(redirect.status).toBe(302);
     return redirect;
 }
@@ -145,52 +152,130 @@ describe('a new consent for the same client replaces what it was allowed before'
     });
 });
 
-describe('a duplicate delivery of the same consent flow', () => {
-    test('with the same ticks keeps the first code valid, and a redelivery after the exchange leaves that grant working', async () => {
+describe('every accepted submission is a new epoch, a resubmission of the same flow included', () => {
+    test('same flow, same ticks, submitted twice: the later submission wins and the first code is refused', async () => {
         const env = setup({ scope: WIDE });
         const form = await start(env);
         const first = codeOf(await consent(env, ['calendar:write'], form));
         const second = codeOf(await consent(env, ['calendar:write'], form));
-        const tokens = await exchange(env, first);
+        await expectInvalidGrant(await tokenRequest(env, first));
+        const tokens = await exchange(env, second);
+        expect(sorted(tokens.scope)).toEqual(['calendar:read', 'calendar:write']);
         await expectCalendars(env, tokens.access_token);
-        // A third delivery of the same flow after the exchange issues a code but ends nothing.
-        codeOf(await consent(env, ['calendar:write'], form));
-        await expectCalendars(env, tokens.access_token);
-        const renewed = await refresh(env, tokens.refresh_token);
-        expect(renewed.status).toBe(200);
-        const current = await renewed.json() as Tokens;
-        // The later completed exchange of the same flow wins.
-        const later = await exchange(env, second);
-        expect(sorted(later.scope)).toEqual(['calendar:read', 'calendar:write']);
-        await expectChallenge(await callTool(env, current.access_token, 'list_calendars'));
-        await expectCalendars(env, later.access_token);
     });
 
-    test('with different ticks: the later completed exchange wins', async () => {
+    test('same flow, same ticks, resubmitted after the first code was exchanged: that grant stops working', async () => {
         const env = setup({ scope: WIDE });
         const form = await start(env);
-        const wideCode = codeOf(await consent(env, ['calendar:write'], form));
-        const wide = await exchange(env, wideCode);
+        const tokens = await exchange(env, codeOf(await consent(env, ['calendar:write'], form)));
+        await expectCalendars(env, tokens.access_token);
+        const again = codeOf(await consent(env, ['calendar:write'], form));
+        await expectChallenge(await callTool(env, tokens.access_token, 'list_calendars'));
+        await expectInvalidGrant(await refresh(env, tokens.refresh_token));
+        await expectCalendars(env, (await exchange(env, again)).access_token);
+    });
+
+    test('same flow, different ticks, wide code exchanged first: the wide grant stops working as soon as the narrow submission is accepted', async () => {
+        const env = setup({ scope: WIDE });
+        const form = await start(env);
+        const wide = await exchange(env, codeOf(await consent(env, ['calendar:write'], form)));
         const narrowCode = codeOf(await consent(env, [], form));
-        // Not yet exchanged: the earlier exchange of this flow still holds.
-        expect(sorted((await env.runtime.engine.verifyAccess(wide.access_token)).scopes)).toEqual(['calendar:read', 'calendar:write']);
+        // Before the narrow code is exchanged.
+        await expectChallenge(await callTool(env, wide.access_token, 'list_calendars'));
+        await expect(env.runtime.engine.verifyAccess(wide.access_token)).rejects.toThrow('invalid_token');
+        await expectInvalidGrant(await refresh(env, wide.refresh_token));
         const narrow = await exchange(env, narrowCode);
         expect(narrow.scope).toBe('calendar:read');
-        await expectChallenge(await callTool(env, wide.access_token, 'list_calendars'));
-        await expectInvalidGrant(await refresh(env, wide.refresh_token));
         await expectCalendars(env, narrow.access_token);
+        await expectChallenge(await callTool(env, wide.access_token, 'list_calendars'));
     });
 
-    test('with different ticks exchanged in reverse order: the code exchanged last wins, whatever it allows', async () => {
+    test('same flow, different ticks, wide code exchanged after the narrow one: it is refused and the narrow grant keeps working', async () => {
         const env = setup({ scope: WIDE });
         const form = await start(env);
         const wideCode = codeOf(await consent(env, ['calendar:write'], form));
         const narrowCode = codeOf(await consent(env, [], form));
         const narrow = await exchange(env, narrowCode);
-        const wide = await exchange(env, wideCode);
-        expect(sorted(wide.scope)).toEqual(['calendar:read', 'calendar:write']);
+        await expectInvalidGrant(await tokenRequest(env, wideCode));
+        await expectCalendars(env, narrow.access_token);
+        expect((await env.runtime.engine.verifyAccess(narrow.access_token)).scopes).toEqual(['calendar:read']);
+    });
+
+    test('same flow, different ticks, neither exchanged yet: the wide code is refused even before the narrow one is exchanged', async () => {
+        const env = setup({ scope: WIDE });
+        const form = await start(env);
+        const wideCode = codeOf(await consent(env, ['calendar:write'], form));
+        const narrowCode = codeOf(await consent(env, [], form));
+        await expectInvalidGrant(await tokenRequest(env, wideCode));
+        expect((await exchange(env, narrowCode)).scope).toBe('calendar:read');
+    });
+
+    test('flow F, then flow G, then a replay of F: the replay is a new epoch that replaces G, and F\'s first code is not revived', async () => {
+        const env = setup({ scope: WIDE });
+        const flowF = await start(env);
+        const wideCode = codeOf(await consent(env, ['calendar:write'], flowF));
+        const narrow = await exchange(env, codeOf(await consent(env, [])));
+        await expectCalendars(env, narrow.access_token);
+        // The delayed duplicate POST of F still carries its cookie, CSRF binding and the password.
+        const replayCode = codeOf(await consent(env, ['calendar:write'], flowF));
+        await expectInvalidGrant(await tokenRequest(env, wideCode));
         await expectChallenge(await callTool(env, narrow.access_token, 'list_calendars'));
-        await expectCalendars(env, wide.access_token);
+        await expectInvalidGrant(await refresh(env, narrow.refresh_token));
+        const replayed = await exchange(env, replayCode);
+        expect(sorted(replayed.scope)).toEqual(['calendar:read', 'calendar:write']);
+        await expectCalendars(env, replayed.access_token);
+        await expectInvalidGrant(await tokenRequest(env, wideCode));
+    });
+
+    test('flow F exchanged, then flow G, then a replay of F: the grant from F\'s first code stays dead', async () => {
+        const env = setup({ scope: WIDE });
+        const flowF = await start(env);
+        const wide = await exchange(env, codeOf(await consent(env, ['calendar:write'], flowF)));
+        await exchange(env, codeOf(await consent(env, [])));
+        const replayCode = codeOf(await consent(env, ['calendar:write'], flowF));
+        await expectChallenge(await callTool(env, wide.access_token, 'list_calendars'));
+        await expectInvalidGrant(await refresh(env, wide.refresh_token));
+        await exchange(env, replayCode);
+        await expectChallenge(await callTool(env, wide.access_token, 'list_calendars'));
+        await expectInvalidGrant(await refresh(env, wide.refresh_token));
+    });
+});
+
+test('an /mcp request reads the grant, the connection and the consent record once each, strongly consistent and uncached', async () => {
+    const env = setup({ scope: WIDE });
+    const tokens = await exchange(env, codeOf(await consent(env, [])));
+    const reads = spyOn(env.store, 'get');
+    await expectCalendars(env, tokens.access_token);
+    expect(reads.mock.calls.map(([kind]) => kind).sort()).toEqual(['connection', 'consent', 'grant']);
+    // Never cached: a second request reads the consent record again, and a replacement in between ends it.
+    await exchange(env, codeOf(await consent(env, ['calendar:write'])));
+    reads.mockClear();
+    await expectChallenge(await callTool(env, tokens.access_token, 'list_calendars'));
+    expect(reads.mock.calls.map(([kind]) => kind).sort()).toEqual(['connection', 'consent', 'grant']);
+    reads.mockRestore();
+});
+
+describe('two consent submissions racing at code issue', () => {
+    test('the one that commits second gets the retryable 503 page, and only the winner\'s code works', async () => {
+        const env = setup({ scope: WIDE });
+        const form = await start(env);
+        const reached = Promise.withResolvers<void>(); const released = Promise.withResolvers<void>();
+        let held = false;
+        env.store.beforeTransact = write => {
+            if (held || !write.puts.some(record => record.kind === 'consent') || !write.puts.some(record => record.kind === 'code')) { return undefined; }
+            held = true; reached.resolve(); return released.promise;
+        };
+        const loser = consentPost(env, form, ['calendar:write']);
+        await reached.promise;
+        const winner = codeOf(await consent(env, [], form));
+        released.resolve();
+        const page = await loser;
+        expect(page.status).toBe(503);
+        expect(page.headers.get('location')).toBeNull();
+        expect(await page.text()).toContain('iCloud sign-in is temporarily unavailable. Try again later.');
+        const tokens = await exchange(env, winner);
+        expect(tokens.scope).toBe('calendar:read');
+        expect((await env.runtime.engine.verifyAccess(tokens.access_token)).scopes).toEqual(['calendar:read']);
     });
 });
 

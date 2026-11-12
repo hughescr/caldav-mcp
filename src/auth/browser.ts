@@ -152,9 +152,10 @@ export async function postBrowser(context: Context, runtime: AuthRuntime) {
     if (discovery === 'unavailable') { return failure(context, runtime, 503, UNAVAILABLE); }
     const credentials: UpstreamCredentials = { accountId, appleId, appPassword, principalUrl: discovery.principalUrl, calendarHomeUrl: discovery.calendarHomeUrl, issuedAt: now() };
     let code: string;
-    try { code = await store(runtime, auth, credentials, scopes, flow.flowId); } catch (error) {
+    try { code = await store(runtime, auth, credentials, scopes); } catch (error) {
         // Fixed pages for the expected outcomes after discovery: a concurrent reconnect or a
-        // session check that now fails (invalid_grant), or a temporary store/upstream error.
+        // session check that now fails (invalid_grant), or a temporary store/upstream error,
+        // including a consent submission that lost the race to a concurrent one (503: retry).
         if (!(error instanceof OAuthError)) { throw error; }
         return error.error === 'temporarily_unavailable' ? failure(context, runtime, 503, UNAVAILABLE) : failure(context, runtime, 400, FAILED);
     }
@@ -162,18 +163,19 @@ export async function postBrowser(context: Context, runtime: AuthRuntime) {
 }
 /**
  * Stores the iCloud-proven credential and issues the authorization code for the scopes the user granted.
- * The code issue replaces this client's earlier consent for the account unless `flowId` is the same flow.
+ * Every accepted submission, a resubmission of the same flow included, starts a new authorization
+ * epoch that replaces this client's earlier consent for the account (see issueCode).
  */
-async function store(runtime: AuthRuntime, auth: Authorization, credentials: UpstreamCredentials, scopes: string[], flowId: string): Promise<string> {
+async function store(runtime: AuthRuntime, auth: Authorization, credentials: UpstreamCredentials, scopes: string[]): Promise<string> {
     const { accountId } = credentials;
     const record = await runtime.store.get('connection', accountId);
     if (record && (record.kind !== 'connection' || record.accountId !== accountId)) { throw new OAuthError('temporarily_unavailable'); }
     const previous = record?.kind === 'connection' ? record : undefined;
     // Duplicate delivery of an identical, still-active credential must not rotate the canonical
-    // generation: that would end the grants of every client already using it and invalidate an
-    // already returned code. issueCode re-validates the session and conditions its write on the
-    // unchanged connection. Anything else is a fresh, iCloud-proven replacement, which ends every
-    // earlier grant for the account.
+    // generation: that would end the grants of every other client already using it. (This client's
+    // earlier code and grant end anyway: the new submission is a new consent epoch.) issueCode
+    // re-validates the session and conditions its write on the unchanged connection. Anything else is
+    // a fresh, iCloud-proven replacement, which ends every earlier grant for the account.
     const connection = previous && identicalActive(runtime, previous, credentials) ? previous : await runtime.engine.connectOrReconnect({ accountId, credentials, expiresAt: now() + 180 * 86400, ...(previous ? { expectedCredentialGeneration: previous.credentialGeneration } : {}) });
-    return runtime.engine.issueCode({ client: auth.client, connectionId: connection.id, redirectUri: auth.redirectUri, resource: auth.resource, scopes, challenge: auth.challenge, flowId });
+    return runtime.engine.issueCode({ client: auth.client, connectionId: connection.id, redirectUri: auth.redirectUri, resource: auth.resource, scopes, challenge: auth.challenge });
 }

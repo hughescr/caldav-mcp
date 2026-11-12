@@ -278,16 +278,18 @@ describe('login throttle', () => {
 });
 
 describe('duplicate delivery and reconnect', () => {
-    test('a duplicate delivery re-proves with iCloud but keeps the generation, so the first code stays valid', async () => {
+    test('a duplicate delivery re-proves with iCloud and keeps the generation, but is a new consent: only the later code is valid', async () => {
         const env = setup(); const form = await start(env);
         const first = await submit(env, form); const second = await submit(env, form);
         expect([first.status, second.status]).toEqual([302, 302]);
         expect(env.caldav.count('discover')).toBe(2);
-        expect(await env.store.get('connection', ACCOUNT_ID)).toMatchObject({ credentialGeneration: 1 });
-        for (const response of [first, second]) {
-            const exchanged = await tokenRequest(env, new URL(response.headers.get('location') ?? '').searchParams.get('code') ?? '');
-            expect(exchanged.status).toBe(200);
-        }
+        // The identical credential is not re-encrypted under a new generation.
+        expect(await env.store.get('connection', ACCOUNT_ID)).toMatchObject({ credentialGeneration: 1, revision: 0 });
+        const codeOf = (response: Response) => new URL(response.headers.get('location') ?? '').searchParams.get('code') ?? '';
+        const refused = await tokenRequest(env, codeOf(first));
+        expect(refused.status).toBe(400);
+        expect((await refused.json()).error).toBe('invalid_grant');
+        expect((await tokenRequest(env, codeOf(second))).status).toBe(200);
     });
 
     test('a reconnect with a new password replaces the credential under the next generation and ends earlier grants', async () => {

@@ -3,22 +3,45 @@ import { createHmac, hkdfSync } from 'node:crypto';
 import { AuthCrypto, connectionAAD, digest, randomId } from '../src/auth/crypto';
 import { AuthEngine } from '../src/auth/engine';
 import { MemoryStore } from '../src/auth/memory-store';
-import { type AuthorizationCode, type BackendSessionValidator, type Connection, type Grant, TemporaryUnavailable, type UpstreamCredentials } from '../src/auth/contracts';
+import { type AtomicStore, type AtomicWrite, type AuthorizationCode, type BackendSessionValidator, type Connection, type Grant, TemporaryUnavailable, type UpstreamCredentials } from '../src/auth/contracts';
 const VALID: BackendSessionValidator = { validate: async () => 'valid', isAllowed: () => true };
 // Synthetic upstream credentials; the engine treats them as an opaque, sealed projection.
 const upstream = (appPassword: string, overrides: Partial<UpstreamCredentials> = {}): UpstreamCredentials => ({ accountId: 'account', appleId: 'user@example.invalid', appPassword, principalUrl: 'https://p01-caldav.icloud.com/10000000001/principal/', calendarHomeUrl: 'https://p01-caldav.icloud.com/10000000001/calendars/', issuedAt: 1000, ...overrides });
 function setup(grace: 0 | 10 = 10) {
     let now = 1000; let backend: 'valid' | 'expired' | 'temporary' = 'valid';
     const store = new MemoryStore(); const crypto = new AuthCrypto({ activeKeyId: 'k1', keys: { k1: new Uint8Array(32).fill(1) } });
-    const engine = new AuthEngine(store, crypto, { validate: async () => backend, isAllowed: () => true }, { issuer: 'https://auth.example', refreshRetrySeconds: grace }, () => now);
+    const gate = commitGate(store);
+    const engine = new AuthEngine(gate.store, crypto, { validate: async () => backend, isAllowed: () => true }, { issuer: 'https://auth.example', refreshRetrySeconds: grace }, () => now);
     const client = { clientId: 'client', redirectUris: ['https://client.example/callback'] };
     const connection: Connection = { kind: 'connection', id: 'account', accountId: 'account', credentialGeneration: 1, revision: 0, status: 'active', expiresAt: 999999, credentials: crypto.seal('upstream-credentials', connectionAAD({ id: 'account', accountId: 'account', credentialGeneration: 1 }), upstream('upstream-secret')) };
     const seed = () => store.transact({ conditions: [{ kind: 'connection', id: connection.id, revision: null }], puts: [connection], operationId: randomId() });
     const verifier = 'a'.repeat(43);
-    // Each call is a separate consent flow unless a flow id is passed.
-    const code = (flowId = randomId()) => engine.issueCode({ client, connectionId: connection.id, redirectUri: 'https://client.example/callback', resource: engine.resource, scopes: ['calendar:read', 'calendar:write'], challenge: digest(verifier), flowId });
-    const exchange = async () => engine.exchange({ client, code: await code(), verifier, redirectUri: 'https://client.example/callback', resource: engine.resource });
-    return { store, crypto, engine, client, connection, seed, code, verifier, exchange, tick: (seconds: number) => { now += seconds; }, backend: (value: typeof backend) => { backend = value; } };
+    // Each call is one accepted consent submission, so each starts a new authorization epoch.
+    const code = () => engine.issueCode({ client, connectionId: connection.id, redirectUri: 'https://client.example/callback', resource: engine.resource, scopes: ['calendar:read', 'calendar:write'], challenge: digest(verifier) });
+    const redeem = (value: string) => engine.exchange({ client, code: value, verifier, redirectUri: 'https://client.example/callback', resource: engine.resource });
+    const exchange = async () => redeem(await code());
+    return { store, crypto, engine, client, connection, seed, code, redeem, verifier, exchange, pause: gate.pause, tick: (seconds: number) => { now += seconds; }, backend: (value: typeof backend) => { backend = value; } };
+}
+/**
+ * Suspends the next transaction that matches `when` at its commit point, before it reaches the store,
+ * until `release` is called: a test can commit a racing operation in between and then resume it.
+ */
+function commitGate(inner: MemoryStore) {
+    let hold: { when: (write: AtomicWrite) => boolean; reached: () => void; released: Promise<void> } | undefined;
+    const store: AtomicStore = {
+        get: (kind, id) => inner.get(kind, id),
+        transact: async write => {
+            const current = hold;
+            if (current?.when(write)) { hold = undefined; current.reached(); await current.released; }
+            return inner.transact(write);
+        },
+    };
+    const pause = (when: (write: AtomicWrite) => boolean) => {
+        const reached = Promise.withResolvers<void>(); const released = Promise.withResolvers<void>();
+        hold = { when, reached: reached.resolve, released: released.promise };
+        return { atCommit: reached.promise, release: released.resolve };
+    };
+    return { store, pause };
 }
 describe('sealed value lengths are pinned', () => {
     const crypto = new AuthCrypto({ activeKeyId: 'k1', keys: { k1: new Uint8Array(32).fill(7) } });
@@ -224,7 +247,7 @@ test('grant and presented token expiry during the atomic receipt check prevents 
     const f = setup(); await f.seed();
     let now = 1000;
     const mintEngine = new AuthEngine(f.store, f.crypto, VALID, { issuer: 'https://auth.example', accessSeconds: 1, grantSeconds: 5, refreshRetrySeconds: 10 }, () => now);
-    const code = await mintEngine.issueCode({ client: f.client, connectionId: 'account', redirectUri: 'https://client.example/callback', resource: mintEngine.resource, scopes: ['calendar:read'], challenge: digest(f.verifier), flowId: randomId() });
+    const code = await mintEngine.issueCode({ client: f.client, connectionId: 'account', redirectUri: 'https://client.example/callback', resource: mintEngine.resource, scopes: ['calendar:read'], challenge: digest(f.verifier) });
     const original = await mintEngine.exchange({ client: f.client, code, verifier: f.verifier, redirectUri: 'https://client.example/callback', resource: mintEngine.resource });
     await mintEngine.refresh({ client: f.client, resource: mintEngine.resource, refreshToken: original.refresh_token });
     const engine = new AuthEngine({ get: f.store.get.bind(f.store), transact: async write => {
@@ -289,9 +312,9 @@ describe('caldav-mcp engine adaptations', () => {
     test('codes accept only calendar scopes', async () => {
         const f = setup(); await f.seed();
         for (const scopes of [['mail:read'], ['profile'], ['calendar:read', 'calendar:admin'], []]) {
-            await expect(f.engine.issueCode({ client: f.client, connectionId: 'account', redirectUri: 'https://client.example/callback', resource: f.engine.resource, scopes, challenge: digest(f.verifier), flowId: randomId() })).rejects.toThrow('invalid_request');
+            await expect(f.engine.issueCode({ client: f.client, connectionId: 'account', redirectUri: 'https://client.example/callback', resource: f.engine.resource, scopes, challenge: digest(f.verifier) })).rejects.toThrow('invalid_request');
         }
-        const tokens = await f.engine.exchange({ client: f.client, code: await f.engine.issueCode({ client: f.client, connectionId: 'account', redirectUri: 'https://client.example/callback', resource: f.engine.resource, scopes: ['calendar:invite', 'calendar:read'], challenge: digest(f.verifier), flowId: randomId() }), verifier: f.verifier, redirectUri: 'https://client.example/callback', resource: f.engine.resource });
+        const tokens = await f.engine.exchange({ client: f.client, code: await f.engine.issueCode({ client: f.client, connectionId: 'account', redirectUri: 'https://client.example/callback', resource: f.engine.resource, scopes: ['calendar:invite', 'calendar:read'], challenge: digest(f.verifier) }), verifier: f.verifier, redirectUri: 'https://client.example/callback', resource: f.engine.resource });
         expect(tokens.scope).toBe('calendar:invite calendar:read');
     });
     test('markReconnectRequired is a CAS on the observed connection revision', async () => {
@@ -336,7 +359,7 @@ describe('caldav-mcp engine adaptations', () => {
         const base = { id: 'account', accountId: 'account', credentialGeneration: 1 };
         await store.transact({ conditions: [{ kind: 'connection', id: 'account', revision: null }], puts: [{ kind: 'connection', ...base, revision: 0, status: 'active', expiresAt: 999999, credentials: crypto.seal('upstream-credentials', connectionAAD(base), upstream('secret')) }], operationId: randomId() });
         const verifier = 'a'.repeat(43);
-        const code = await engine.issueCode({ client, connectionId: 'account', redirectUri: 'https://client.example/callback', resource: engine.resource, scopes: ['calendar:read'], challenge: digest(verifier), flowId: randomId() });
+        const code = await engine.issueCode({ client, connectionId: 'account', redirectUri: 'https://client.example/callback', resource: engine.resource, scopes: ['calendar:read'], challenge: digest(verifier) });
         const tokens = await engine.exchange({ client, code, verifier, redirectUri: 'https://client.example/callback', resource: engine.resource });
         const first = await engine.refresh({ client, resource: engine.resource, refreshToken: tokens.refresh_token });
         expect(await engine.refresh({ client, resource: engine.resource, refreshToken: tokens.refresh_token })).toEqual(first);
@@ -391,24 +414,45 @@ describe('one current consent per client and account', () => {
         await expect(f.engine.refresh(request)).rejects.toThrow('invalid_grant');
         await expect(f.engine.refresh({ ...request, refreshToken: first.refresh_token })).rejects.toThrow('invalid_grant');
     });
-    test('the consent record stores the flow digest, outlives the connection generation and names the grant of the latest exchange', async () => {
+    test('every accepted consent is a fresh epoch: the record holds it, outlives the connection generation and names the grant of its one code', async () => {
         const f = setup(); await f.seed();
-        const flowId = randomId();
-        const code = await f.code(flowId);
+        const code = await f.code();
         const issued = await f.store.get('consent', consentKey('client'));
         if (issued?.kind !== 'consent') { throw new Error('missing consent'); }
-        expect(issued).toEqual({ kind: 'consent', id: consentKey('client'), revision: 0, expiresAt: f.connection.expiresAt, accountId: 'account', clientId: 'client', flow: digest(JSON.stringify(['caldav-mcp', 1, 'consent-flow', flowId])) });
-        const tokens = await f.engine.exchange({ client: f.client, code, verifier: f.verifier, redirectUri: 'https://client.example/callback', resource: f.engine.resource });
+        expect(issued).toEqual({ kind: 'consent', id: consentKey('client'), revision: 0, expiresAt: f.connection.expiresAt, accountId: 'account', clientId: 'client', epoch: expect.stringMatching(/^[A-Za-z0-9_-]{43}$/) });
+        const stored = await f.store.get('code', digest(code));
+        expect(stored).toMatchObject({ epoch: issued.epoch });
+        expect(stored).not.toHaveProperty('flow');
+        const tokens = await f.redeem(code);
         const { grantId } = f.crypto.readToken(tokens.refresh_token, 'refresh', 1000);
         expect(await f.store.get('consent', consentKey('client'))).toEqual({ ...issued, revision: 1, grantId });
-        // A redelivery of the same flow changes nothing; a new flow drops the grant at once.
-        await f.code(flowId);
-        expect(await f.store.get('consent', consentKey('client'))).toMatchObject({ revision: 1, grantId });
+        // The next accepted consent starts a new, different epoch and drops the grant at once.
         await f.code();
         const replaced = await f.store.get('consent', consentKey('client'));
+        if (replaced?.kind !== 'consent') { throw new Error('missing consent'); }
         expect(replaced).toMatchObject({ revision: 2, expiresAt: f.connection.expiresAt });
-        expect(replaced?.kind === 'consent' && replaced.grantId).toBeUndefined();
-        for (const bad of ['', 'short', 'a'.repeat(44), `${'a'.repeat(42)}=`]) { await expect(f.code(bad)).rejects.toThrow('invalid_request'); }
+        expect(replaced.epoch).not.toBe(issued.epoch);
+        expect(replaced.grantId).toBeUndefined();
+        await expect(f.engine.verifyAccess(tokens.access_token)).rejects.toThrow('invalid_token');
+    });
+    test('an epoch yields at most one grant: a code of an epoch that already has a grant is refused even if it reads as unconsumed', async () => {
+        const f = setup(); await f.seed();
+        const code = await f.code();
+        const tokens = await f.redeem(code);
+        // Simulate a code record whose consumed marker was lost: the consent record still refuses it.
+        const stored = await f.store.get('code', digest(code));
+        if (stored?.kind !== 'code') { throw new Error('missing code'); }
+        const { consumedGrantId: _consumed, ...unconsumed } = stored;
+        expect(await f.store.transact({ conditions: [{ kind: 'code', id: stored.id, revision: stored.revision }], puts: [{ ...unconsumed, revision: stored.revision + 1 }], operationId: randomId() })).toBe(true);
+        await expect(f.redeem(code)).rejects.toThrow('invalid_grant');
+        await expect(f.engine.verifyAccess(tokens.access_token)).resolves.toMatchObject({ clientId: 'client' });
+    });
+    test('verifyAccess returns the connection record it checked, so /mcp need not read it again', async () => {
+        const f = setup(); await f.seed();
+        const tokens = await f.exchange();
+        const context = await f.engine.verifyAccess(tokens.access_token);
+        expect(context).toMatchObject({ clientId: 'client', accountId: 'account', connectionId: 'account', connectionStatus: 'active' });
+        expect(context.connection).toEqual(await f.store.get('connection', 'account') as Connection);
     });
     test('a record under the consent key that names another client is a store fault, never a pass', async () => {
         const f = setup(); await f.seed(); const tokens = await f.exchange();
@@ -416,5 +460,73 @@ describe('one current consent per client and account', () => {
         const engine = new AuthEngine({ get: async (kind, id) => kind === 'consent' && record ? { ...record, clientId: 'other' } : f.store.get(kind, id), transact: write => f.store.transact(write) }, f.crypto, VALID, { issuer: 'https://auth.example', refreshRetrySeconds: 10 }, () => 1000);
         await expect(engine.verifyAccess(tokens.access_token)).rejects.toBeInstanceOf(TemporaryUnavailable);
         await expect(engine.refresh({ client: f.client, resource: engine.resource, refreshToken: tokens.refresh_token })).rejects.toBeInstanceOf(TemporaryUnavailable);
+    });
+    describe('commit-point races: one operation is suspended right before its transaction while the other commits', () => {
+        const rotation = (write: AtomicWrite) => write.puts.length === 1 && write.puts[0]?.kind === 'grant';
+        const checkOnly = (write: AtomicWrite) => write.puts.length === 0;
+        const exchangeCommit = (write: AtomicWrite) => write.puts.some(record => record.kind === 'grant') && write.puts.some(record => record.kind === 'consent');
+        const issueCommit = (write: AtomicWrite) => write.puts.some(record => record.kind === 'code' && record.revision === 0) && write.puts.some(record => record.kind === 'consent');
+        test('a refresh of a pre-consent grant that read "no consent record" fails when the client\'s first consent commits first', async () => {
+            const f = setup(); await f.seed();
+            const legacy = await legacyGrant(f, 'client');
+            const gate = f.pause(rotation);
+            const refreshing = f.engine.refresh({ client: f.client, resource: f.engine.resource, refreshToken: legacy.refresh });
+            await gate.atCommit;
+            const code = await f.code();
+            gate.release();
+            await expect(refreshing).rejects.toThrow('invalid_grant');
+            const grant = await f.store.get('grant', f.crypto.readToken(legacy.refresh, 'refresh', 1000).grantId);
+            expect(grant).toMatchObject({ refreshGeneration: 0 });
+            await expect(f.engine.verifyAccess(legacy.access)).rejects.toThrow('invalid_token');
+            await expect(f.engine.refresh({ client: f.client, resource: f.engine.resource, refreshToken: legacy.refresh })).rejects.toThrow('invalid_grant');
+            expect((await f.redeem(code)).scope).toBe('calendar:read calendar:write');
+        });
+        test('refresh-receipt recovery fails when a replacement commits between its consent read and its check-only transaction', async () => {
+            const f = setup(); await f.seed(); const tokens = await f.exchange();
+            const request = { client: f.client, resource: f.engine.resource, refreshToken: tokens.refresh_token };
+            const first = await f.engine.refresh(request);
+            const gate = f.pause(checkOnly);
+            const retrying = f.engine.refresh(request);
+            await gate.atCommit;
+            await f.code();
+            gate.release();
+            await expect(retrying).rejects.toThrow('invalid_grant');
+            await expect(f.engine.refresh(request)).rejects.toThrow('invalid_grant');
+            await expect(f.engine.verifyAccess(first.access_token)).rejects.toThrow('invalid_token');
+        });
+        test('an exchange fails when a newer consent commits a new epoch before it', async () => {
+            const f = setup(); await f.seed();
+            const older = await f.code();
+            const gate = f.pause(exchangeCommit);
+            const exchanging = f.redeem(older);
+            await gate.atCommit;
+            const newer = await f.code();
+            gate.release();
+            await expect(exchanging).rejects.toThrow('invalid_grant');
+            await expect(f.redeem(older)).rejects.toThrow('invalid_grant');
+            const tokens = await f.redeem(newer);
+            await expect(f.engine.verifyAccess(tokens.access_token)).resolves.toMatchObject({ clientId: 'client' });
+        });
+        test('of two simultaneous code issues exactly one epoch becomes current; the loser fails as temporarily unavailable with no usable code', async () => {
+            const f = setup(); await f.seed();
+            const gate = f.pause(issueCommit);
+            const loser = f.code();
+            await gate.atCommit;
+            const winner = await f.code();
+            gate.release();
+            await expect(loser).rejects.toBeInstanceOf(TemporaryUnavailable);
+            const consent = await f.store.get('consent', consentKey('client'));
+            expect(consent).toMatchObject({ revision: 0, epoch: (await f.store.get('code', digest(winner)) as AuthorizationCode).epoch });
+            await f.redeem(winner);
+        });
+        test('however many submissions race unsuspended, at most one of their codes can be exchanged', async () => {
+            const f = setup(); await f.seed();
+            const results = await Promise.allSettled(Array.from({ length: 5 }, () => f.code()));
+            const codes = results.flatMap(result => result.status === 'fulfilled' ? [result.value] : []);
+            for (const result of results) { if (result.status === 'rejected') { expect(result.reason).toBeInstanceOf(TemporaryUnavailable); } }
+            expect(codes.length).toBeGreaterThan(0);
+            const exchanged = await Promise.allSettled(codes.map(value => f.redeem(value)));
+            expect(exchanged.filter(result => result.status === 'fulfilled')).toHaveLength(1);
+        });
     });
 });

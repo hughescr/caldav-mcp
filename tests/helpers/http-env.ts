@@ -94,20 +94,24 @@ export function tokenRequest(env: Env, code: string) {
     return post(env.app, '/token', fields);
 }
 
-/** Full browser flow: login page, single connect POST, callback, token exchange. */
+/**
+ * Full browser flow: login page, connect POST, callback, token exchange. With `duplicate`, the same
+ * form is posted twice and the code of the second (the current consent epoch) is exchanged.
+ */
 export async function connect(env: Env, options: SubmitOptions & { duplicate?: boolean } = {}) {
     const form = await start(env);
     expect(form.response.headers.get('referrer-policy')).toBe('same-origin');
     expect(form.response.headers.get('content-security-policy')).toContain("form-action 'self' http://127.0.0.1:5678");
-    const redirect = await submit(env, form, options);
+    let redirect = await submit(env, form, options);
     expect(redirect.status).toBe(302);
+    if (options.duplicate) {
+        redirect = await submit(env, form, options);
+        expect(redirect.status).toBe(302);
+    }
     expect(redirect.headers.get('referrer-policy')).toBe('no-referrer');
     const target = new URL(redirect.headers.get('location') ?? '');
     expect(target.searchParams.get('iss')).toBe(issuer);
     expect(target.searchParams.get('state')).toBe('original-state');
-    if (options.duplicate) {
-        expect((await submit(env, form, options)).status).toBe(302);
-    }
     const code = target.searchParams.get('code') ?? '';
     const response = await tokenRequest(env, code);
     expect(response.status).toBe(200);

@@ -39,26 +39,28 @@ export interface Grant extends BaseRecord {
     receiptBinding?: string;
 }
 /**
- * `flow` is the consent flow that issued the code; it can be exchanged only while that flow is the
- * client's current consent. Codes issued before consent records existed have none and are refused.
+ * `epoch` is the authorization epoch of the accepted consent submission that issued the code; the
+ * code can be exchanged only while that epoch is its client's current one. Codes issued before
+ * consent records existed have none and are refused.
  */
 export interface AuthorizationCode extends BaseRecord {
     kind: 'code'; clientId: string; connectionId: string; accountId: string;
     credentialGeneration: number; redirectUri: string; resource: string; scopes: string[];
-    challenge: string; consumedGrantId?: string; flow?: string;
+    challenge: string; consumedGrantId?: string; epoch?: string;
 }
 /**
- * The latest completed consent of one client for one account; id = consentId(accountId, clientId).
- * While it exists, the only valid grant of that client for that account is `grantId`, and only codes
- * of `flow` can be exchanged. A new consent flow replaces `flow` and drops `grantId` at code issue, so
- * every earlier grant and outstanding code of that client ends at that moment; each exchange of a code
- * of the current flow names its new grant here, so the later completed exchange wins. `expiresAt`
- * never falls below the expiry of the connection generation it was written under, so the record
- * outlives every grant it can refuse. Grants that predate consent records are valid only while no
- * record exists for their client.
+ * The latest accepted consent of one client for one account; id = consentId(accountId, clientId).
+ * Every accepted consent submission is its own authorization epoch: a fresh random `epoch`, never
+ * reused, written here in the same transaction as the one code it issues, replacing the previous
+ * epoch and dropping `grantId`. So every earlier grant and outstanding code of that client ends at that
+ * moment, a resubmission of the same browser flow included. While the record exists, the only valid
+ * grant of that client for that account is `grantId`, created by the exchange of the current epoch's
+ * code. `expiresAt` never falls below the expiry of the connection generation it was written under,
+ * so the record outlives every grant it can refuse. Grants that predate consent records are valid only
+ * while no record exists for their client.
  */
 export interface Consent extends BaseRecord {
-    kind: 'consent'; accountId: string; clientId: string; flow: string; grantId?: string;
+    kind: 'consent'; accountId: string; clientId: string; epoch: string; grantId?: string;
 }
 /** Fixed-window count of upstream-rejected logins for one allowlisted account; id = accountId. */
 export interface LoginThrottle extends BaseRecord {
@@ -87,7 +89,8 @@ export interface BackendSessionValidator {
     isAllowed(accountId: string): boolean;
 }
 export interface TokenResponse { access_token: string; token_type: 'Bearer'; expires_in: number; refresh_token: string; scope: string }
-export interface AuthContext { grantId: string; accountId: string; connectionId: string; scopes: string[]; connectionStatus: ConnectionStatus }
+/** `connection` is the record verifyAccess checked the grant against, so a caller need not read it again. */
+export interface AuthContext { grantId: string; clientId: string; accountId: string; connectionId: string; scopes: string[]; connectionStatus: ConnectionStatus; connection: Connection }
 export class OAuthError extends Error {
     constructor(public readonly error: 'invalid_grant' | 'invalid_request' | 'invalid_scope' | 'invalid_token' | 'temporarily_unavailable') { super(error); }
 }

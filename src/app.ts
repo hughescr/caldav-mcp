@@ -67,18 +67,19 @@ export function createApp(options: AppOptions = {}) {
         if (!header || !/^Bearer [A-Za-z0-9._~-]+$/i.test(header)) { return unauthorized(); }
         const auth = await runtime(); if (!auth) { return context.json({ error: 'service_not_ready' }, 503); }
         try {
+            // verifyAccess reads the grant, the connection and the consent record (strongly consistent, never
+            // cached) and checks the grant against the connection's credential generation and the consent:
+            // a replaced credential or a newer consent ends it. Its result carries that connection record,
+            // so this request reads nothing twice.
             const token = header.slice(7); const identity = await auth.engine.verifyAccess(token);
-            // Allowlist removal takes effect on the very next request, before any record or upstream access.
+            // Allowlist removal takes effect on the very next request, before any upstream access.
             if (!auth.allowedAccountIds.has(identity.accountId)) { return unauthorized(); }
-            const [grant, record] = await Promise.all([auth.store.get('grant', identity.grantId), auth.store.get('connection', identity.connectionId)]);
-            // The grant must still belong to the stored credential generation: a replaced credential ends it.
-            if (grant?.kind !== 'grant' || grant.status !== 'active' || record?.kind !== 'connection' || record.accountId !== identity.accountId || record.id !== identity.connectionId || grant.credentialGeneration !== record.credentialGeneration) { return unauthorized(); }
-            const connectionStatus = record.expiresAt <= Math.floor(Date.now() / 1000) ? 'reconnect_required' : record.status;
+            const record = identity.connection;
             // No upstream validation request here: the tool call itself reaches iCloud and reports a 401.
             // Credentials are decrypted lazily, only when a tool on an active connection needs iCloud,
             // and stay in the bound closure. initialize and tools/list never decrypt.
-            const calendar = bindCalendarService({ caldav: auth.caldav, connectionStatus, credentials: () => readCredentials(auth.crypto, record), markReconnectRequired: () => auth.engine.markReconnectRequired(record), downloads });
-            return handleMcp(context.req.raw, { token, clientId: grant.clientId, scopes: identity.scopes, resource: new URL(auth.engine.resource) }, calendar);
+            const calendar = bindCalendarService({ caldav: auth.caldav, connectionStatus: identity.connectionStatus, credentials: () => readCredentials(auth.crypto, record), markReconnectRequired: () => auth.engine.markReconnectRequired(record), downloads });
+            return handleMcp(context.req.raw, { token, clientId: identity.clientId, scopes: identity.scopes, resource: new URL(auth.engine.resource) }, calendar);
         } catch (error) { if (error instanceof OAuthError && error.error !== 'temporarily_unavailable') { return unauthorized(); } throw error; }
     });
     app.notFound(context => context.json({ error: 'not_found' }, 404));

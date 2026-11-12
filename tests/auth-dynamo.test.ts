@@ -5,9 +5,23 @@ import type { AtomicWrite, AuthorizationCode, Connection, Consent, LoginThrottle
 import { AuthCrypto, connectionAAD } from '../src/auth/crypto';
 const connection = (id = 'conn', revision = 0): Connection => ({ kind: 'connection', id, revision, expiresAt: 2000000000, accountId: 'account', credentialGeneration: 0, status: 'active', credentials: { keyId: 'v1', nonce: 'a'.repeat(16), tag: 'a'.repeat(22), ciphertext: 'abc' } });
 const write = (): AtomicWrite => ({ operationId: 'a'.repeat(43), conditions: [{ kind: 'connection', id: 'conn', revision: null }], puts: [connection()] });
+/**
+ * Models DynamoDB's ClientRequestToken rule: a token reused with different transaction items is
+ * refused with IdempotentParameterMismatchException, so a test can reuse an operation id only for an
+ * identical retry.
+ */
 function fixture(handler: (command: GetCommand | TransactWriteCommand) => Promise<unknown> = async () => ({}), timeoutMs = 5000) {
     const calls: (GetCommand | TransactWriteCommand)[] = [];
-    const store = new DynamoAtomicStore({ tableName: 'AuthTable', timeoutMs, client: { async send(command) { calls.push(command); return handler(command); } } });
+    const tokens = new Map<string, string>();
+    const store = new DynamoAtomicStore({ tableName: 'AuthTable', timeoutMs, client: { async send(command) {
+        calls.push(command);
+        if (command instanceof TransactWriteCommand) {
+            const token = command.input.ClientRequestToken ?? ''; const items = JSON.stringify(command.input.TransactItems);
+            if ((tokens.get(token) ?? items) !== items) { throw { name: 'IdempotentParameterMismatchException' }; }
+            tokens.set(token, items);
+        }
+        return handler(command);
+    } } });
     return { calls, store };
 }
 describe('DynamoDB auth store', () => {
@@ -36,8 +50,10 @@ describe('DynamoDB auth store', () => {
         expect(first.input.TransactItems).toHaveLength(2);
         expect(first.input.TransactItems?.[0]?.Put?.ConditionExpression).toBe('attribute_not_exists(#pk)');
         expect(first.input.TransactItems?.[1]?.ConditionCheck?.Key).toEqual({ pk: 'caldav-mcp#connection#reader', sk: 'STATE' });
-        const update = { ...write(), conditions: [{ kind: 'connection' as const, id: 'conn', revision: 0 }], puts: [connection('conn', 1)] };
-        await store.transact(update);
+        const update = { operationId: 'u'.repeat(43), conditions: [{ kind: 'connection' as const, id: 'conn', revision: 0 }], puts: [connection('conn', 1)] };
+        expect(await store.transact(update)).toBe(true);
+        // A different transaction under an operation id already used is refused, as DynamoDB refuses it.
+        await expect(store.transact({ ...update, operationId: transaction.operationId })).rejects.toThrow('temporarily_unavailable');
         expect((calls[2] as TransactWriteCommand).input.TransactItems?.[0]?.Put?.ExpressionAttributeValues).toEqual({ ':revision': 0 });
     });
     test('rejects blind overwrites, duplicates and unsupported record fields before sending', async () => {
@@ -160,20 +176,40 @@ describe('caldav-mcp record kinds and limits', () => {
         }
         expect(calls).toHaveLength(1);
     });
-    test('consent records and code flows use the namespace, round-trip and are strictly validated', async () => {
+    test('consent records and code epochs use the namespace, round-trip and are strictly validated', async () => {
         const id = 'k'.repeat(43);
-        const consent = (overrides: Record<string, unknown> = {}): Consent => ({ kind: 'consent', id, revision: 0, expiresAt: 2000000000, accountId, clientId: 'https://client.example/metadata.json', flow: 'f'.repeat(43), ...overrides }) as Consent;
+        const consent = (overrides: Record<string, unknown> = {}): Consent => ({ kind: 'consent', id, revision: 0, expiresAt: 2000000000, accountId, clientId: 'https://client.example/metadata.json', epoch: 'e'.repeat(43), ...overrides }) as Consent;
         const { store, calls } = fixture(async command => command instanceof GetCommand ? { Item: { ...consent({ grantId: 'g'.repeat(43) }), pk: `caldav-mcp#consent#${id}`, sk: 'STATE' } } : {});
         expect(await store.get('consent', id)).toEqual(consent({ grantId: 'g'.repeat(43) }));
         expect(calls[0]?.input).toMatchObject({ Key: { pk: `caldav-mcp#consent#${id}`, sk: 'STATE' } });
+        // Distinct operations use distinct operation ids; DynamoDB refuses a reused token with other items.
         expect(await store.transact({ operationId: 'b'.repeat(43), conditions: [{ kind: 'consent', id, revision: null }], puts: [consent()] })).toBe(true);
-        expect(await store.transact({ operationId: 'b'.repeat(43), conditions: [{ kind: 'consent', id, revision: 0 }], puts: [consent({ revision: 1, grantId: 'g'.repeat(43) })] })).toBe(true);
-        expect(await store.transact({ operationId: 'b'.repeat(43), conditions: [{ kind: 'code', id: 'c'.repeat(43), revision: null }], puts: [{ ...code(['calendar:read']), flow: 'f'.repeat(43) }] })).toBe(true);
-        for (const bad of [consent({ flow: 'short' }), consent({ flow: undefined }), consent({ grantId: '' }), consent({ grantId: 'g'.repeat(44) }), consent({ clientId: '' }), consent({ clientId: 'x'.repeat(4097) }), consent({ scopes: ['calendar:read'] }), consent({ extra: true })]) {
+        expect(await store.transact({ operationId: 'd'.repeat(43), conditions: [{ kind: 'consent', id, revision: 0 }], puts: [consent({ revision: 1, grantId: 'g'.repeat(43) })] })).toBe(true);
+        expect(await store.transact({ operationId: 'f'.repeat(43), conditions: [{ kind: 'code', id: 'c'.repeat(43), revision: null }], puts: [{ ...code(['calendar:read']), epoch: 'e'.repeat(43) }] })).toBe(true);
+        // A code from before consent records has no epoch and still reads (exchange refuses it).
+        expect(await store.transact({ operationId: 'h'.repeat(43), conditions: [{ kind: 'code', id: 'c'.repeat(43), revision: null }], puts: [code(['calendar:read'])] })).toBe(true);
+        // The `flow` field of the superseded design is an unknown field now, on both kinds.
+        for (const bad of [consent({ epoch: 'short' }), consent({ epoch: undefined }), consent({ epoch: undefined, flow: 'f'.repeat(43) }), consent({ flow: 'f'.repeat(43) }), consent({ grantId: '' }), consent({ grantId: 'g'.repeat(44) }), consent({ clientId: '' }), consent({ clientId: 'x'.repeat(4097) }), consent({ scopes: ['calendar:read'] }), consent({ extra: true })]) {
             await expect(store.transact({ operationId: 'b'.repeat(43), conditions: [{ kind: 'consent', id, revision: null }], puts: [bad] })).rejects.toThrow();
         }
-        await expect(store.transact({ operationId: 'b'.repeat(43), conditions: [{ kind: 'code', id: 'c'.repeat(43), revision: null }], puts: [{ ...code(['calendar:read']), flow: 'short' }] })).rejects.toThrow('Invalid auth record');
-        expect(calls).toHaveLength(4);
+        for (const bad of [{ ...code(['calendar:read']), epoch: 'short' }, { ...code(['calendar:read']), flow: 'f'.repeat(43) }]) {
+            await expect(store.transact({ operationId: 'f'.repeat(43), conditions: [{ kind: 'code', id: 'c'.repeat(43), revision: null }], puts: [bad as AuthorizationCode] })).rejects.toThrow('Invalid auth record');
+        }
+        expect(calls).toHaveLength(5);
+        for (const item of [(calls[1] as TransactWriteCommand).input.TransactItems?.[0]?.Put, (calls[3] as TransactWriteCommand).input.TransactItems?.[0]?.Put]) {
+            expect(item?.ConditionExpression).toBe('attribute_not_exists(#pk)');
+        }
+        expect((calls[2] as TransactWriteCommand).input.TransactItems?.[0]?.Put?.ExpressionAttributeValues).toEqual({ ':revision': 0 });
+    });
+    test('a "record must be absent" condition with no put is sent as a ConditionCheck on that key with attribute_not_exists', async () => {
+        const { store, calls } = fixture();
+        const id = 'k'.repeat(43);
+        expect(await store.transact({ operationId: 'b'.repeat(43), conditions: [{ kind: 'grant', id: 'g'.repeat(43), revision: 0 }, { kind: 'consent', id, revision: null }], puts: [] })).toBe(true);
+        const items = (calls[0] as TransactWriteCommand).input.TransactItems ?? [];
+        expect(items).toEqual([
+            { ConditionCheck: { TableName: 'AuthTable', Key: { pk: `caldav-mcp#grant#${'g'.repeat(43)}`, sk: 'STATE' }, ConditionExpression: '#revision = :revision', ExpressionAttributeNames: { '#revision': 'revision' }, ExpressionAttributeValues: { ':revision': 0 } } },
+            { ConditionCheck: { TableName: 'AuthTable', Key: { pk: `caldav-mcp#consent#${id}`, sk: 'STATE' }, ConditionExpression: 'attribute_not_exists(#pk)', ExpressionAttributeNames: { '#pk': 'pk' } } },
+        ]);
     });
     test('check-only transactions (refresh receipt authorization) are sent as condition checks', async () => {
         const { store, calls } = fixture();
