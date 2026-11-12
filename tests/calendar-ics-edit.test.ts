@@ -8,7 +8,7 @@ import {
     displayAlarm, rruleProperty, sequenceProperty, statusProperty, textProperty, timeProperty, transparencyProperty, travelDurationProperty, uidProperty, type WrittenProperty,
 } from '../src/calendar/ics-write';
 import { parseOriginalResource } from '../src/calendar/ical';
-import type { EventComponent, OriginalResource } from '../src/calendar/model';
+import { BudgetError, type EventComponent, type OriginalResource } from '../src/calendar/model';
 
 // Expected outputs are hand-written: physical lines of the input fixture (by 1-based line number, read from the file, never
 // from the editor) spliced with hand-written new lines. The fixture is LF; every output must be CRLF.
@@ -109,7 +109,7 @@ describe('master edits', () => {
             removed: [25, 26, 27, 33, 34, 35, 36, 37],
             written: [25, 26, 27, 33, 34, 41],
             copied: [],
-            target: { begin: 22, end: 53 },
+            targets: [{ begin: 22, end: 53 }],
             removedComponents: [],
             changes: [
                 { action: 'replaced', name: 'SUMMARY', reason: 'requested', original: 33, output: 33 },
@@ -248,7 +248,7 @@ describe('override edits', () => {
             'TRANSP:TRANSPARENT',
             ...lines(70, 93),
         ]));
-        expect<unknown>(result.report.target).toEqual({ begin: 54, end: 71 });
+        expect<unknown>(result.report.targets).toEqual([{ begin: 54, end: 71 }]);
         const before = parse(FIXTURE);
         const after = parse(result.text);
         expect<unknown>(masterOf(after).properties).toEqual(masterOf(before).properties);
@@ -347,7 +347,7 @@ describe('override edits', () => {
             'END:VEVENT',
             ...lines(93),
         ]));
-        expect<unknown>(result.report.target).toBeNull();
+        expect<unknown>(result.report.targets).toEqual([]);
         expect<unknown>(result.report.copied.map(copy => copy.original)).toEqual([23, 24, 33, 34, 35, 36, 37, 38, 43, 44, 45, 46, 47, 48, 49, 50, 51]);
         expect<unknown>(verifyUntouched(FIXTURE, result.text, result.report)).toEqual({ ok: true });
         const before = parse(FIXTURE);
@@ -538,8 +538,12 @@ describe('verifyUntouched catches a corrupted emit or report', () => {
         expect(reason(good.text, { ...good.report, removed: good.report.removed.slice(1) })).toBe('untouched_changed');
         expect(reason(good.text, { ...good.report, written: [...good.report.written].reverse() })).toBe('report_invalid');
         expect(reason(good.text, { ...good.report, removed: [-1, ...good.report.removed] })).toBe('report_invalid');
-        expect(reason(good.text, { ...good.report, target: { begin: 54, end: 71 } })).toBe('scope_violation');
-        expect(reason(good.text, { ...good.report, target: null })).toBe('scope_violation');
+        expect(reason(good.text, { ...good.report, targets: [{ begin: 54, end: 71 }] })).toBe('scope_violation');
+        expect(reason(good.text, { ...good.report, targets: [] })).toBe('scope_violation');
+        // A target listed twice, a target that is not a top-level VEVENT, or a missing list is refused.
+        expect(reason(good.text, { ...good.report, targets: [{ begin: 22, end: 53 }, { begin: 22, end: 53 }] })).toBe('scope_violation');
+        expect(reason(good.text, { ...good.report, targets: [{ begin: 22, end: 53 }, { begin: 0, end: 0 }] })).toBe('scope_violation');
+        expect(reason(good.text, { ...good.report, targets: undefined } as unknown as EditReport)).toBe('report_invalid');
         expect(reason(good.text, { ...good.report, copied: [{ output: 33, original: 33 }] })).toBe('copy_mismatch');
         expect(reason(good.text, { ...good.report, removedComponents: [{ begin: 54, end: 71 }] })).toBe('scope_violation');
         // Removing a VTIMEZONE line and claiming it was in the target.
@@ -974,5 +978,53 @@ describe('travel time (addendum 1): X-APPLE-TRAVEL-DURATION is settable and remo
         const doubled = TRAVEL.replace('X-APPLE-TRAVEL-DURATION;VALUE=DURATION:PT17M\r\n', 'X-APPLE-TRAVEL-DURATION;VALUE=DURATION:PT17M\r\nX-APPLE-TRAVEL-DURATION;VALUE=DURATION:PT18M\r\n');
         expect(reasonOf(() => editResource(doubled, { target: { kind: 'master' }, edits: [{ op: 'set', property: travelDurationProperty('PT5M') }] }))).toBe('duplicate_property');
         expect(reasonOf(() => editResource(doubled, { target: { kind: 'master' }, edits: [{ op: 'remove', name: 'X-APPLE-TRAVEL-DURATION' }] }))).toBe('duplicate_property');
+    });
+});
+
+describe('several components in one pass (security review finding 5)', () => {
+    const editsFor = (sequence: number): ComponentEdit[] => [
+        { op: 'set', property: textProperty('SUMMARY', 'Renamed') },
+        { op: 'remove', name: 'LOCATION' },
+        { op: 'remove_alarms' },
+        { op: 'add_alarm', alarm: displayAlarm('PT5M') },
+        { op: 'set', property: timeProperty('DTSTAMP', NOW) },
+        { op: 'set', property: sequenceProperty(sequence) },
+    ];
+    const selectors = [{ kind: 'master' }, { kind: 'override', recurrenceId: RID_DEC08 }, { kind: 'override', recurrenceId: RID_DEC22 }] as const;
+
+    test('one pass equals the same edits applied one component at a time; the report names every edited component', () => {
+        const oneByOne = selectors.reduce((text, target, index) => editResource(text, { target, edits: editsFor(index + 3) }).text, FIXTURE);
+        const once = editResource(FIXTURE, { targets: selectors.map((target, index) => ({ target, edits: editsFor(index + 3) })) });
+        expect(once.text).toBe(oneByOne);
+        expect<unknown>(once.report.targets).toEqual([{ begin: 22, end: 53 }, { begin: 54, end: 71 }, { begin: 72, end: 82 }]);
+        expect<unknown>(verifyUntouched(FIXTURE, once.text, once.report)).toEqual({ ok: true });
+        // Every line outside the three components (the calendar lines, the VTIMEZONE, the VTODO) is byte-equal and in place.
+        const asCrlf = (text: string): string => text.replaceAll('\n', '\r\n');
+        expect(once.text.startsWith(asCrlf(FIXTURE.slice(0, FIXTURE.indexOf('BEGIN:VEVENT'))))).toBe(true);
+        expect(once.text.endsWith(asCrlf(FIXTURE.slice(FIXTURE.indexOf('BEGIN:VTODO'))))).toBe(true);
+        // A report that leaves one edited component out is a scope violation.
+        expect<unknown>(verifyUntouched(FIXTURE, once.text, { ...once.report, targets: once.report.targets.slice(0, 2) })).toMatchObject({ ok: false, reason: 'scope_violation' });
+    });
+
+    test('the same component twice, or both plan forms at once, is refused', () => {
+        expect(reasonOf(() => editResource(FIXTURE, { targets: [{ target: { kind: 'master' }, edits: editsFor(1) }, { target: { kind: 'master' }, edits: [{ op: 'add_alarm', alarm: displayAlarm('PT1M') }] }] }))).toBe('conflicting_edits');
+        expect(reasonOf(() => editResource(FIXTURE, { target: { kind: 'master' }, edits: editsFor(1), targets: [{ target: { kind: 'override', recurrenceId: RID_DEC08 }, edits: editsFor(1) }] }))).toBe('edit_not_allowed');
+        expect(reasonOf(() => editResource(FIXTURE, { targets: [{ target: { kind: 'override', recurrenceId: `${RID_DEC08}0` }, edits: editsFor(1) }] }))).toBe('target_not_found');
+    });
+
+    test('with the caller\'s work charge, a budget failure propagates unchanged; without it, it is an edit error', () => {
+        const failing = (kind: 'deadline' | 'work') => () => ({ chargeLines: () => { throw new BudgetError(kind); }, chargeProperties: () => undefined });
+        for (const kind of ['deadline', 'work'] as const) {
+            let thrown: unknown = null;
+            try { editResource(FIXTURE, { target: { kind: 'master' }, edits: editsFor(1) }, { work: failing(kind) }); } catch (error) { thrown = error; }
+            expect<unknown>([kind, thrown instanceof BudgetError && thrown.kind]).toEqual([kind, kind]);
+            thrown = null;
+            try { describeEvents(FIXTURE, { work: failing(kind) }); } catch (error) { thrown = error; }
+            expect<unknown>([kind, thrown instanceof BudgetError && thrown.kind]).toEqual([kind, kind]);
+        }
+        // The charge is taken for every parse: the original and the output.
+        let parses = 0;
+        editResource(FIXTURE, { target: { kind: 'master' }, edits: editsFor(1) }, { work: () => { parses++; return { chargeLines: () => undefined, chargeProperties: () => undefined }; } });
+        expect(parses).toBe(2);
     });
 });

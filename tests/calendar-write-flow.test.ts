@@ -448,6 +448,68 @@ describe('update_event', () => {
         expect<unknown>([result.write_outcome, result.readback, result.stored_differs_from_request]).toEqual(['applied', 'ok', ['title']]);
     });
 
+    test('edit_scope all on a large series is ONE edit pass and ONE verification: the work grows linearly (250 vs 1,000 overrides)', async () => {
+        // About 2 KB per override, so 1,000 overrides come close to the 2 MiB resource cap (the edit keeps the size).
+        const series = (count: number): string => {
+            const overrides = Array.from({ length: count }, (_, index) => {
+                const day = new Date(Date.UTC(2027, 0, 5) + index * 7 * 86_400_000).toISOString().slice(0, 10).replaceAll('-', '');
+                return [
+                    'BEGIN:VEVENT', 'UID:BIG-1', 'DTSTAMP:20261105T120000Z', 'LAST-MODIFIED:20261105T120000Z', 'SEQUENCE:1', `RECURRENCE-ID:${day}T150000Z`,
+                    `DTSTART:${day}T160000Z`, `DTEND:${day}T170000Z`, 'SUMMARY:Weekly', `DESCRIPTION:${'n'.repeat(1790)}`, 'END:VEVENT',
+                ];
+            });
+            return crlf(['BEGIN:VCALENDAR', 'VERSION:2.0', 'PRODID:-//Synthetic//EN', 'BEGIN:VEVENT', 'UID:BIG-1', 'DTSTAMP:20261101T120000Z', 'SEQUENCE:1', 'DTSTART:20270105T150000Z', 'DTEND:20270105T160000Z', 'RRULE:FREQ=WEEKLY', 'SUMMARY:Weekly', 'END:VEVENT', ...overrides.flat(), 'END:VCALENDAR']);
+        };
+        const href = `${WORK}BIG-1.ics`;
+        const timed = async (count: number): Promise<number> => {
+            let best = Number.POSITIVE_INFINITY;
+            for (let run = 0; run < 3; run++) {
+                const h = harness();
+                const etag = h.fake.seed(WORK, href, series(count));
+                const started = performance.now();
+                const result = await update(h, { calendar_id: WORK, resource_href: href, expected_version: etag, edit_scope: 'all', changes: { title: 'Renamed' } });
+                best = Math.min(best, performance.now() - started);
+                expect<unknown>([count, result.write_outcome, result.overrides_changed, result.stored_differs_from_request]).toEqual([count, 'applied', count, []]);
+                expect(h.fake.count('putEvent')).toBe(1);
+            }
+            return best;
+        };
+        expect(Buffer.byteLength(series(1000), 'utf8')).toBeGreaterThan(1.9 * 1024 * 1024);
+        expect(Buffer.byteLength(series(1000), 'utf8')).toBeLessThan(2 * 1024 * 1024);
+        const small = await timed(250);
+        const large = await timed(1000);
+        // Linear work is about 4x for 4x the components; the old per-component passes were about 16x. Generous bound.
+        expect<unknown>({ small, large, ratio: large / small, linear: large / small < 9 }).toMatchObject({ linear: true });
+    }, 60_000);
+
+    test('a budget that expires after the original is read: no parse or edit work starts, nothing is sent', async () => {
+        let clock = 0;
+        const h = harness();
+        const etag = h.fake.seed(WORK, SERIES_HREF, SERIES);
+        const budget = createWriteBudget({ now: () => clock, lambdaRemainingMs: () => undefined });
+        let parsesAfterExpiry = 0;
+        let expired = false;
+        const counted = { ...budget, newResourceWork: () => { if (expired) { parsesAfterExpiry++; } return budget.newResourceWork(); } };
+        const read = h.fake.multigetEvents.bind(h.fake);
+        h.fake.multigetEvents = async (...args) => {
+            const answer = await read(...args);
+            clock = 40_001;
+            expired = true;
+            return answer;
+        };
+        const deps: WriteDeps = { ...h.deps, budget: counted };
+        expect(await failure(() => updateEvent(deps, updateEventInputSchema.parse({ calendar_id: WORK, resource_href: SERIES_HREF, expected_version: etag, edit_scope: 'all', changes: { title: 'Late' } }) as UpdateEventArgs))).toEqual({ code: 'temporarily_unavailable' });
+        expect<unknown>([parsesAfterExpiry, h.fake.count('putEvent')]).toEqual([0, 0]);
+    });
+
+    test('every parse of the edit work charges the invocation\'s shared line cap: past it, result_too_large and nothing is sent', async () => {
+        // 45,000 lines fit one parse (50,000 per resource) but not the five parses an edit needs (200,000 per invocation).
+        const h = harness();
+        const etag = h.fake.seed(WORK, SINGLE_HREF, SINGLE.replace('SUMMARY:Dentist\r\n', `SUMMARY:Dentist\r\n${Array.from({ length: 45_000 }, (_, index) => `X-L${String(index)}:v\r\n`).join('')}`));
+        expect(await failure(() => update(h, { calendar_id: WORK, resource_href: SINGLE_HREF, expected_version: etag, changes: { title: 'x' } }))).toEqual({ code: 'result_too_large' });
+        expect(h.fake.count('putEvent')).toBe(0);
+    });
+
     test('series target rules: a scope is required; time and rule changes are not supported yet; occurrence-only resources are refused', async () => {
         const h = harness();
         const etag = h.fake.seed(WORK, SERIES_HREF, SERIES);

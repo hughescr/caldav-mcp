@@ -5,9 +5,11 @@
  * follow; the target rules (`targets`) and the per-component plans are where they will plug in.
  *
  * Every call: membership listing → (edits) one multiget of the original, the attendee gate, the target rules and the
- * version check → the text, built by ics-write or ics-edit → the MANDATORY intent gate (`verifyCreateOutcome` /
- * `verifyEditOutcome`) with an expectation derived from the request, never from the builder's report → a deadline guard
- * → ONE conditional request → classification. There is no server-side retry of a write, ever (ORCH B1): a 412 or an
+ * version check → the text, built by ics-write or by ONE ics-edit pass over every selected component → the MANDATORY
+ * intent gate (`verifyCreateOutcome` / ONE `verifyEditOutcome` over every selected component) with an expectation derived
+ * from the request, never from the builder's report → a deadline guard → ONE conditional request → classification. Every
+ * parse checks the invocation's deadline first and charges its shared work caps, so the work is linear in the resource
+ * and bounded per invocation. There is no server-side retry of a write, ever (ORCH B1): a 412 or an
  * uncertain answer is followed by one re-read and a comparison of the requested values with the stored raw text.
  * `write_outcome` is separate from the read-back (ORCH B2): a 2xx is `applied` even when the read-back fails, and after
  * a request was sent, absence or an unchanged ETag never proves that nothing was applied. Only a 412 is a definitive
@@ -21,8 +23,8 @@ import { CalDavError, type CalDavAuth, type CalendarSummary, type Discovery } fr
 import { isDirectChildResource } from '../caldav/identifiers';
 import type { CalDavReadBackend, CalendarResource } from '../caldav/read-contracts';
 import { strongEtag, type CalDavWriteBackend, type StrongEtag, type UpstreamDetail, type WriteCallOptions, type WriteResponse } from '../caldav/write-contracts';
-import type { ReadBudget } from './budget';
-import { describeEvents, editResource, IcsEditError, type ComponentEdit, type ComponentSelector } from './ics-edit';
+import type { ReadBudget, ResourceWork } from './budget';
+import { describeEvents, editResource, IcsEditError, type ComponentEdit, type ComponentPlan, type ComponentSelector } from './ics-edit';
 import {
     hasSchedulingLine, verifyCreateOutcome, verifyEditOutcome, type Companion, type CreateExpectation, type ExpectedAlarm, type ExpectedProperty, type OutcomeVerdict, type PropertyExpectation, type TargetExpectation,
 } from './ics-verify';
@@ -126,6 +128,8 @@ const FIELD_NAMES: ReadonlySet<string> = new Set<WriteErrorField>(['title', 'loc
 
 function builderError(error: unknown): WriteError {
     if (error instanceof WriteError) { return error; }
+    // The invocation's deadline or shared caps, from a parse inside the editor or the verifier.
+    if (error instanceof BudgetError) { return budgetFailure(error); }
     if (error instanceof WriteTimeError) { return invalid(error.reason, error.field); }
     if (error instanceof IcsWriteError) {
         const field = error.field === 'rrule' ? 'recurrence' : error.field;
@@ -168,7 +172,7 @@ function requireVerified(verdict: OutcomeVerdict): void {
 function readFailure(error: unknown): WriteError {
     if (error instanceof WriteError) { return error; }
     if (error instanceof ReadError) { return new WriteError(error.code); }
-    if (error instanceof BudgetError) { return new WriteError(error.kind === 'deadline' ? 'temporarily_unavailable' : 'result_too_large'); }
+    if (error instanceof BudgetError) { return budgetFailure(error); }
     if (error instanceof CalDavError && error.code === 'unauthorized') { return new WriteError('reconnect_required'); }
     return new WriteError('temporarily_unavailable');
 }
@@ -197,11 +201,27 @@ async function reread(deps: WriteDeps, reporter: UnauthorizedReporter, calendarI
     }
 }
 
+/**
+ * The work charge for one parse of this invocation's write work: the deadline is checked first, so no parse (and no edit or
+ * verification built on one) starts once it has passed, and every parse charges the invocation's shared line and property
+ * caps. Throws BudgetError.
+ */
+function parseWork(deps: WriteDeps): () => ResourceWork {
+    return () => {
+        deps.budget.throwIfExpired();
+        return deps.budget.newResourceWork();
+    };
+}
+
+function budgetFailure(error: BudgetError): WriteError {
+    return new WriteError(error.kind === 'deadline' ? 'temporarily_unavailable' : 'result_too_large');
+}
+
 function parseStored(deps: WriteDeps, text: string): OriginalResource {
     try {
-        return parseOriginalResource(text, { work: deps.budget.newResourceWork() });
+        return parseOriginalResource(text, { work: parseWork(deps)() });
     } catch (error) {
-        if (error instanceof BudgetError) { throw new WriteError(error.kind === 'deadline' ? 'temporarily_unavailable' : 'result_too_large'); }
+        if (error instanceof BudgetError) { throw budgetFailure(error); }
         if (error instanceof IcalError && error.reason === 'resource_too_large') { throw new WriteError('result_too_large'); }
         throw unsupported('stored_data_not_editable');
     }
@@ -418,7 +438,7 @@ export async function createEvent(deps: WriteDeps, input: CreateEventArgs): Prom
         rrule: input.recurrence?.rrule,
         alarms: alarm.expected,
     };
-    requireVerified(verifyCreateOutcome(body, expectation));
+    try { requireVerified(verifyCreateOutcome(body, expectation, { work: parseWork(deps) })); } catch (error) { throw builderError(error); }
 
     const request: ComponentRequest = { rid: null, fields: fields.map(fieldLine), triggers: alarm.triggers };
     const { summary, reporter } = await membership(deps, calendarId);
@@ -516,7 +536,7 @@ function planChanges(changes: UpdateChanges): ChangePlan {
 interface TargetComponent { selector: ComponentSelector; rid: string | null; component: EventComponent }
 
 /** The target rules of this release (design 4.3, addendum 1). The occurrence scopes add their rows here. */
-function targets(original: OriginalResource, text: string, scope: 'all' | undefined, plan: ChangePlan): TargetComponent[] {
+function targets(deps: WriteDeps, original: OriginalResource, text: string, scope: 'all' | undefined, plan: ChangePlan): TargetComponent[] {
     if (original.kind === 'occurrence_only' || original.master === null) { throw new WriteError('edit_not_supported', { reason: 'occurrence_only_resource' }); }
     if (original.kind === 'single') {
         // recurrence: null on a single event asks for what is already true; alone it is no change at all.
@@ -527,7 +547,7 @@ function targets(original: OriginalResource, text: string, scope: 'all' | undefi
     if (plan.span !== undefined) { throw new WriteError('edit_not_supported', { reason: 'series_time_change_not_supported' }); }
     if (plan.recurrence !== undefined) { throw new WriteError('edit_not_supported', { reason: 'series_rule_change_not_supported' }); }
     let outlines: ReturnType<typeof describeEvents>;
-    try { outlines = describeEvents(text); } catch (error) { throw builderError(error); }
+    try { outlines = describeEvents(text, { work: parseWork(deps) }); } catch (error) { throw builderError(error); }
     const overrides = outlines.filter(outline => outline.recurrenceId !== null);
     if (overrides.length !== original.overrides.length) { throw unsupported('stored_data_not_editable'); }
     return [
@@ -572,7 +592,7 @@ export async function updateEvent(deps: WriteDeps, input: UpdateEventArgs): Prom
     if (found === null) { throw new WriteError('not_found'); }
     const original = parseStored(deps, found.calendarData);
     const guests = attendeeGate(deps, found.calendarData);
-    const selected = targets(original, found.calendarData, input.edit_scope, plan);
+    const selected = targets(deps, original, found.calendarData, input.edit_scope, plan);
 
     // A repeating rule for a single event: UNTIL must fit the form of the (new or stored) start.
     let rrule: WrittenProperty | null = null;
@@ -596,41 +616,41 @@ export async function updateEvent(deps: WriteDeps, input: UpdateEventArgs): Prom
         throw new WriteError('calendar_changed', { reason: 'version_mismatch' });
     }
 
-    let body = found.calendarData;
+    // ONE edit pass over the resource for every selected component and ONE verification of the result (batch-first: a pass
+    // per component was quadratic in the series). Each component's edits and its expectation are built from the request.
+    let body: string;
     const removed = new Set<Companion>();
     try {
+        const sharedEdits: ComponentEdit[] = plan.fields.map(field => (field.property === null ? { op: 'remove', name: field.name } : { op: 'set', property: field.property }));
+        const sharedProperties: PropertyExpectation[] = plan.fields.map(field => field.expected);
+        if (plan.span !== undefined) {
+            sharedEdits.push({ op: 'remove', name: 'DURATION' });
+            sharedProperties.push({ name: 'DURATION', absent: true });
+        }
+        if (plan.alarms !== undefined) {
+            sharedEdits.push({ op: 'remove_alarms' }, ...(plan.alarms?.components ?? []).map(alarm => ({ op: 'add_alarm' as const, alarm })));
+        }
+        if (rrule !== null) { sharedEdits.push({ op: 'set', property: rrule }); }
+        sharedEdits.push(
+            { op: 'set', property: timeProperty('DTSTAMP', { kind: 'utc', utc: stamp.basic }) },
+            { op: 'set', property: timeProperty('LAST-MODIFIED', { kind: 'utc', utc: stamp.basic }) },
+        );
+        const alarms = plan.alarms === undefined ? {} : { alarms: plan.alarms === null ? { kind: 'removed' as const } : { kind: 'replaced' as const, alarms: plan.alarms.expected } };
+        const rule = plan.recurrence !== undefined && plan.recurrence !== null ? { rrule: plan.recurrence.rrule } : {};
+        const componentPlans: ComponentPlan[] = [];
+        const expectations: TargetExpectation[] = [];
         for (const target of selected) {
             const sequence = nextSequence(target.component);
-            const edits: ComponentEdit[] = plan.fields.map(field => (field.property === null ? { op: 'remove', name: field.name } : { op: 'set', property: field.property }));
-            const properties: PropertyExpectation[] = plan.fields.map(field => field.expected);
-            if (plan.span !== undefined) {
-                edits.push({ op: 'remove', name: 'DURATION' });
-                properties.push({ name: 'DURATION', absent: true });
-            }
-            if (plan.alarms !== undefined) {
-                edits.push({ op: 'remove_alarms' }, ...(plan.alarms?.components ?? []).map(alarm => ({ op: 'add_alarm' as const, alarm })));
-            }
-            if (rrule !== null) { edits.push({ op: 'set', property: rrule }); }
-            edits.push(
-                { op: 'set', property: timeProperty('DTSTAMP', { kind: 'utc', utc: stamp.basic }) },
-                { op: 'set', property: timeProperty('LAST-MODIFIED', { kind: 'utc', utc: stamp.basic }) },
-                { op: 'set', property: sequenceProperty(sequence) },
-            );
-            properties.push(...stampExpectations(stamp, sequence));
-            const expectation: TargetExpectation = {
-                component: target.selector,
-                properties,
-                companionsRemoved: plan.companions,
-                ...(plan.alarms === undefined ? {} : { alarms: plan.alarms === null ? { kind: 'removed' as const } : { kind: 'replaced' as const, alarms: plan.alarms.expected } }),
-                ...(plan.recurrence !== undefined && plan.recurrence !== null ? { rrule: plan.recurrence.rrule } : {}),
-            };
-            const next = editResource(body, { target: target.selector, edits });
-            requireVerified(verifyEditOutcome(body, next.text, { target: expectation }));
-            for (const change of next.report.changes) {
-                if (change.reason === 'paired' && (change.name === 'X-APPLE-STRUCTURED-LOCATION' || change.name === 'X-ALT-DESC')) { removed.add(change.name); }
-            }
-            body = next.text;
+            componentPlans.push({ target: target.selector, edits: [...sharedEdits, { op: 'set', property: sequenceProperty(sequence) }] });
+            expectations.push({ component: target.selector, properties: [...sharedProperties, ...stampExpectations(stamp, sequence)], companionsRemoved: plan.companions, ...alarms, ...rule });
         }
+        const work = parseWork(deps);
+        const next = editResource(found.calendarData, { targets: componentPlans }, { work });
+        requireVerified(verifyEditOutcome(found.calendarData, next.text, { targets: expectations }, { work }));
+        for (const change of next.report.changes) {
+            if (change.reason === 'paired' && (change.name === 'X-APPLE-STRUCTURED-LOCATION' || change.name === 'X-ALT-DESC')) { removed.add(change.name); }
+        }
+        body = next.text;
     } catch (error) {
         throw builderError(error);
     }

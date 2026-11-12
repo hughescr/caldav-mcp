@@ -11,10 +11,10 @@
  *
  * What "unchanged" means, precisely:
  * - calendar-level properties: the same logical lines (unfolded text), in the same order;
- * - every component other than the target, the removed override and the added override (other VEVENTs, VTIMEZONEs, VTODOs,
- *   unknown components, with everything nested in them): the same logical lines in the same order, and in the same order
- *   relative to each other;
- * - the target's other direct properties (every name the expectation does not name): the same logical lines in the same
+ * - every component other than the targets (one, or several distinct ones checked in the same single pass), the removed
+ *   override and the added override (other VEVENTs, VTIMEZONEs, VTODOs, unknown components, with everything nested in
+ *   them): the same logical lines in the same order, and in the same order relative to each other;
+ * - each target's other direct properties (every name the expectation does not name): the same logical lines in the same
  *   relative order (names, parameters, values, multiplicity), and per name deep-equal decoded properties. Order-insensitive
  *   only where the editor may legally place a line: an expected property, a removed companion and an added EXDATE may sit
  *   anywhere among the direct properties; replaced alarms and an added override's lines are compared as multisets.
@@ -29,11 +29,14 @@
  * - no VALARM whose ACTION is not exactly DISPLAY unless the identical VALARM was there before in the same component (an
  *   added override may copy the master's).
  *
- * Linear in the size of both texts. Failures carry a fixed reason and, at most, a property name taken from the expectation;
+ * Linear in the size of both texts, however many targets. Failures carry a fixed reason and, at most, a property name taken from the expectation;
  * never resource text.
  */
-import { parseOriginalResource } from './ical';
-import type { EventComponent, JCalValue, OriginalResource, RawProperty } from './model';
+import { parseOriginalResource, type ParseOptions } from './ical';
+import { BudgetError, type EventComponent, type JCalValue, type OriginalResource, type RawProperty } from './model';
+
+/** The parser's work charge, named through the parser so this module's imports stay the parser and the model. */
+type ResourceWork = NonNullable<ParseOptions['work']>;
 
 // ---- Expectations ----
 
@@ -108,8 +111,21 @@ export interface AddedOverrideExpectation {
  */
 export interface EditExpectation {
     readonly target?: TargetExpectation | undefined;
+    /**
+     * Several targets checked in one verification (`edit_scope: "all"`): each names a distinct component, and each is checked
+     * exactly like `target`. Exclusive with `target`.
+     */
+    readonly targets?: readonly TargetExpectation[] | undefined;
     readonly addOverride?: AddedOverrideExpectation | undefined;
     readonly removeOverride?: { readonly recurrenceId: string } | undefined;
+}
+
+/**
+ * `work`: makes the work charge for each parse of either text. When given, a BudgetError it throws (the invocation's shared
+ * caps or its deadline) propagates out of the verify call unchanged: running out of budget is not a verdict about the text.
+ */
+export interface OutcomeOptions {
+    readonly work?: (() => ResourceWork) | undefined;
 }
 
 export interface CreateExpectation {
@@ -163,6 +179,8 @@ function verdictOf(run: () => void): OutcomeVerdict {
         return { ok: true };
     } catch (error) {
         if (error instanceof Refusal) { return { ok: false, reason: error.reason, property: error.property }; }
+        // Only `parse` lets one through, and only from the caller's own budget (OutcomeOptions).
+        if (error instanceof BudgetError) { throw error; }
         // Anything else is a malformed expectation reaching code that assumed its shape.
         return { ok: false, reason: 'expectation_invalid', property: null };
     }
@@ -325,10 +343,11 @@ function expectedKey(name: string, expected: ExpectedValue): string {
     return canonical([name.toLowerCase(), expected.type, expected.values, params]);
 }
 
-function parse(text: string, failure: OutcomeFailure): OriginalResource {
+function parse(text: string, failure: OutcomeFailure, options: OutcomeOptions): OriginalResource {
     try {
-        return parseOriginalResource(text, {});
-    } catch {
+        return parseOriginalResource(text, options.work === undefined ? {} : { work: options.work() });
+    } catch (error) {
+        if (error instanceof BudgetError && options.work !== undefined) { throw error; }
         return refuse(failure);
     }
 }
@@ -368,11 +387,11 @@ interface Reading {
     readonly master: EventView | null;
 }
 
-function read(text: string, unparseable: OutcomeFailure): Reading {
+function read(text: string, unparseable: OutcomeFailure, options: OutcomeOptions): Reading {
     if (typeof text !== 'string') { return refuse(unparseable); }
     // A lone CR is a break to some readers and data to others; refuse it in either text.
     if (/\r(?!\n)/u.test(text)) { refuse('line_endings'); }
-    const parsed = parse(text, unparseable);
+    const parsed = parse(text, unparseable, options);
     const doc = readDoc(text, unparseable);
     const veventNodes = doc.root.children.filter(child => child.name === 'VEVENT');
     const masters: VNode[] = [];
@@ -804,10 +823,6 @@ function checkAddedOverride(before: Reading, after: Reading, view: EventView, ex
     }
 }
 
-function selects(view: EventView | undefined, selector: TargetSelector): boolean {
-    if (view === undefined) { return false; }
-    return selector.kind === 'master' ? view.rid === null : view.rid === selector.recurrenceId;
-}
 
 function validSelector(selector: unknown): TargetSelector {
     if (typeof selector !== 'object' || selector === null) { return refuse('expectation_invalid', 'target'); }
@@ -825,13 +840,25 @@ function validAlarmExpectation(alarms: unknown, kinds: readonly string[]): void 
     if ((alarms as { kind: string }).kind === 'replaced') { validAlarms((alarms as { alarms: unknown }).alarms); }
 }
 
+const selectorKey = (selector: TargetSelector): string => (selector.kind === 'master' ? MASTER_KEY : overrideKey(selector.recurrenceId));
+
+/** The expectation's targets as one list (`target` and `targets` are exclusive), each naming a distinct component. */
+function targetList(expectation: EditExpectation): readonly TargetExpectation[] {
+    if (expectation.targets === undefined) { return expectation.target === undefined ? [] : [expectation.target]; }
+    if (!Array.isArray(expectation.targets) || expectation.target !== undefined) { return refuse('expectation_invalid', 'target'); }
+    return expectation.targets;
+}
+
 /** The whole expectation is checked before either text is read, so a malformed one is never reported as a text mismatch. */
 function validateEditExpectation(expectation: EditExpectation): void {
     if (typeof expectation !== 'object' || expectation === null) { refuse('expectation_invalid'); }
-    const { target, addOverride, removeOverride } = expectation;
-    if (target !== undefined) {
+    const { addOverride, removeOverride } = expectation;
+    const keys = new Set<string>();
+    for (const target of targetList(expectation)) {
         if (typeof target !== 'object' || target === null) { refuse('expectation_invalid', 'target'); }
-        validSelector(target.component);
+        const key = selectorKey(validSelector(target.component));
+        if (keys.has(key)) { refuse('expectation_invalid', 'target'); }
+        keys.add(key);
         propertyPlan(target.properties, target.companionsRemoved, TARGET_RESERVED);
         if (target.alarms !== undefined) { validAlarmExpectation(target.alarms, ['unchanged', 'replaced', 'removed']); }
         if (target.rrule !== undefined && target.rrule !== null) { decodeRrule(target.rrule); }
@@ -855,7 +882,7 @@ function validateEditExpectation(expectation: EditExpectation): void {
     if (removeOverride !== undefined && (typeof removeOverride !== 'object' || removeOverride === null || typeof removeOverride.recurrenceId !== 'string' || removeOverride.recurrenceId === '')) {
         refuse('expectation_invalid', 'removeOverride');
     }
-    if (target?.component.kind === 'override' && target.component.recurrenceId === removeOverride?.recurrenceId) { refuse('expectation_invalid', 'target'); }
+    if (removeOverride !== undefined && keys.has(overrideKey(removeOverride.recurrenceId))) { refuse('expectation_invalid', 'target'); }
 }
 
 function lineList(doc: Doc, node: VNode): string[] {
@@ -866,22 +893,24 @@ function lineList(doc: Doc, node: VNode): string[] {
  * Checks an edited resource against the request-derived expectation. `before` is the stored text the edit started from,
  * `after` the text about to be sent. Returns `{ ok: true }` only when every rule in the module comment holds.
  */
-export function verifyEditOutcome(before: string, after: string, expectation: EditExpectation): OutcomeVerdict {
+export function verifyEditOutcome(before: string, after: string, expectation: EditExpectation, options: OutcomeOptions = {}): OutcomeVerdict {
     return verdictOf(() => {
         validateEditExpectation(expectation);
-        const old = read(before, 'before_unparseable');
-        const now = read(after, 'after_unparseable');
+        const old = read(before, 'before_unparseable', options);
+        const now = read(after, 'after_unparseable', options);
         hardRules(old, now, expectation.addOverride !== undefined);
-        const target = expectation.target;
-        const selector = target === undefined ? null : validSelector(target.component);
+        // Targets by component key: every lookup below is O(1), so checking every component of a series stays linear.
+        const targets = new Map<string, TargetExpectation>();
+        for (const target of targetList(expectation)) { targets.set(selectorKey(validSelector(target.component)), target); }
+        const eventKey = (event: EventView | undefined): string | undefined => (event === undefined ? undefined : event.rid === null ? MASTER_KEY : overrideKey(event.rid));
+        const masterTarget = targets.get(MASTER_KEY);
 
         // Identity: one UID throughout, and the same kind. A single event becomes a series only by an expected RRULE, a
         // series a single event only by an expected RRULE removal on the master (and nothing else recurring left).
         const uidOf = (reading: Reading): string => (reading.parsed.master ?? reading.parsed.overrides[0])?.uid ?? refuse('structure_mismatch');
         if (uidOf(old) !== uidOf(now)) { refuse('identity_changed', 'UID'); }
-        const onMaster = selector?.kind === 'master';
-        const becameSeries = old.parsed.kind === 'single' && now.parsed.kind === 'series' && onMaster && typeof target?.rrule === 'string';
-        const becameSingle = old.parsed.kind === 'series' && now.parsed.kind === 'single' && onMaster && target?.rrule === null;
+        const becameSeries = old.parsed.kind === 'single' && now.parsed.kind === 'series' && typeof masterTarget?.rrule === 'string';
+        const becameSingle = old.parsed.kind === 'series' && now.parsed.kind === 'single' && masterTarget?.rrule === null;
         if (old.parsed.kind !== now.parsed.kind && !becameSeries && !becameSingle) { refuse('identity_changed', 'kind'); }
 
         const oldCalendar = lineList(old.doc, old.doc.root);
@@ -894,18 +923,27 @@ export function verifyEditOutcome(before: string, after: string, expectation: Ed
         const nowView = new Map(now.events.map(event => [event.node, event]));
         const oldTop = old.doc.root.children.filter(node => removedRid === null || oldView.get(node)?.rid !== removedRid);
         if (removedRid !== null && old.events.filter(event => event.rid === removedRid).length !== 1) { refuse('override_mismatch', 'removeOverride'); }
-        if (selector !== null && old.events.filter(event => selects(event, selector)).length !== 1) { refuse('target_not_found', 'target'); }
+        // Each target names exactly one component of the original.
+        const oldCounts = new Map<string, number>();
+        for (const event of old.events) {
+            const key = eventKey(event) ?? '';
+            oldCounts.set(key, (oldCounts.get(key) ?? 0) + 1);
+        }
+        for (const key of targets.keys()) {
+            if (oldCounts.get(key) !== 1) { refuse('target_not_found', 'target'); }
+        }
         let added: EventView | null = null;
-        let pairedTarget: [EventView, EventView] | null = null;
+        const pairedTargets = new Map<string, [EventView, EventView]>();
         let cursor = 0;
         const nowTop = now.doc.root.children;
         for (const node of oldTop) {
             const oldEvent = oldView.get(node);
-            const isTarget = selector !== null && selects(oldEvent, selector);
+            const key = eventKey(oldEvent);
+            const isTarget = key !== undefined && targets.has(key);
             let partner = nowTop[cursor];
             const matches = (candidate: VNode | undefined): boolean => {
                 if (candidate === undefined) { return false; }
-                if (isTarget) { return selects(nowView.get(candidate), selector); }
+                if (isTarget) { return eventKey(nowView.get(candidate)) === key; }
                 return blockKey(blockOf(old.doc, node)) === blockKey(blockOf(now.doc, candidate));
             };
             if (!matches(partner) && expectation.addOverride !== undefined && added === null && partner !== undefined && nowView.get(partner)?.rid !== null && nowView.has(partner)) {
@@ -914,7 +952,7 @@ export function verifyEditOutcome(before: string, after: string, expectation: Ed
                 partner = nowTop[cursor];
             }
             if (!matches(partner)) { refuse(isTarget ? 'target_not_found' : 'component_changed'); }
-            if (isTarget && oldEvent !== undefined && partner !== undefined) { pairedTarget = [oldEvent, nowView.get(partner) ?? refuse('structure_mismatch')]; }
+            if (isTarget && key !== undefined && oldEvent !== undefined && partner !== undefined) { pairedTargets.set(key, [oldEvent, nowView.get(partner) ?? refuse('structure_mismatch')]); }
             cursor++;
         }
         if (cursor < nowTop.length && expectation.addOverride !== undefined && added === null) {
@@ -929,9 +967,10 @@ export function verifyEditOutcome(before: string, after: string, expectation: Ed
         }
         if (expectation.addOverride !== undefined && added === null) { refuse('override_mismatch', 'addOverride'); }
 
-        if (target !== undefined) {
-            if (pairedTarget === null) { return refuse('target_not_found', 'target'); }
-            checkTarget(old, pairedTarget[0], now, pairedTarget[1], target);
+        for (const [key, target] of targets) {
+            const paired = pairedTargets.get(key);
+            if (paired === undefined) { return refuse('target_not_found', 'target'); }
+            checkTarget(old, paired[0], now, paired[1], target);
         }
         if (expectation.addOverride !== undefined && added !== null) { checkAddedOverride(old, now, added, expectation.addOverride); }
     });
@@ -942,7 +981,7 @@ export function verifyEditOutcome(before: string, after: string, expectation: Ed
  * the expected DISPLAY alarms, no ATTENDEE, ORGANIZER or ATTACH anywhere, no other component than `vtimezoneCount`
  * VTIMEZONEs (default none), and only VERSION, PRODID and CALSCALE at calendar level.
  */
-export function verifyCreateOutcome(text: string, expectation: CreateExpectation): OutcomeVerdict {
+export function verifyCreateOutcome(text: string, expectation: CreateExpectation, options: OutcomeOptions = {}): OutcomeVerdict {
     return verdictOf(() => {
         // The whole expectation first, before the text is read.
         if (typeof expectation !== 'object' || expectation === null || !Array.isArray(expectation.properties)) { refuse('expectation_invalid'); }
@@ -955,7 +994,7 @@ export function verifyCreateOutcome(text: string, expectation: CreateExpectation
         const wantedRule = expectation.rrule === undefined ? null : decodeRrule(expectation.rrule);
         const alarms = validAlarms(expectation.alarms);
 
-        const now = read(text, 'after_unparseable');
+        const now = read(text, 'after_unparseable', options);
         hardRules(null, now, false);
         const events = now.doc.root.children.filter(child => child.name === 'VEVENT');
         const zones = now.doc.root.children.filter(child => child.name === 'VTIMEZONE');

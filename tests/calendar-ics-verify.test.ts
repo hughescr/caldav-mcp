@@ -3,6 +3,7 @@ import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { describeEvents, editResource, verifyUntouched, type ComponentEdit, type EditPlan, type EventOutline, type NewComponentItem } from '../src/calendar/ics-edit';
 import { hasSchedulingLine, isSchedulingName, verifyCreateOutcome, verifyEditOutcome, type CreateExpectation, type EditExpectation, type ExpectedProperty, type OutcomeVerdict } from '../src/calendar/ics-verify';
+import { BudgetError } from '../src/calendar/model';
 import {
     buildCreateResource, displayAlarm, rruleProperty, sequenceProperty, statusProperty, textProperty, timeProperty, transparencyProperty, travelDurationProperty, type CreateEventInput,
 } from '../src/calendar/ics-write';
@@ -559,6 +560,56 @@ describe('independence and cost', () => {
         started = performance.now();
         expect<unknown>(verifyEditOutcome(before, removed, { target: { component: { kind: 'master' }, alarms: { kind: 'removed' } } })).toEqual({ ok: true });
         expect<unknown>(performance.now() - started).toBeLessThan(2000);
+    });
+});
+
+describe('verifyEditOutcome over several components in one pass (security review finding 5)', () => {
+    const selectors = [{ kind: 'master' }, { kind: 'override', recurrenceId: RID_DEC08 }, { kind: 'override', recurrenceId: RID_DEC22 }] as const;
+    const edits = (sequence: number): ComponentEdit[] => [
+        { op: 'set', property: textProperty('SUMMARY', 'Renamed') },
+        { op: 'set', property: timeProperty('DTSTAMP', NOW) },
+        { op: 'set', property: timeProperty('LAST-MODIFIED', NOW) },
+        { op: 'set', property: sequenceProperty(sequence) },
+    ];
+    // Hand-written from the request: the same title and stamps everywhere, each component its own SEQUENCE.
+    const expectations = selectors.map((component, index) => ({ component, properties: [text('SUMMARY', 'Renamed'), ...STAMPS(index + 7)] }));
+    const ALL = editResource(FIXTURE, { targets: selectors.map((target, index) => ({ target, edits: edits(index + 7) })) });
+
+    test('the one-pass output of every component passes one verification; each component is held to its own expectation', () => {
+        expect<unknown>(verifyEditOutcome(FIXTURE, ALL.text, { targets: expectations })).toEqual({ ok: true });
+        // One override's SEQUENCE as another's: that component fails, whichever it is.
+        const swapped = expectations.map((item, index) => (index === 2 ? { ...item, properties: [text('SUMMARY', 'Renamed'), ...STAMPS(8)] } : item));
+        expect(failure(verifyEditOutcome(FIXTURE, ALL.text, { targets: swapped }))).toBe('property_mismatch');
+        // A component edited but not expected, or expected but not edited, is a change elsewhere or a mismatch.
+        expect(failure(verifyEditOutcome(FIXTURE, ALL.text, { targets: expectations.slice(0, 2) }))).toBe('component_changed');
+        const masterOnly = editResource(FIXTURE, { target: { kind: 'master' }, edits: edits(7) }).text;
+        expect(failure(verifyEditOutcome(FIXTURE, masterOnly, { targets: expectations }))).toBe('property_mismatch');
+    });
+
+    test('the hard rules hold in every component: an ATTENDEE slipped into one override among many is refused', () => {
+        const injected = insertAfter(ALL.text, RID_DEC22, 'ATTENDEE:mailto:x@example.test');
+        expect(failure(verifyEditOutcome(FIXTURE, injected, { targets: expectations }))).toBe('scheduling_added');
+        const grouped = insertAfter(ALL.text, RID_DEC08, 'item9.ORGANIZER:mailto:x@example.test');
+        expect(failure(verifyEditOutcome(FIXTURE, grouped, { targets: expectations }))).toBe('scheduling_added');
+    });
+
+    test('a component named twice, both forms at once, or a component that does not exist is refused', () => {
+        expect(failure(verifyEditOutcome(FIXTURE, ALL.text, { targets: [...expectations, expectations[0] as (typeof expectations)[number]] }))).toBe('expectation_invalid');
+        expect(failure(verifyEditOutcome(FIXTURE, ALL.text, { target: expectations[0], targets: expectations.slice(1) }))).toBe('expectation_invalid');
+        expect(failure(verifyEditOutcome(FIXTURE, ALL.text, { targets: [...expectations, { component: { kind: 'override', recurrenceId: `${RID_DEC08}0` }, properties: [] }] }))).toBe('target_not_found');
+        expect(failure(verifyEditOutcome(FIXTURE, ALL.text, { targets: expectations, removeOverride: { recurrenceId: RID_DEC22 } }))).toBe('expectation_invalid');
+    });
+
+    test('with the caller\'s work charge, every parse charges it and a budget failure propagates instead of becoming a verdict', () => {
+        let parses = 0;
+        expect<unknown>(verifyEditOutcome(FIXTURE, ALL.text, { targets: expectations }, { work: () => { parses++; return { chargeLines: () => undefined, chargeProperties: () => undefined }; } })).toEqual({ ok: true });
+        expect(parses).toBe(2);
+        let thrown: unknown = null;
+        try { verifyEditOutcome(FIXTURE, ALL.text, { targets: expectations }, { work: () => ({ chargeLines: () => { throw new BudgetError('deadline'); }, chargeProperties: () => undefined }) }); } catch (error) { thrown = error; }
+        expect<unknown>(thrown instanceof BudgetError && thrown.kind).toBe('deadline');
+        thrown = null;
+        try { verifyCreateOutcome(FIXTURE, { properties: [], alarms: [] }, { work: () => ({ chargeLines: () => { throw new BudgetError('work'); }, chargeProperties: () => undefined }) }); } catch (error) { thrown = error; }
+        expect<unknown>(thrown instanceof BudgetError && thrown.kind).toBe('work');
     });
 });
 

@@ -469,7 +469,12 @@ released (single-occurrence scopes and series moves are the next build).
 - Before every `PUT`, an independent check (`verifyCreateOutcome` or `verifyEditOutcome`)
   compares the text about to be sent with an expectation derived from the request; any
   difference, or any added `ATTENDEE`, `ORGANIZER`, `ATTACH` or non-display alarm, stops the
-  write with nothing sent.
+  write with nothing sent. A whole-series edit changes every component in one editor pass and
+  checks them in one verification, so its work is linear in the stored event. Every parse of
+  that work first checks the call's deadline and is charged to the call's shared limits
+  (200,000 lines): a stored event too large for them (above about 40,000 lines) is refused with
+  `result_too_large`, and a call out of time with `temporarily_unavailable`, before anything
+  is sent.
 - Invitations: iCloud emails guests at once when the time or description of an event with
   attendees changes or the event is deleted (an alarm-only or `TRANSP`-only change sent none),
   and `SCHEDULE-AGENT` cannot suppress it (probe, 2026-11-12). The write tools take no
