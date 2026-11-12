@@ -13,19 +13,37 @@ import {
 import { DEFAULT_EVENTS, EDGE_INCLUSION_SENTENCE } from './calendar/limits';
 import { RESPONSE_TOO_LARGE_MESSAGE, shapeDownloadResult, shapeEventDetail, shapeEventsResult, type WireContext } from './calendar/shape';
 import type { ErrorDetail } from './calendar/read';
+import { DEFAULT_SCOPE, SCOPE_LABELS } from './auth/scopes';
 
 type ToolName = keyof BoundCalendarService;
 const DOWNLOAD_TOOL = 'get_event_attachment_download';
-const requiredScope: Record<ToolName, string> = {
-    list_calendars: 'calendar:read', list_events: 'calendar:read', search_events: 'calendar:read', get_event: 'calendar:read', get_event_attachment_download: 'calendar:read',
+/** Every listed scope must be granted. The tuple type keeps a tool from ever having an empty, always-passing list. */
+type RequiredScopes = readonly [string, ...string[]];
+const READ: RequiredScopes = ['calendar:read'];
+const requiredScope: Record<ToolName, RequiredScopes> = {
+    list_calendars: READ, list_events: READ, search_events: READ, get_event: READ, get_event_attachment_download: READ,
 };
+/** Scopes of `required` missing from `granted`, in the order `required` lists them. */
+export function missingScopes(required: readonly string[], granted: readonly string[] | undefined): string[] {
+    return required.filter(scope => !granted?.includes(scope));
+}
+/**
+ * Fixed text only: scope names and their consent-page labels. Read has no checkbox, because the page
+ * always includes it when the client requests it; every other scope is a box the user must tick.
+ */
+export function insufficientScopeMessage(missing: readonly string[]): string {
+    const steps = missing.map(scope => scope === DEFAULT_SCOPE
+        ? `allow "${SCOPE_LABELS[scope] ?? scope}" (the page always includes it when the client requests ${scope})`
+        : `tick "${SCOPE_LABELS[scope] ?? scope}"`);
+    return `Access denied. This tool requires ${missing.join(' and ')}, which this connection was not granted. The user must reconnect this connector and, on the consent page, ${steps.join(' and ')}.`;
+}
 const annotations = { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true } as const;
 const objectRoot = { type: 'object' } as const;
 
-const messages: Record<ToolErrorCode, (name: ToolName, detail: ErrorDetail | undefined) => string> = {
+const messages: Record<ToolErrorCode, (name: ToolName, detail: ErrorDetail | undefined, missing: readonly string[] | undefined) => string> = {
     reconnect_required: () => 'Reconnect your iCloud account before using this tool.',
     temporarily_unavailable: () => 'iCloud Calendar is temporarily unavailable. Please try again later.',
-    insufficient_scope: name => `Access denied. This tool requires ${requiredScope[name]}; reconnect and authorize that scope if it is missing.`,
+    insufficient_scope: (name, _detail, missing) => insufficientScopeMessage(missing?.length ? missing : requiredScope[name]),
     upstream_error: () => 'iCloud returned a response this server could not use safely. Please try again later.',
     invalid_input: () => INVALID_INPUT_MESSAGE,
     not_found: name => (name === DOWNLOAD_TOOL ? 'The requested calendar, event or attachment was not found.' : 'The requested calendar, event or occurrence was not found.'),
@@ -40,10 +58,10 @@ const messages: Record<ToolErrorCode, (name: ToolName, detail: ErrorDetail | und
     verification_failed: () => 'The attachment could not be verified safely. Please try again later.',
 };
 
-function failure(error: unknown, name: ToolName, requestId: string): CallToolResult {
+function failure(error: unknown, name: ToolName, requestId: string, missing?: readonly string[]): CallToolResult {
     const parsed = error instanceof CalendarError ? toolErrorCodeSchema.safeParse(error.code) : undefined;
     const code: ToolErrorCode = parsed?.success ? parsed.data : 'temporarily_unavailable';
-    const message = `${messages[code](name, error instanceof CalendarError ? error.detail : undefined)} Request ID: ${requestId}.`;
+    const message = `${messages[code](name, error instanceof CalendarError ? error.detail : undefined, missing)} Request ID: ${requestId}.`;
     // Only fixed messages and a server UUID: with the boundary's 128-unit id cap, either wire codec fits 4 KiB.
     const payload = { error: { code, message, request_id: requestId } };
     // eslint-disable-next-line no-console -- Only the tool name, a server-generated ID and an allowlisted code are logged.
@@ -115,7 +133,8 @@ function createServer(calendar: BoundCalendarService): CalendarMcpServer {
     const server = new CalendarMcpServer();
     const execute = async (name: ToolName, context: ServerContext, run: () => Promise<CallToolResult>): Promise<CallToolResult> => {
         const { requestId } = server.invocation(name, context);
-        if (!context.http?.authInfo?.scopes.includes(requiredScope[name])) { return failure(new CalendarError('insufficient_scope'), name, requestId); }
+        const missing = missingScopes(requiredScope[name], context.http?.authInfo?.scopes);
+        if (missing.length > 0) { return failure(new CalendarError('insufficient_scope'), name, requestId, missing); }
         try {
             const result = await withRequestId(requestId, run);
             // Shape owns sizing; convert its small fixed failures to the common error envelope with a request id.

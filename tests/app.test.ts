@@ -30,7 +30,7 @@ test('configured discovery and missing bearer need no secret access', async () =
 });
 
 test('discovery advertises exactly the calendar scopes from the single SCOPES source', async () => {
-    expect(SCOPES).toEqual(['calendar:read', 'calendar:write', 'calendar:invite']);
+    expect(SCOPES).toEqual(['calendar:read', 'calendar:write', 'calendar:delete', 'calendar:invite']);
     const app = createApp({ config, runtime: async () => { throw new Error('must not load'); } });
     const metadata = await (await app.request('/.well-known/oauth-authorization-server')).json();
     expect(metadata.scopes_supported).toEqual(SCOPES);

@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, expect, spyOn, test, type Mock } from 'bun:test';
 import { CLIENT_CAPABILITIES_META_KEY, CLIENT_INFO_META_KEY, PROTOCOL_VERSION_META_KEY, SERVER_INFO_META_KEY, type AuthInfo } from '@modelcontextprotocol/server';
-import { handleMcp } from '../src/mcp';
+import { handleMcp, insufficientScopeMessage, missingScopes } from '../src/mcp';
 import { createApp } from '../src/app';
 import { bindCalendarService, CalendarError, type BoundCalendarService } from '../src/calendar/service';
 import { MAX_CALENDARS } from '../src/calendar/schemas';
@@ -302,8 +302,23 @@ test('the scope check precedes the bound service', async () => {
         expect(result.isError).toBe(true);
         expect(result.structuredContent.error.code).toBe('insufficient_scope');
         expect(result.content[0].text).toContain('calendar:read');
+        expect(result.structuredContent.error.message).toBe(`${insufficientScopeMessage(['calendar:read'])} Request ID: ${result.structuredContent.error.request_id}.`);
     }
     expect(f.calls()).toBe(0);
+});
+
+test('the scope check needs every listed scope and names only the missing ones', () => {
+    expect(missingScopes(['calendar:read', 'calendar:write', 'calendar:delete'], ['calendar:delete', 'calendar:read'])).toEqual(['calendar:write']);
+    expect(missingScopes(['calendar:read', 'calendar:write'], undefined)).toEqual(['calendar:read', 'calendar:write']);
+    expect(missingScopes(['calendar:read'], ['calendar:read', 'calendar:invite'])).toEqual([]);
+});
+
+test('insufficient_scope tells the agent which permission the user must tick on reconnect', () => {
+    expect(insufficientScopeMessage(['calendar:write'])).toBe('Access denied. This tool requires calendar:write, which this connection was not granted. The user must reconnect this connector and, on the consent page, tick "Create and change events".');
+    expect(insufficientScopeMessage(['calendar:delete', 'calendar:invite'])).toBe('Access denied. This tool requires calendar:delete and calendar:invite, which this connection was not granted. The user must reconnect this connector and, on the consent page, tick "Delete events (whole events, single occurrences, or all following occurrences)" and tick "Change events that involve other people. iCloud emails them at once: invitations, updates and cancellations from your Apple Account. Has effect only together with create/change or delete.".');
+    expect(insufficientScopeMessage(['calendar:read'])).toBe('Access denied. This tool requires calendar:read, which this connection was not granted. The user must reconnect this connector and, on the consent page, allow "Read your calendars and events" (the page always includes it when the client requests calendar:read).');
+    // The longest possible message stays well inside the 4 KiB error budget.
+    expect(insufficientScopeMessage(['calendar:read', 'calendar:write', 'calendar:delete', 'calendar:invite']).length).toBeLessThan(1024);
 });
 
 test('caller-supplied identity, credential or URL arguments are rejected', async () => {

@@ -4,7 +4,7 @@ A small remote MCP server that lets Claude clients read Apple iCloud calendars o
 
 ## Status
 
-Version 0.3.0 is released and live on 2026-11-12 at https://caldav-mcp.rungie.com. It has five tools: `list_calendars`, `list_events`, `search_events`, `get_event` and `get_event_attachment_download`. It also has a restyled sign-in page. On develop, not released: the download result no longer carries a separate `resource_link` content block, so the presigned link appears once in the text content and once in `structuredContent`. Version 0.2.1 was deployed on 2026-11-12, and its deploy verification passed. Version 0.1.1 was released and deployed on 2026-11-11. The owner connected it from a Claude client and reported that `list_calendars` worked. This was not checked independently from server logs.
+Version 0.3.0 is released and live on 2026-11-12 at https://caldav-mcp.rungie.com. It has five tools: `list_calendars`, `list_events`, `search_events`, `get_event` and `get_event_attachment_download`. It also has a restyled sign-in page. On develop, not released: the download result no longer carries a separate `resource_link` content block, so the presigned link appears once in the text content and once in `structuredContent`. Also on develop, not released: the sign-in page lets the user choose which requested permissions to grant, and a new scope `calendar:delete` exists (see "Scopes"). Version 0.2.1 was deployed on 2026-11-12, and its deploy verification passed. Version 0.1.1 was released and deployed on 2026-11-11. The owner connected it from a Claude client and reported that `list_calendars` worked. This was not checked independently from server logs.
 
 The tools of 0.2.1 were verified locally, end to end, against one real iCloud account on 2026-11-12: all 11 calendars answered, and a one-year query returned 210 events with 0 unreadable. The download tool was verified locally the same day against one real iCloud account, with an in-memory store in place of S3. Six managed attachments (PNG, JPEG and PDF, 35 KB to 19.2 MB) were fetched anonymously from Apple's attachment host, and each staged copy began with the correct file signature. Three external-link attachments were returned as links without being fetched. The real S3 upload and presigned link were verified on 2026-11-12 on the live 0.3.0 service through a Claude client: a 43,935-byte managed PNG was staged, the presigned link returned exactly those bytes as a forced download with server-side encryption, and the unsigned object URL was refused with 403. A real inline attachment is still unverified; none exists in the owner's data.
 
@@ -77,7 +77,7 @@ A short query can miss an occurrence that was moved more than 31 days away from 
 
 ## Account connection
 
-A client discovers this server's own OAuth endpoints and opens one page at `/authorize`. That page shows the client name, the client's redirect host, the scopes requested as a read-only list, and two fields: Apple ID and app-specific password. It is styled by one built-in inline style block that the page's Content-Security-Policy allows by hash; the page loads no scripts or outside resources. A help link beside the password field opens Apple's article on app-specific passwords. Its one outbound link, beside the password label, opens Apple's article on creating an app-specific password (`https://support.apple.com/102654`) in a new tab without sending a referrer. There is no second consent page and no TOTP step. The form posts to `/auth/connect`.
+A client discovers this server's own OAuth endpoints and opens one page at `/authorize`. That page shows the client name, the client's redirect host, two fields (Apple ID and app-specific password) and the requested permissions. Read access, when requested, is a fixed row; every other requested permission is a checkbox the user can tick or untick (see "Scopes"; on develop, not released). It is styled by one built-in inline style block that the page's Content-Security-Policy allows by hash; the page loads no scripts or outside resources. A help link beside the password field opens Apple's article on app-specific passwords. Its one outbound link, beside the password label, opens Apple's article on creating an app-specific password (`https://support.apple.com/102654`) in a new tab without sending a referrer. There is no second consent page and no TOTP step. The form posts to `/auth/connect`.
 
 Use an app-specific password that you create only for this connector. Apple lets you revoke each one on its own.
 
@@ -108,9 +108,18 @@ The login throttle allows 5 attempts per account in each 15-minute window. An at
 
 ### Scopes
 
-- `calendar:read` is the default. It allows `list_calendars`, `list_events`, `search_events`, `get_event` and `get_event_attachment_download`.
-- `calendar:write` is reserved for later phases. No tool uses it yet.
-- `calendar:invite` is also reserved. Saving an event with attendees may make iCloud send invitations, so requesting this scope adds a separate required checkbox on the login page.
+The user decides on the login page which of the requested permissions the client gets. The scopes and their checkbox labels (on develop, not released; release 0.3.0 shows the requested scopes as a fixed list, with a required acknowledgment for `calendar:invite`):
+
+| Scope | On the login page | Used by |
+|---|---|---|
+| `calendar:read` | Fixed row "Read your calendars and events (always included)". It is the default when a client requests no scope. | `list_calendars`, `list_events`, `search_events`, `get_event`, `get_event_attachment_download` |
+| `calendar:write` | Checkbox "Create and change events", ticked by default | no tool yet |
+| `calendar:delete` | Checkbox "Delete events (whole events, single occurrences, or all following occurrences)", ticked by default | no tool yet |
+| `calendar:invite` | Checkbox marked SENSITIVE, "Change events that involve other people. iCloud emails them at once: invitations, updates and cancellations from your Apple Account. Has effect only together with create/change or delete.", not ticked by default | no tool yet |
+
+A checkbox appears only for a scope the client requested. The client gets read (if it asked for it) plus the boxes left ticked, and the token response's `scope` names exactly that set, which may be narrower than the request. If nothing is granted (possible only when the client did not request read), the page says "Choose at least one permission", and nothing is stored and iCloud is not contacted. A refresh can keep or narrow the granted scopes, never widen them. To grant more, reconnect and tick the box. A tool called without a scope it needs returns `insufficient_scope`, naming the scope and the checkbox to tick.
+
+`calendar:write` used to mean "create, change and delete events". Deleting now needs `calendar:delete`. No tool uses either scope yet, so connections made before this change behave as before, and their grants are not changed.
 
 ### Token lifetimes
 

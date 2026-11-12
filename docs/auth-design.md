@@ -58,28 +58,59 @@ Allowlist membership is observable to anyone probing the login endpoint, and thi
 
 ## Login flow
 
-One page, `GET /authorize`, shows the client name and identity host (the CIMD hostname, or "Registered OAuth client"), the redirect hostname, the requested scopes, an Apple ID field (`autocomplete="username"`), an app-specific password field (`type="password"`, `autocomplete="off"`, at most 256 characters) with a "How do I generate an app-specific password?" link to Apple's instructions, an `allow_invite` checkbox only when `calendar:invite` is requested, and "Connect and allow" / "Cancel" buttons. It posts to `/auth/connect`. There is no TOTP step and no separate consent step: the user's own app-specific password is the consent credential for this connector.
+One page, `GET /authorize`, shows the client name and identity host (the CIMD hostname, or "Registered OAuth client"), the redirect hostname, an Apple ID field (`autocomplete="username"`), an app-specific password field (`type="password"`, `autocomplete="off"`, at most 256 characters) with a "How do I generate an app-specific password?" link to Apple's instructions, the permission rows (see "Scopes and consent"), and "Connect and allow" / "Cancel" buttons. It posts to `/auth/connect`. There is no TOTP step and no separate consent step: the user's own app-specific password is the consent credential for this connector.
 
 The flow cookie `__Host-caldav-flow` is sealed (`browser-flow` purpose), `Secure; HttpOnly; SameSite=Lax`, ten minutes, and holds only `{deadline, csrf, flowId, binding}`. `binding` is a digest of the public OAuth request fields.
 
 `POST /auth/connect` runs in this order:
 
-1. `Origin` must equal the issuer; the body is a bounded, duplicate-free form; the CSRF token and request binding must match the cookie.
-2. `decision=cancel` redirects with `error=access_denied` (no credential is read or sent anywhere). Any decision other than `allow` is rejected.
-3. If `calendar:invite` was requested, `allow_invite=yes` is required.
+1. `Origin` must equal the issuer; the body is a bounded form in which only `grant` may repeat; the CSRF token and request binding must match the cookie.
+2. `decision=cancel` redirects with `error=access_denied` (no credential is read or sent anywhere, and `grant` is ignored). Any decision other than `allow` is rejected.
+3. The `grant` values are checked and the granted set computed; an empty grant gets the "Choose at least one permission" page (see "Scopes and consent").
 4. The Apple ID is normalized (trim, lowercase, plain ASCII address). The password is trimmed of surrounding whitespace only; hyphens are kept.
 5. Allowlist check.
 6. Throttle reservation: one sign-in attempt is counted before iCloud sees it (see "Login throttle").
 7. `caldav.discover` proves the credentials with iCloud. Discovered URLs must pass the fixed-host rule. A rejected sign-in keeps its reservation; any other outcome releases it.
-8. Duplicate check, then `connectOrReconnect`, then `issueCode`, then the redirect with `code`, `iss` and `state`.
+8. Duplicate check, then `connectOrReconnect`, then `issueCode` with the granted scopes, then the redirect with `code`, `iss` and `state`.
 
 Invalid Apple ID syntax, an empty or oversized password, a non-allowlisted Apple ID and a wrong password all return the same static page with HTTP 400: "Sign-in failed. Check the Apple ID and app-specific password, then start the connection again." A throttled account gets 429. An upstream temporary or protocol failure, a discovery URL outside the fixed hosts, or a store failure gets 503. Failures after discovery also render these static pages: a concurrent reconnect that wins the generation change, or a session check that now fails, gets the 400 page; a temporary store or upstream error while storing the credential or issuing the code gets the 503 page. Failure pages never echo submitted fields, and every one clears the flow cookie.
 
-Form pages use `Referrer-Policy: same-origin` (so Chromium sends a trustworthy `Origin` on the POST) and a CSP of `default-src 'none'; style-src 'sha256-<hash of the page style>'; form-action 'self' <callback origin>; frame-ancestors 'none'; base-uri 'none'`. Redirects use `Referrer-Policy: no-referrer`. Every page the browser flow serves (the form and the 400, 429 and 503 failure pages) embeds the same single `<style>` block from `src/auth/page-style.ts`, and the CSP allows exactly that text by its SHA-256 hash, computed at module load. The pages have no `style=` attributes, no scripts and no third-party assets, so the policy needs neither `'unsafe-inline'` nor a nonce. The form's single `<a>` to Apple's app-specific password article (`https://support.apple.com/102654`, a fixed constant, `target="_blank" rel="noopener noreferrer" referrerpolicy="no-referrer"`) is a navigation, which `default-src` does not govern, so the policy and `form-action` are unchanged; the page-level `same-origin` referrer policy stays because `no-referrer` would make Chromium send `Origin: null` on the POST. The link sits after the password input in the DOM (CSS `order` places it in the label row) and outside the `<label>`, so tabbing from the field is not detoured and clicking the link does not focus the field. Editing the style block changes the hash with it.
+Form pages use `Referrer-Policy: same-origin` (so Chromium sends a trustworthy `Origin` on the POST) and a CSP of `default-src 'none'; style-src 'sha256-<hash of the page style>'; form-action 'self' <callback origin>; frame-ancestors 'none'; base-uri 'none'`. Redirects use `Referrer-Policy: no-referrer`. Every page the browser flow serves (the form, the empty-grant page and the 400, 429 and 503 failure pages) embeds the same single `<style>` block from `src/auth/page-style.ts`, and the CSP allows exactly that text by its SHA-256 hash, computed at module load. The pages have no `style=` attributes, no scripts and no third-party assets, so the policy needs neither `'unsafe-inline'` nor a nonce. The form's single `<a>` to Apple's app-specific password article (`https://support.apple.com/102654`, a fixed constant, `target="_blank" rel="noopener noreferrer" referrerpolicy="no-referrer"`) is a navigation, which `default-src` does not govern, so the policy and `form-action` are unchanged; the page-level `same-origin` referrer policy stays because `no-referrer` would make Chromium send `Origin: null` on the POST. The link sits after the password input in the DOM (CSS `order` places it in the label row) and outside the `<label>`, so tabbing from the field is not detoured and clicking the link does not focus the field. Editing the style block changes the hash with it.
 
 **Duplicate delivery.** If the active, unexpired connection already holds identical credentials (same Apple ID, same password compared in constant time, same URLs), it is reused without bumping the credential generation, so an already returned code stays valid and the grants of other clients already using that credential keep working. Each delivery still runs discovery, so it is re-proven with iCloud. Anything else, including the same password for a connection that is `reconnect_required`, expired or `revoked`, is a fresh, iCloud-proven replacement under the next credential generation. An unreadable old ciphertext (retired key, damage) never blocks a replacement.
 
 **Reconnect.** A login for an Apple ID that already has a connection replaces its credential with a conditional generation change. That ends every existing grant for the account, for every client; each client must authorize again.
+
+## Scopes and consent
+
+On develop, not released. Release 0.3.0 lists the requested scopes as fixed rows and requires an `allow_invite=yes` acknowledgment when `calendar:invite` is requested; that field no longer exists.
+
+The owner's decision: "We want the user to be in full control of what they are allowing their agent to do." So the user picks the permissions on the login page.
+
+Scopes are defined once in `src/auth/scopes.ts` (`SCOPES`, in page order, with their labels), re-exported by `src/auth/http.ts`, and advertised as `scopes_supported` in both metadata documents:
+
+| Scope | Page row | `name="grant"` checkbox | Default |
+|---|---|---|---|
+| `calendar:read` | "Read your calendars and events (always included)", a fixed list row with the check marker, not an input | none | always granted when requested; the default when a client requests no scope |
+| `calendar:write` | "Create and change events" | `value="calendar:write"` | ticked |
+| `calendar:delete` | "Delete events (whole events, single occurrences, or all following occurrences)" | `value="calendar:delete"` | ticked |
+| `calendar:invite` | SENSITIVE marker, "Change events that involve other people. iCloud emails them at once: invitations, updates and cancellations from your Apple Account. Has effect only together with create/change or delete." | `value="calendar:invite"` | not ticked |
+
+Only requested scopes get a row, in the order above. With at least one checkbox the rows sit in a `<fieldset>` with the legend "Choose permissions"; each checkbox is a whole-row `<label>` at least 48 px high. A read-only request has nothing to choose and keeps the plain "Requested permissions" list.
+
+The default tick state is the orchestrator's ruling, not the owner's, and differs from the write-tools design (which had every box unticked): the user came to connect an agent to their calendar and can untick write or delete, while anything that makes iCloud send mail needs a deliberate tick.
+
+The POST carries one `grant` field per ticked box. `grant` is the only field that may repeat. The granted set is computed after the CSRF and request-binding check, so it can only draw on the `scope` value bound into the flow:
+
+- Every `grant` value must be a scope the page offered for this request (requested, and not `calendar:read`), and no value may appear twice. An unknown, empty, unrequested, duplicated or `calendar:read` value is `invalid_request` (a JSON 400), before any store write or iCloud request.
+- Grant = requested ∩ {`calendar:read`} ∪ ticked.
+- An empty grant (possible only when read was not requested) renders a fixed 400 page, "Choose at least one permission", and clears the flow cookie. This is decided before the allowlist, the throttle and iCloud: nothing is stored and no request is made.
+- `issueCode` receives the granted set. The code record, the token response's `scope` (RFC 6749 §5.1: it states the granted set when it differs from the request) and the grant record all hold exactly that set.
+- Refresh can keep or narrow the grant's scopes, never widen them (`invalid_scope`). A narrowing rewrites the grant record, and access tokens read the grant's scopes on every request, so it also applies at once to access tokens issued before it. A user who wants more must reconnect and tick the box.
+
+Each tool lists its required scopes, and all of them must be granted (`requiredScope` in `src/mcp.ts`, a non-empty list per tool). `insufficient_scope` names the missing scopes and tells the agent that the user must reconnect and tick the named checkbox, quoting its label; for `calendar:read` it says the page includes it whenever the client requests it.
+
+Meaning change: before this change, `calendar:write` was labelled "Create, change and delete events". Now deleting needs `calendar:delete`. No tool uses `calendar:write` or `calendar:delete` yet, so behaviour does not change for existing grants. Existing connections and grants are left as they are: nothing migrates, widens or narrows them, and a grant that holds `calendar:write` does not gain `calendar:delete`. A connection that wants delete must reconnect.
 
 ## Login throttle
 
@@ -115,7 +146,7 @@ Every replacement of the stored credential increments the connection's credentia
 
 `/mcp` verifies the access token (including the credential generation), checks the allowlist, reads the grant and connection, and builds a request-local calendar service. It makes no separate validation request: the tool call itself reaches iCloud. The credential is decrypted lazily, inside the bound service, only when a tool on an active connection needs iCloud; `initialize` and `tools/list` never decrypt, and an inactive or expired connection is never decrypted. A credential that cannot be opened or re-validated (`UnreadableCredentials`) is handled like a definitive 401: the tool returns `reconnect_required`, the connection is conditionally marked `reconnect_required`, and a new login replaces it.
 
-The read tools (`list_calendars`, `list_events`, `search_events`, `get_event`, `get_event_attachment_download`) require `calendar:read`. Errors are structured `{ error: { code, message, request_id } }` with codes `reconnect_required`, `temporarily_unavailable`, `insufficient_scope`, `upstream_error`, `invalid_input`, `not_found`, `result_too_large`, `calendar_changed`, `unsupported_calendar_data`, `unsupported_attachment` and `verification_failed`, and a server-generated request id. No upstream text is forwarded. Only the tool name, request id and code are logged.
+The read tools (`list_calendars`, `list_events`, `search_events`, `get_event`, `get_event_attachment_download`) require `calendar:read`; no tool uses another scope yet. Errors are structured `{ error: { code, message, request_id } }` with codes `reconnect_required`, `temporarily_unavailable`, `insufficient_scope`, `upstream_error`, `invalid_input`, `not_found`, `result_too_large`, `calendar_changed`, `unsupported_calendar_data`, `unsupported_attachment` and `verification_failed`, and a server-generated request id. No upstream text is forwarded. Only the tool name, request id and code are logged.
 
 If iCloud answers a tool call with a definitive 401, the service marks the connection `reconnect_required` with a CAS on the revision it read, and returns `reconnect_required`. A connection reconnected concurrently is not overwritten. While a connection is `reconnect_required`, tool calls return that code without contacting iCloud; access tokens of the same generation stay valid until they expire, and refresh fails with `invalid_grant`. A fresh login restores service under the next credential generation, for newly authorized grants only: every earlier grant has ended. A 403 from iCloud is treated as temporary, not as invalid credentials.
 
@@ -124,7 +155,7 @@ If iCloud answers a tool call with a definitive 401, the service marks the conne
 Copied from wildduck-mcp and adapted, not shared. A security fix must be applied in both repositories.
 
 - Names and domain separation: HKDF info, AAD prefix, cookie name, key namespace and keyring parameter all use `caldav-mcp`.
-- Scopes are `calendar:read`, `calendar:write`, `calendar:invite` (default `calendar:read`), defined once as `SCOPES` in `src/auth/http.ts`.
+- Scopes are `calendar:read`, `calendar:write`, `calendar:delete`, `calendar:invite` (default `calendar:read`), defined once as `SCOPES` in `src/auth/scopes.ts`, and the user chooses which requested scopes to grant (see "Scopes and consent").
 - One login+consent page instead of login, TOTP and consent steps; the flow cookie carries no credentials.
 - A stored password instead of a backend session token; the allowlist; the login throttle.
 - The session validator decrypts and re-checks credentials, allowlist and hosts before calling `caldav.validate`; an unreadable credential is `expired`.

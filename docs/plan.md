@@ -247,8 +247,10 @@ Additional controls:
   This prevents the server from being used to send requests to arbitrary addresses.
   Redirects are followed at most 3 times and only to allowed hosts. Stored URLs are
   re-checked after decryption.
-- **Scopes:** `calendar:read`, `calendar:write`, and a separate `calendar:invite` that needs
-  its own consent checkbox, because saving an event with attendees may send invitations.
+- **Scopes:** `calendar:read`, `calendar:write`, `calendar:delete`, and a separate
+  `calendar:invite`, because saving an event with attendees may send invitations. The user
+  chooses on the login page which requested scopes to grant (on develop, not released; see
+  "Scopes and consent" in [auth-design.md](auth-design.md)).
 
 ### Deployment
 

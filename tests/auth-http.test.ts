@@ -173,16 +173,16 @@ test('authenticated HTTP binds identity and permits multi-megabyte requests with
     expect(larger.status).toBe(200); const denied = await larger.json(); expect(Boolean(denied.error || denied.result?.isError)).toBe(true);
     expect(env.caldav.count('listCalendars')).toBe(1);
 });
-test('invite permission needs its own explicit consent checkbox without granting extra scopes', async () => {
+test('invite is granted only by its own deliberate tick, and the token states exactly the granted scopes', async () => {
     const env = setup({ scope: 'calendar:read calendar:invite' });
-    const login = await start(env); expect(login.html).toContain('name="allow_invite" value="yes" required');
-    expect((await submit(env, login)).status).toBe(400); expect(env.caldav.count()).toBe(0);
-    const approved = await submit(env, login, { extra: { allow_invite: 'yes' } }); expect(approved.status).toBe(302);
+    const login = await start(env); expect(login.html).toContain('<input type="checkbox" name="grant" value="calendar:invite">');
+    expect(login.html).not.toContain('allow_invite');
+    const untouched = await submit(env, login); expect(untouched.status).toBe(302);
+    const narrow = await tokenRequest(env, new URL(untouched.headers.get('location') ?? '').searchParams.get('code') ?? '');
+    expect((await narrow.json()).scope).toBe('calendar:read');
+    const approved = await submit(env, await start(env), { grants: ['calendar:invite'] }); expect(approved.status).toBe(302);
     const callback = new URL(approved.headers.get('location') ?? ''); const response = await tokenRequest(env, callback.searchParams.get('code') ?? '');
     expect(response.status).toBe(200); expect((await response.json()).scope).toBe('calendar:invite calendar:read');
-    const plain = setup({ scope: 'calendar:read calendar:write' });
-    const form = await start(plain); expect(form.html).not.toContain('allow_invite');
-    expect((await submit(plain, form)).status).toBe(302);
 });
 // Keep the helper's page parser exercised for hidden-field escaping.
 test('hidden public fields round-trip HTML escaping', async () => {

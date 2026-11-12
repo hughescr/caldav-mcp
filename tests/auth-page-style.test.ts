@@ -2,7 +2,7 @@ import { createHash } from 'node:crypto';
 import { afterEach, beforeEach, describe, expect, spyOn, test, type Mock } from 'bun:test';
 import { TemporaryUnavailable } from '../src/auth/contracts';
 import { PAGE_STYLE, PAGE_STYLE_SOURCE } from '../src/auth/page-style';
-import { setup, start, submit, type Env } from './helpers/http-env';
+import { checkboxes, setup, start, submit, type Env } from './helpers/http-env';
 
 const APPLE_HELP_URL = 'https://support.apple.com/102654';
 /** The one allowed outbound link: a fixed constant, a new tab, no opener, no referrer. */
@@ -20,6 +20,9 @@ afterEach(() => {
 async function pages(): Promise<Record<string, Response>> {
     const plain = setup({ scope: 'calendar:read calendar:write' });
     const invite = setup({ scope: 'calendar:read calendar:invite' });
+    const every = setup({ scope: 'calendar:read calendar:write calendar:delete calendar:invite' });
+    const readOnly = setup({ scope: 'calendar:read' });
+    const none = setup({ scope: 'calendar:write' });
     const wrong = setup(); wrong.caldav.setPassword('calendar.user@example.invalid', 'something-else-entirely');
     const throttled = setup();
     for (let index = 0; index < 5; index++) { await submit(throttled, await start(throttled), { password: 'wrong-pass-word-0000' }); }
@@ -27,6 +30,9 @@ async function pages(): Promise<Record<string, Response>> {
     return {
         form: (await start(plain)).response,
         'form with invite checkbox': (await start(invite)).response,
+        'form with every permission': (await start(every)).response,
+        'form read only': (await start(readOnly)).response,
+        'no permission chosen (400)': await submit(none, await start(none), { grants: [] }),
         'sign-in failed (400)': await submit(wrong, await start(wrong)),
         'throttled (429)': await submit(throttled, await start(throttled)),
         'unavailable (503)': await submit(unavailable, await start(unavailable)),
@@ -40,7 +46,7 @@ describe('page style and its Content-Security-Policy hash', () => {
 
     test('every page kind carries exactly one style block that the CSP allows by hash and nothing broader', async () => {
         const all = await pages();
-        expect(Object.keys(all)).toHaveLength(5);
+        expect(Object.keys(all)).toHaveLength(8);
         for (const [kind, response] of Object.entries(all)) {
             const html = await response.text();
             expect(response.headers.get('content-type'), kind).toContain('text/html');
@@ -78,14 +84,30 @@ describe('page style and its Content-Security-Policy hash', () => {
         }
     });
 
-    test('the permission list rows are plain text and only the invitation acknowledgment is a checkbox', async () => {
-        const all = await pages();
-        const plain = await all.form?.text() ?? '';
-        const invite = await all['form with invite checkbox']?.text() ?? '';
-        expect(plain.match(/type="checkbox"/g)).toBeNull();
-        expect(invite.match(/type="checkbox"/g)).toHaveLength(1);
-        expect(invite).toContain('<em>Sensitive</em>');
-        expect(plain).not.toContain('<em>Sensitive</em>');
+    test('each form has exactly the expected checkboxes, read is never one, and only invite is marked sensitive', async () => {
+        const all = Object.fromEntries(await Promise.all(Object.entries(await pages()).map(async ([kind, response]) => [kind, await response.text()] as const)));
+        const expected: Record<string, string[]> = {
+            form: ['calendar:write'],
+            'form with invite checkbox': ['calendar:invite'],
+            'form with every permission': ['calendar:write', 'calendar:delete', 'calendar:invite'],
+            'form read only': [],
+        };
+        for (const [kind, values] of Object.entries(expected)) {
+            const html = all[kind] ?? '';
+            expect(checkboxes(html).map(box => box.value), kind).toEqual(values);
+            expect(html.match(/type="checkbox"/g)?.length ?? 0, kind).toBe(values.length);
+            expect(html.match(/<em>Sensitive<\/em>/g)?.length ?? 0, kind).toBe(values.includes('calendar:invite') ? 1 : 0);
+            // Every page here was requested with read, which is a fixed list row with the check marker.
+            expect(html, kind).toContain('<li class="permission"><span>Read your calendars and events (always included)<small>calendar:read</small></span></li>');
+            expect(html.match(/<li class="permission">/g), kind).toHaveLength(1);
+        }
+        // Each checkbox is a whole-row label; checkboxes sit in a fieldset whose legend names the choice.
+        const every = all['form with every permission'] ?? '';
+        expect(every).toContain('<fieldset class="permissions"><legend>Choose permissions</legend><div class="rows"><ul>');
+        expect(every.match(/<label class="permission"><input type="checkbox"/g)).toHaveLength(3);
+        const readOnly = all['form read only'] ?? '';
+        expect(readOnly).toContain('<section class="permissions"><h2>Requested permissions</h2>');
+        expect(readOnly).not.toContain('<fieldset');
     });
 
     test('only the sign-in form carries the app-specific password help link, and it is outside every label', async () => {

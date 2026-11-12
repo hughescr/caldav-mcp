@@ -1,8 +1,8 @@
 import { ClientError, matchesRedirectUri, type ClientRegistry, type ResolvedClient } from './clients';
 import { OAuthError } from './contracts';
-/** Single source of truth for supported scopes; the engine and store import this list. */
-export const SCOPES: readonly string[] = Object.freeze(['calendar:read', 'calendar:write', 'calendar:invite']);
-export const DEFAULT_SCOPE = 'calendar:read';
+import { DEFAULT_SCOPE, SCOPES } from './scopes';
+/** The scope list lives in ./scopes; the engine and the app import it through here. */
+export { DEFAULT_SCOPE, SCOPES };
 /** The parts of the runtime the OAuth request helpers need; structural to avoid an import cycle with the engine. */
 export interface OAuthServices { clients: ClientRegistry; engine: { readonly resource: string } }
 export function unique(params: URLSearchParams): Record<string, string> {
@@ -10,9 +10,11 @@ export function unique(params: URLSearchParams): Record<string, string> {
     for (const [key, value] of params) { if (Object.hasOwn(out, key)) { throw new OAuthError('invalid_request'); } out[key] = value; }
     return out;
 }
-export async function form(request: Request): Promise<Record<string, string>> {
+export async function form(request: Request): Promise<Record<string, string>> { return unique(await formParams(request)); }
+/** The bounded urlencoded body, before the duplicate check; for a form that has one repeatable field. */
+export async function formParams(request: Request): Promise<URLSearchParams> {
     if (!/^application\/x-www-form-urlencoded(?:\s*;|$)/i.test(request.headers.get('content-type') ?? '')) { throw new OAuthError('invalid_request'); }
-    const raw = await boundedText(request); return unique(new URLSearchParams(raw));
+    return new URLSearchParams(await boundedText(request));
 }
 export async function boundedText(request: Request): Promise<string> {
     if (!request.body) { return ''; }

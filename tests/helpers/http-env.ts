@@ -43,12 +43,20 @@ export function setup(options: SetupOptions = {}) {
 }
 export type Env = ReturnType<typeof setup>;
 
-/** Extracts the hidden public fields and the flow cookie from a rendered page. */
+const unescape = (value: string) => value.replaceAll('&amp;', '&').replaceAll('&quot;', '"').replaceAll('&#39;', "'").replaceAll('&lt;', '<').replaceAll('&gt;', '>');
+
+/** The permission checkboxes of a rendered page, in page order, with their default tick state. */
+export function checkboxes(html: string): { name: string; value: string; checked: boolean }[] {
+    return [...html.matchAll(/<input type="checkbox" name="([^"]*)" value="([^"]*)"( checked)?>/g)].map(match => ({ name: match[1] ?? '', value: unescape(match[2] ?? ''), checked: match[3] !== undefined }));
+}
+
+/** Extracts the hidden public fields, the default-ticked checkboxes (as a browser would submit them) and the flow cookie. */
 export function page(response: Response, html: string) {
     const fields = new URLSearchParams();
     for (const match of html.matchAll(/type="hidden" name="([^"]+)" value="([^"]*)"/g)) {
-        fields.set(match[1] ?? '', (match[2] ?? '').replaceAll('&amp;', '&').replaceAll('&quot;', '"').replaceAll('&#39;', "'").replaceAll('&lt;', '<').replaceAll('&gt;', '>'));
+        fields.set(match[1] ?? '', unescape(match[2] ?? ''));
     }
+    for (const box of checkboxes(html)) { if (box.checked) { fields.append(box.name, box.value); } }
     return { fields, cookie: (response.headers.get('set-cookie') ?? '').split(';')[0] ?? '' };
 }
 
@@ -65,7 +73,8 @@ export async function start(env: Env, params = env.params) {
     return { response, html, ...form };
 }
 
-export interface SubmitOptions { appleId?: string; password?: string; decision?: string; extra?: Record<string, string> }
+/** `grants` replaces the default-ticked boxes with exactly these `grant` values, in this order (repeats kept). */
+export interface SubmitOptions { appleId?: string; password?: string; decision?: string; extra?: Record<string, string>; grants?: string[] }
 
 export async function submit(env: Env, form: { fields: URLSearchParams; cookie: string }, options: SubmitOptions = {}) {
     const fields = new URLSearchParams(form.fields);
@@ -73,6 +82,7 @@ export async function submit(env: Env, form: { fields: URLSearchParams; cookie: 
     fields.set('app_password', options.password ?? PASSWORD);
     fields.set('decision', options.decision ?? 'allow');
     for (const [key, value] of Object.entries(options.extra ?? {})) { fields.set(key, value); }
+    if (options.grants) { fields.delete('grant'); for (const value of options.grants) { fields.append('grant', value); } }
     return post(env.app, '/auth/connect', fields, form.cookie);
 }
 

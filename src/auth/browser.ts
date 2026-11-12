@@ -3,7 +3,8 @@ import { accountIdFor, normalizeAppleId } from '../account';
 import { CalDavError, type Discovery } from '../caldav/contracts';
 import { isAllowedCalDavUrl } from '../caldav/hosts';
 import type { AuthRuntime } from './runtime';
-import { AUTH_FIELDS, authorization, form, required, unique, type Authorization } from './http';
+import { AUTH_FIELDS, authorization, formParams, required, unique, type Authorization } from './http';
+import { DEFAULT_SCOPE, PRE_TICKED, SCOPE_LABELS, SCOPES, SENSITIVE } from './scopes';
 import { connectionAAD, digest, equal, randomId } from './crypto';
 import { OAuthError, type Connection, type Sealed, type UpstreamCredentials } from './contracts';
 import { LoginThrottle, type LoginReservation } from './throttle';
@@ -14,16 +15,15 @@ interface Flow { deadline: number; csrf: string; flowId: string; binding: string
 const now = () => Math.floor(Date.now() / 1000);
 const escape = (text: string) => text.replace(/[&<>"']/g, char => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[char] ?? char);
 const binding = (auth: Authorization) => digest(JSON.stringify(AUTH_FIELDS.map(key => [key, auth.fields[key] ?? null])));
-const SCOPE_TEXT: Record<string, string> = {
-    'calendar:read': 'Read your calendars and events',
-    'calendar:write': 'Create, change and delete events',
-    'calendar:invite': 'Save events with attendees, which can send invitations from your Apple Account',
-};
+/** The form field that carries one ticked permission; it is the only field that may repeat. */
+const GRANT_FIELD = 'grant';
 /** Apple's article on what app-specific passwords are and how to create one. A fixed constant: never built from request data. */
 const APPLE_HELP_URL = 'https://support.apple.com/102654';
 const FAILED ='Sign-in failed. Check the Apple ID and app-specific password, then start the connection again.';
 const THROTTLED = 'Too many failed sign-in attempts for this Apple ID. Wait 15 minutes, then start the connection again.';
 const UNAVAILABLE = 'iCloud sign-in is temporarily unavailable. Try again later.';
+const NO_PERMISSION = 'Choose at least one permission';
+const NO_PERMISSION_TEXT = 'Nothing was saved and iCloud was not contacted. Start the connection again and tick at least one permission.';
 function cookie(context: Context, runtime: AuthRuntime, flow?: Flow) {
     const value = flow ? Buffer.from(JSON.stringify(runtime.crypto.seal('browser-flow', JSON.stringify([runtime.issuer, 1]), flow))).toString('base64url') : '';
     if (value.length > 3800) { throw new OAuthError('invalid_request'); }
@@ -46,18 +46,34 @@ function page(context: Context, title: string, body: string, callbackOrigin?: st
 }
 /** Terminal pages are static text: they never echo a submitted field, so they cannot reflect a password. */
 const FAILURE_HEADING = { 400: 'Sign-in failed', 429: 'Please wait', 503: 'Temporary failure · 503' } as const;
-function failure(context: Context, runtime: AuthRuntime, status: 400 | 429 | 503, message: string) {
+function failure(context: Context, runtime: AuthRuntime, status: 400 | 429 | 503, message: string, heading: string = FAILURE_HEADING[status]) {
     cookie(context, runtime);
     context.status(status);
-    return page(context, 'Connection not completed', `<section class="terminal" aria-labelledby="result"><h2 id="result">${FAILURE_HEADING[status]}</h2><p>${escape(message)}</p></section>`);
+    return page(context, 'Connection not completed', `<section class="terminal" aria-labelledby="result"><h2 id="result">${escape(heading)}</h2><p>${escape(message)}</p></section>`);
+}
+/** One consent row per requested scope, in SCOPES order. Read is a fixed row; every other scope is a real checkbox. */
+function permissions(requested: readonly string[]): string {
+    const row = (scope: string) => `${SENSITIVE.has(scope) ? '<em>Sensitive</em>' : ''}${escape(SCOPE_LABELS[scope] ?? scope)}`;
+    const fixed = requested.includes(DEFAULT_SCOPE) ? `<ul><li class="permission"><span>${row(DEFAULT_SCOPE)} (always included)<small>${escape(DEFAULT_SCOPE)}</small></span></li></ul>` : '';
+    const choices = SCOPES.filter(scope => scope !== DEFAULT_SCOPE && requested.includes(scope))
+        .map(scope => `<label class="permission"><input type="checkbox" name="${GRANT_FIELD}" value="${escape(scope)}"${PRE_TICKED.has(scope) ? ' checked' : ''}><span>${row(scope)}<small>${escape(scope)}</small></span></label>`).join('');
+    // A read-only request has nothing to choose: it keeps the plain list under its old heading.
+    return choices
+        ? `<fieldset class="permissions"><legend>Choose permissions</legend><div class="rows">${fixed}${choices}</div></fieldset>`
+        : `<section class="permissions"><h2>Requested permissions</h2><div class="rows">${fixed}</div></section>`;
+}
+/**
+ * The scopes the user grants: requested read (always included) plus the ticked boxes. A ticked value
+ * must be one the page offered for this bound request, at most once; anything else is a tampered form.
+ */
+function granted(auth: Authorization, ticked: readonly string[]): string[] {
+    if (new Set(ticked).size !== ticked.length || ticked.some(scope => scope === DEFAULT_SCOPE || !auth.scopes.includes(scope))) { throw new OAuthError('invalid_request'); }
+    return SCOPES.filter(scope => ticked.includes(scope) || (scope === DEFAULT_SCOPE && auth.scopes.includes(scope)));
 }
 function render(context: Context, runtime: AuthRuntime, auth: Authorization, flow: Flow) {
     cookie(context, runtime, flow);
     const hidden = [...Object.entries(auth.fields), ['csrf', flow.csrf]].map(([key, value]) => `<input type="hidden" name="${escape(key ?? '')}" value="${escape(value ?? '')}">`).join('');
     const identity = auth.client.clientId.startsWith('https://') ? new URL(auth.client.clientId).hostname : 'Registered OAuth client';
-    // Requested scopes are plain list rows, not inputs: there is no choice to make about them.
-    const scopes = auth.scopes.map(scope => `<li class="permission"><span>${escape(SCOPE_TEXT[scope] ?? scope)}<small>${escape(scope)}</small></span></li>`).join('');
-    const invite = auth.scopes.includes('calendar:invite') ? '<label class="permission"><input type="checkbox" name="allow_invite" value="yes" required><span><em>Sensitive</em>Allow saving events that can send invitations to other people</span></label>' : '';
     return page(context, 'Connect your iCloud calendar', [
         `<div class="request"><strong>${escape(auth.client.name)}</strong> (${escape(identity)}) requests access to your iCloud calendar<small>Redirect destination · <span class="host">${escape(new URL(auth.redirectUri).hostname)}</span></small></div>`,
         `<form method="post" action="/auth/connect">${hidden}`,
@@ -66,7 +82,7 @@ function render(context: Context, runtime: AuthRuntime, auth: Authorization, flo
         // The help link sits after the input in the DOM so tabbing from the field never detours through it; CSS order puts it in the label row. It is outside the label so clicking it cannot focus the field.
         `<div class="field row"><label for="password">App-specific password</label><input id="password" name="app_password" type="password" autocomplete="off" autocapitalize="none" spellcheck="false" maxlength="256" aria-describedby="password-help" required><a class="aside" href="${APPLE_HELP_URL}" target="_blank" rel="noopener noreferrer" referrerpolicy="no-referrer">How do I generate an app-specific password?</a></div>`,
         '<p id="password-help" class="help">Use one made only for this connector. Never use your main Apple Account password.</p></section>',
-        `<section class="permissions"><h2>Requested permissions</h2><div class="rows"><ul>${scopes}</ul>${invite}</div></section>`,
+        permissions(auth.scopes),
         '<p class="help">Keep this connection for up to 180 days. iCloud may require reconnection sooner, for example if the app-specific password is revoked.</p>',
         '<p class="privacy">Your password is stored encrypted and used only to talk to iCloud.</p>',
         '<div class="actions"><button class="primary" name="decision" value="allow">Connect and allow</button>',
@@ -102,11 +118,16 @@ function identicalActive(runtime: AuthRuntime, previous: Connection | undefined,
 }
 export async function postBrowser(context: Context, runtime: AuthRuntime) {
     if (context.req.header('origin') !== runtime.issuer) { throw new OAuthError('invalid_request'); }
-    const fields = await form(context.req.raw); const flow = read(context, runtime); const auth = await authorization(runtime, fields);
+    // Each ticked checkbox sends one grant field; every other field must appear at most once.
+    const params = await formParams(context.req.raw); const ticked = params.getAll(GRANT_FIELD); params.delete(GRANT_FIELD);
+    const fields = unique(params); const flow = read(context, runtime); const auth = await authorization(runtime, fields);
+    // auth.scopes comes from the bound `scope` field, so the binding check also pins what may be ticked.
     if (!equal(flow.csrf, required(fields, 'csrf')) || !equal(flow.binding, binding(auth))) { throw new OAuthError('invalid_request'); }
     if (fields.decision === 'cancel') { return redirect(context, runtime, auth, { error: 'access_denied' }); }
     if (fields.decision !== 'allow') { throw new OAuthError('invalid_request'); }
-    if (auth.scopes.includes('calendar:invite') && fields.allow_invite !== 'yes') { throw new OAuthError('invalid_request'); }
+    const scopes = granted(auth, ticked);
+    // Before the allowlist, the throttle and iCloud: an empty grant stores nothing and contacts no one.
+    if (scopes.length === 0) { return failure(context, runtime, 400, NO_PERMISSION_TEXT, NO_PERMISSION); }
     // Syntax, allowlist and wrong-password failures share one static page and status. Timing and the
     // throttle still distinguish an allowlisted Apple ID from others (an accepted limitation).
     const appleId = normalizeAppleId((fields.apple_id ?? '').slice(0, 512));
@@ -128,7 +149,7 @@ export async function postBrowser(context: Context, runtime: AuthRuntime) {
     if (discovery === 'unavailable') { return failure(context, runtime, 503, UNAVAILABLE); }
     const credentials: UpstreamCredentials = { accountId, appleId, appPassword, principalUrl: discovery.principalUrl, calendarHomeUrl: discovery.calendarHomeUrl, issuedAt: now() };
     let code: string;
-    try { code = await store(runtime, auth, credentials); } catch (error) {
+    try { code = await store(runtime, auth, credentials, scopes); } catch (error) {
         // Fixed pages for the expected outcomes after discovery: a concurrent reconnect or a
         // session check that now fails (invalid_grant), or a temporary store/upstream error.
         if (!(error instanceof OAuthError)) { throw error; }
@@ -136,8 +157,8 @@ export async function postBrowser(context: Context, runtime: AuthRuntime) {
     }
     return redirect(context, runtime, auth, { code });
 }
-/** Stores the iCloud-proven credential and issues the authorization code. */
-async function store(runtime: AuthRuntime, auth: Authorization, credentials: UpstreamCredentials): Promise<string> {
+/** Stores the iCloud-proven credential and issues the authorization code for the scopes the user granted. */
+async function store(runtime: AuthRuntime, auth: Authorization, credentials: UpstreamCredentials, scopes: string[]): Promise<string> {
     const { accountId } = credentials;
     const record = await runtime.store.get('connection', accountId);
     if (record && (record.kind !== 'connection' || record.accountId !== accountId)) { throw new OAuthError('temporarily_unavailable'); }
@@ -148,5 +169,5 @@ async function store(runtime: AuthRuntime, auth: Authorization, credentials: Ups
     // unchanged connection. Anything else is a fresh, iCloud-proven replacement, which ends every
     // earlier grant for the account.
     const connection = previous && identicalActive(runtime, previous, credentials) ? previous : await runtime.engine.connectOrReconnect({ accountId, credentials, expiresAt: now() + 180 * 86400, ...(previous ? { expectedCredentialGeneration: previous.credentialGeneration } : {}) });
-    return runtime.engine.issueCode({ client: auth.client, connectionId: connection.id, redirectUri: auth.redirectUri, resource: auth.resource, scopes: auth.scopes, challenge: auth.challenge });
+    return runtime.engine.issueCode({ client: auth.client, connectionId: connection.id, redirectUri: auth.redirectUri, resource: auth.resource, scopes, challenge: auth.challenge });
 }

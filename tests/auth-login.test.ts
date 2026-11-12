@@ -36,8 +36,8 @@ describe('single-page login and consent', () => {
         expect(response.headers.get('cache-control')).toBe('no-store');
         expect(html).toContain('<strong>&lt;Client&gt;</strong> (Registered OAuth client)');
         expect(html).toContain('Redirect destination · <span class="host">127.0.0.1</span>');
-        expect(html).toContain('<li class="permission"><span>Read your calendars and events<small>calendar:read</small></span></li>');
-        expect(html).toContain('<small>calendar:write</small>');
+        expect(html).toContain('<li class="permission"><span>Read your calendars and events (always included)<small>calendar:read</small></span></li>');
+        expect(html).toContain('<label class="permission"><input type="checkbox" name="grant" value="calendar:write" checked><span>Create and change events<small>calendar:write</small></span></label>');
         expect(html).not.toMatch(/<li[^>]*>(?:(?!<\/li>)[^])*<input/);
         expect(html).toContain('<form method="post" action="/auth/connect">');
         expect(html).toMatch(/<input id="apple" name="apple_id" type="email" autocomplete="username"[^>]* required/);
@@ -303,17 +303,16 @@ describe('duplicate delivery and reconnect', () => {
         expect(env.caldav.calls.at(-1)).toMatchObject({ method: 'listCalendars', appPassword: 'brand-new-app-pass' });
     });
 
-    test('the invite checkbox is required exactly when calendar:invite is requested', async () => {
+    test('the old allow_invite acknowledgment is gone: it neither is required nor grants anything', async () => {
         const env = setup({ scope: 'calendar:invite' });
         const form = await start(env);
-        expect(form.html).toContain('<label class="permission"><input type="checkbox" name="allow_invite" value="yes" required><span><em>Sensitive</em>Allow saving events that can send invitations to other people</span></label>');
-        expect(form.html.match(/type="checkbox"/g)).toHaveLength(1);
-        for (const value of [undefined, 'no', '']) {
-            expect((await submit(env, form, value === undefined ? {} : { extra: { allow_invite: value } })).status).toBe(400);
-        }
+        expect(form.html).not.toContain('allow_invite');
+        expect(form.html).not.toContain(' required><span>');
+        // Unticked invite alone is an empty grant; the stale field cannot stand in for the tick.
+        const stale = await submit(env, form, { extra: { allow_invite: 'yes' } });
+        expect(stale.status).toBe(400);
+        expect(await stale.text()).toContain('Choose at least one permission');
         expect(env.caldav.count()).toBe(0);
-        expect((await submit(env, form, { extra: { allow_invite: 'yes' } })).status).toBe(302);
-        const plain = setup({ scope: 'calendar:read calendar:write' });
-        expect((await submit(plain, await start(plain), { extra: { allow_invite: 'yes' } })).status).toBe(302);
+        expect((await submit(env, form, { grants: ['calendar:invite'] })).status).toBe(302);
     });
 });
