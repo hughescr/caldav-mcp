@@ -1,6 +1,6 @@
 # caldav-mcp: assessment and development plan
 
-Status: the phase 0 probe is written. The owner has run its read-only mode and its `--write` mode against their own iCloud account, locally, on 2026-11-11, one run each. The invite and Lambda runs are outstanding. The phase 1 skeleton is built and not deployed. The auth and credential-storage code and the probe each had one independent review by a second Claude agent (same model family; no cross-family reviewer was available). The findings were fixed, except the items listed under "Accepted limitations".
+Status: the phase 0 probe is written. The owner has run its read-only mode and its `--write` mode against their own iCloud account, locally, on 2026-11-11, several times as the probe grew. The invite and Lambda runs are outstanding. The phase 1 skeleton was deployed on 2026-11-11 (version 0.1.1, https://caldav-mcp.rungie.com). The owner connected it from a Claude client and reports that it worked; this was not checked from server logs. The live service has the one tool `list_calendars`. Phase 2 (`list_events`, `search_events`, `get_event`) is built on the `develop` branch and has not been released or deployed. The attachment download tool is designed but not built. The auth and credential-storage code and the probe each had one independent review by a second Claude agent (same model family; no cross-family reviewer was available). The findings were fixed, except the items listed under "Accepted limitations".
 
 ## Goal
 
@@ -18,17 +18,19 @@ It mirrors the security and deployment strategy of
   Named providers with fixed hosts would fit the current security model. An arbitrary server
   URL would replace the fixed-host rule with a weaker control.
 - **Push notifications and caching.** The server holds no calendar data. Each tool call
-  reads iCloud when it needs to. sync-collection is unused for now: it returns the whole
-  collection and ignores limits, and the server has no cache to update.
+  reads iCloud when it needs to. This stays true for the next release. It will change when
+  the attachment download tool ships: the server will then hold copies of attachments that
+  an agent asked to download, for about one day, and nothing else. sync-collection is
+  unused for now: it returns the whole collection and ignores limits, and the server has
+  no cache to update.
 
 ## What iCloud provides
 
 Apple has never documented its CalDAV server. The statuses below come from two sources.
-"Confirmed" means the owner's probe runs: probe 0.1.0, report schema 2, one account, local,
-2026-11-11. The read-only run sent 50 requests in 13 seconds. The `--write` run sent 104
-requests in 33 seconds and ran 37 checks: 35 confirmed, 2 refuted, 0 inconclusive and 0
-errors. It repeated every read-only finding with an identical result. It made two temporary
-calendars, and both were deleted and verified gone. Everything else comes from other
+"Confirmed" means the owner's probe runs: one account, local, 2026-11-11, several read-only
+and `--write` runs as the probe grew. Each `--write` run made two temporary calendars, and
+both were deleted and verified gone. "Refuted" means iCloud differs from the expectation
+that the check encoded, which is often an RFC expectation. Everything else comes from other
 clients' published test results (mainly python-caldav's iCloud compatibility profile, probed
 October 2026) or has not been tested. Another account may behave differently. The probe is
 described in [probe.md](probe.md).
@@ -39,7 +41,7 @@ of the calendar home. It also assumes that a wrong password gives 401. That is u
 If iCloud answers 403, the login throttle never counts it, because a 403 is treated as
 temporary.
 
-Confirmed in both runs, for this account:
+Confirmed in every run, for this account:
 
 - Discovery: `PROPFIND` on `https://caldav.icloud.com/` returned 207 with no redirect. The
   principal is on `caldav.icloud.com` with a relative href shaped `/<id>/principal/`. The
@@ -62,36 +64,40 @@ Still open:
   1631-item sync-collection reply. A larger account may behave differently.
 - Invitations: the `--invite` run has not been done. They are advertised through
   `calendar-auto-schedule` and unconfirmed.
-- Behaviour from AWS addresses: the Lambda run has not been done.
+- Behaviour from AWS addresses: the probe's Lambda run has not been done. The owner reports one successful login through the deployed Lambda, which means one discovery and validation exchange with iCloud from an AWS address, for one account. This is the owner's report, not checked from server logs. It gives no rate-limit or volume evidence.
 - `--cleanup` has not been run against the real server. The write run's own cleanup deleted
   both temporary calendars.
-- A `TZID` that is unknown or unusual when a new event is sent without a `VTIMEZONE`. Only
-  `Europe/Berlin` was tried.
+- A `TZID` that is unusual when a new event is sent without a `VTIMEZONE`. Only
+  `Europe/Berlin` was tried. A made-up `TZID` sent with its own `VTIMEZONE` was accepted but
+  stored as a floating time (see below). Whether iCloud keeps a real IANA `TZID` whose
+  embedded rules differ from the tz database is unknown.
+- Whether the managed-attachment URL of an old, real attachment behaves like the probe's
+  own, and whether such a URL expires.
 
 | Capability | Status |
 |---|---|
-| Calendars and events: read | Confirmed (both runs, 2026-11-11). Time-range calendar-query worked: in the write run it returned exactly the one event inside the range and nothing for an adjacent empty range. calendar-multiget worked. |
+| Calendars and events: read | Confirmed (probe runs, 2026-11-11). Time-range calendar-query worked: in the write run it returned exactly the one event inside the range and nothing for an adjacent empty range. calendar-multiget worked. |
 | Events: create, update, delete | Confirmed (write run, 2026-11-11). Create: `PUT` with `If-None-Match: *` gives 201. Update with the exact ETag in `If-Match` gives 204. A stale ETag gives 412 for both `PUT` and `DELETE`, and the event is unchanged. |
 | Calendars: create and delete | Confirmed (write run, 2026-11-11). `MKCALENDAR` at a client-chosen path gives 201. The calendar is visible and keeps its display name. There is no `Location` header. `DELETE` of the collection gives 204, and the calendar is then gone. |
 | Round trip of an event (`PUT` then `GET`) | Confirmed (write run, 2026-11-11) for 6 events: nothing was changed, removed or added by the server, except the one `VTIMEZONE` noted below. The 6: `TZID=America/New_York` with an embedded `VTIMEZONE`; `TZID=Europe/Berlin` without one; all-day with an exclusive end; floating; UTC; an unknown `X-` property with a parameter plus a `VALARM`. Europe/Berlin was accepted with `DTSTART` and `DTEND` unchanged, and the server added one `VTIMEZONE` itself. `PRODID` and `DTSTAMP` were not changed, and `SEQUENCE` was not added or changed. |
-| Authentication | Confirmed (both runs, 2026-11-11): HTTP Basic with an app-specific password on every request was accepted, with no cookie. No documented OAuth. Apple's "Account Data Sharing" is a pilot with no public technical documentation. The response to a wrong password is untested. |
-| Discovery | Confirmed (both runs, 2026-11-11). Start at `caldav.icloud.com`, follow `current-user-principal` and `calendar-home-set` to a per-account host (`pNN-caldav.icloud.com`). Never hard-code that host. |
-| Calendar properties | Confirmed (both runs, 2026-11-11). All 16 collections returned displayname, calendar-color, calendar-timezone, getctag, sync-token, supported-calendar-component-set, current-user-privilege-set and owner. 10 returned `invite`. The owner differs from the principal on 5. All 16 report write privilege. |
-| Owned, shared and subscribed calendars | Confirmed (both runs, 2026-11-11) for owned and shared: 6 owned, 5 shared with the owner, 5 shared by the owner, all under the calendar home. Subscribed: untested, none in the account. |
-| Free/busy query | Confirmed (both runs, 2026-11-11) as rejected: HTTP 400. Compute free time from events if it is ever needed. |
-| Server-side recurrence expansion | Confirmed (both runs, 2026-11-11). In the read-only run, calendar-query with `expand` returned 13 instances from 3 recurring events, with `RECURRENCE-ID` and no `RRULE`. In the write run, a weekly series with one `RECURRENCE-ID` override and one `EXDATE` returned exactly the 5 expected instances: the override was applied, the `EXDATE` was respected, and there was no `RRULE`. All 5 instance start times were in UTC form, so the original `TZID` is not on the instance. The server therefore reads the zone name from the master event to show local times. |
-| Server-side text search | Refuted (both runs, 2026-11-11): a `SUMMARY` text-match filter is ignored. In the write run it returned all 10 events in range, also for upper case and for a random word. |
-| calendar-query filter on `UID` | Confirmed (both runs, 2026-11-11) as rejected: HTTP 412. Fetch by href or use calendar-multiget. |
-| ETags | Confirmed (both runs, 2026-11-11): strong, quoted, and identical across REPORT, GET and PROPFIND. Create and update also return an `ETag` header, and the one from create equals the ETag a later PROPFIND shows. |
+| Authentication | Confirmed (probe runs, 2026-11-11): HTTP Basic with an app-specific password on every request was accepted, with no cookie. No documented OAuth. Apple's "Account Data Sharing" is a pilot with no public technical documentation. The response to a wrong password is untested. |
+| Discovery | Confirmed (probe runs, 2026-11-11). Start at `caldav.icloud.com`, follow `current-user-principal` and `calendar-home-set` to a per-account host (`pNN-caldav.icloud.com`). Never hard-code that host. |
+| Calendar properties | Confirmed (probe runs, 2026-11-11). All 16 collections returned displayname, calendar-color, calendar-timezone, getctag, sync-token, supported-calendar-component-set, current-user-privilege-set and owner. 10 returned `invite`. The owner differs from the principal on 5. All 16 report write privilege. |
+| Owned, shared and subscribed calendars | Confirmed (probe runs, 2026-11-11) for owned and shared: 6 owned, 5 shared with the owner, 5 shared by the owner, all under the calendar home. Subscribed: untested, none in the account. |
+| Free/busy query | Confirmed (probe runs, 2026-11-11) as rejected: HTTP 400. Compute free time from events if it is ever needed. |
+| Server-side recurrence expansion | Confirmed (probe runs, 2026-11-11). calendar-query with `expand` returns one component per instance, with `RECURRENCE-ID`, with `DTEND` and without `RRULE`. A weekly series with one `RECURRENCE-ID` override and one `EXDATE` returned exactly the 5 expected instances: the override was applied and the `EXDATE` was respected. The expansion keeps the stored form of `DTSTART` and `DTEND`: zone-local with its `TZID`, all-day date, floating, or UTC. It drops the `VTIMEZONE` and keeps the `TZID` parameters. `RECURRENCE-ID` always arrives with a `Z`. That is a true instant only for a zoned or UTC series. For an all-day or floating series it is the local value with a `Z` appended. See "Read behaviour that shapes the design" below. |
+| Server-side text search | Refuted (probe runs, 2026-11-11): a `SUMMARY` text-match filter is ignored. In the write run it returned all 10 events in range, also for upper case and for a random word. |
+| calendar-query filter on `UID` | Confirmed (probe runs, 2026-11-11) as rejected: HTTP 412. Fetch by href or use calendar-multiget. |
+| ETags | Confirmed (probe runs, 2026-11-11): strong, quoted, and identical across an expanded calendar-query, calendar-multiget, GET and PROPFIND. The `expected_version` from `list_events` can therefore be passed to `get_event`. Create and update also return an `ETag` header, and the one from create equals the ETag a later PROPFIND shows. |
 | Conditional writes | Confirmed (write run, 2026-11-11). `If-None-Match: *` on an existing resource is refused with 412. `If-Match: *` is broken and dangerous: on an existing event it is refused with 412, and on a missing resource it creates the event (201). |
-| sync-collection | Confirmed (both runs, 2026-11-11) at Depth 0. The initial sync returned 1631 items and a token. Repeating with the token returned no changes. In the write run, after one change and one deletion, a sync with the earlier token reported exactly those two (the change with an ETag, the deletion as 404) and a new token. `limit` is ignored: asking for 1 returned 1631 and asking for 2 returned 12, with no 507 marker. An invalid token gives 403 with the `valid-sync-token` precondition. |
+| sync-collection | Confirmed (probe runs, 2026-11-11) at Depth 0. The initial sync returned 1631 items and a token. Repeating with the token returned no changes. In the write run, after one change and one deletion, a sync with the earlier token reported exactly those two (the change with an ETag, the deletion as 404) and a new token. `limit` is ignored: asking for 1 returned 1631 and asking for 2 returned 12, with no 507 marker. An invalid token gives 403 with the `valid-sync-token` precondition. |
 | Invitations when an event with attendees is saved | Advertised, not confirmed. The `DAV` header lists `calendar-auto-schedule`, `calendar-schedule` and `calendarserver-sharing`. The principal has a schedule-outbox URL and 7 `calendar-user-address-set` mailto addresses. Whether the server sends invitations is untested until the invite run. |
 | Rate limits | Confirmed (write run, 2026-11-11) for a home connection: no 429 or 503 in 104 requests. The read-only part included a burst of 10 sequential and 5 parallel PROPFINDs. Median latency was 262 ms and the maximum 971 ms. No rate-limit headers. Not tested from AWS. |
-| Behaviour from AWS addresses | Untested. No reports of blocking. |
+| Behaviour from AWS addresses | One login from the deployed Lambda succeeded, for one account (the owner's report, 2026-11-11, not checked from server logs). That is one discovery and validation exchange. No rate-limit or volume evidence. The probe's Lambda run has not been done. No reports of blocking. |
 
 Known quirks:
 
-All five are confirmed (probe runs, 2026-11-11, one account).
+All are confirmed (probe runs, 2026-11-11, one account).
 
 - An event with `DTSTART` and neither `DTEND` nor `DURATION` is refused with HTTP 404, not
   with a status that names the problem.
@@ -102,6 +108,69 @@ All five are confirmed (probe runs, 2026-11-11, one account).
   the exact ETag, and the server must never send `If-Match: *`.
 - A calendar-query filter on `UID` returns 412.
 - The sync-collection `limit` is ignored.
+- A `POST` with `?action=attachment-remove` returns 200, but the attachment stays on the
+  event and the ETag does not change. Phase 3 must not trust that status.
+- iCloud rewrites a local time that falls in a skipped daylight-saving hour. A single event
+  written at 02:30 on the spring-forward day in `America/New_York` came back at 00:00. A
+  weekly series through that day shifted its instances.
+- iCloud treats a local time in a repeated daylight-saving hour as the second occurrence.
+  RFC 5545 and Temporal's default say the first. In `America/New_York` on the fall-back day,
+  01:30 was selected as 06:30 UTC (EST), not 05:30 UTC (EDT).
+
+### Read behaviour that shapes the design
+
+Measured by the probe on one account, 2026-11-11.
+
+- **Stored form survives expansion.** Zone-local times stay zone-local with their `TZID`,
+  all-day dates stay dates, floating times stay floating and UTC times stay UTC. This holds
+  for single events and for recurring series. The expansion drops the `VTIMEZONE`, so a
+  `TZID` on an instance has no definition in the same response. A made-up `TZID` does not
+  survive: iCloud strips it and stores the event as floating. The owner's account has no
+  event with a `TZID` that is neither an IANA name nor defined in the same resource.
+- **`RECURRENCE-ID` form.** It usually arrives as `…Z`. For a zoned or UTC series it is the
+  true instant of the original slot. For an all-day series it is the date at midnight with a
+  `Z`, and for a floating series it is the wall-clock time with a `Z`. Neither is an
+  instant. An end-to-end run against the real server also saw `RECURRENCE-ID;VALUE=DATE:`
+  `YYYYMMDD` on an all-day series. The server accepts a `Z` date-time, a `VALUE=DATE` date
+  (read as midnight) and a floating date-time (read as its wall-clock digits) with no other
+  parameter, and maps each to the same opaque `occ1_…Z` token, read in the form of the
+  series, never as UTC for an all-day or floating series. A `TZID` or any other parameter
+  leaves that one resource unreadable.
+- **Time-range queries read all-day and floating values as UTC.** iCloud ignores the
+  calendar's `calendar-timezone` for them. The server therefore sends a window built from
+  both the requested instants and the requested civil digits read as UTC. After the query it
+  keeps zoned and UTC events whose instants overlap the requested range. It keeps all-day,
+  floating and unrecognised-zone events whose digits, read as UTC, overlap the range widened
+  by 24 hours on each side. Events within that 24 hours outside the edges can appear in
+  results.
+- **Moved occurrences.** iCloud returns an occurrence that was moved to another time only
+  when the query window covers both its original slot and its new time. A window that covers
+  only the new time misses it. This was measured with the new time after the series' last
+  instance and with it inside the series. The server therefore queries 31 days beyond each
+  end of the requested range and filters afterwards. An occurrence moved more than 31 days
+  from its original date can still be missed by a short query. The largest window sent is
+  430 days (366 days of range plus the padding).
+- **Text filters are ignored.** `search_events` matches text in the server.
+- **Yearly all-day series on 29 February** clamp to 28 February in non-leap years. RFC 5545
+  would skip those years. The server passes iCloud's expansion through, because it is what
+  Apple Calendar shows. `rrule-temporal`, `node-ical` and `ical.js` all disagree with iCloud
+  here, so none of them can serve as a test oracle for it.
+- **Other expansion facts.** `RANGE=THISANDFUTURE` on an override is stored but ignored by
+  the expansion: only the named instance moves. An all-day event with `DTEND` equal to
+  `DTSTART` is accepted and read back unchanged, so the reader treats it as a one-day event.
+  `calendar-data` from a REPORT and from a GET differ only in line endings.
+- **Attachments are rare** in the owner's account: 4 `ATTACH` properties on 3 events in six
+  years. Three were `https` links to hosts outside Apple, one was a managed attachment.
+  iCloud preserves inline base64 and external-link attachments unchanged when they are
+  written through CalDAV.
+- **Managed attachments** (RFC 8607) are served from `gateway.icloud.com` over `https`. The
+  URL has a file name in its path and no query string. It does not contain the `MANAGED-ID`
+  or the account's id. A plain `GET` with no `Authorization` header and no cookies returned
+  status 200 and the exact bytes for the one attachment the probe uploaded, so the URL
+  works like a bearer link. The response had no `Content-Length`, ignored `Range` and did not
+  redirect. The server therefore plans to download managed attachments without credentials
+  and never to send the CalDAV credentials to that host. The size limit then rests on the
+  `SIZE` parameter of the `ATTACH` and a hard cap on the streamed body.
 
 ## Architecture
 
@@ -190,7 +259,7 @@ Additional controls:
 - The first deployment follows the stages wildduck-mcp went through. The bootstrap stack is
   created with a placeholder `FunctionUrlOrigin`. The service is then deployed, which creates the
   real Function URL. The bootstrap stack is then updated with that origin, and the deployment
-  verification runs. The README gives the steps. They have not been executed yet.
+  verification runs. The README gives the steps. They were carried out on 2026-11-11.
 - The DynamoDB table stays at 1 RCU and 1 WCU.
 - The keyring stays under the AWS-managed `aws/ssm` key.
 - CI is the same as wildduck-mcp: actions are pinned by tag and the deploy job has no approval
@@ -200,67 +269,142 @@ Additional controls:
 
 ### Tools
 
-`list_calendars`, `list_events`, `search_events`, `get_event`, `create_event`,
-`update_event`, `delete_event`. Only `list_calendars` is built.
+`list_calendars`, `list_events`, `search_events`, `get_event`,
+`get_event_attachment_download`, `create_event`, `update_event`, `delete_event`.
 
-- Date ranges are required and capped at 366 days. Result counts are capped. Nothing is
-  silently truncated: a capped result says so.
-- `list_events` and `search_events` take their occurrences from iCloud's server-side expansion
-  (`calendar-query` with `expand`). Converting an instant to a zone is unambiguous, so the
-  server reads the zone name from the master event to show local times.
-- `search_events` fetches the range and matches text in this server. The server ignores a
-  text-match filter, so client-side matching is required.
+Built and on `develop`, not yet deployed: `list_calendars` (live in 0.1.1), `list_events`,
+`search_events` and `get_event`. All four need the scope `calendar:read`. Designed, not built:
+`get_event_attachment_download`. Not started: the three write tools.
+
+- Date ranges are required and capped at 366 days, within the years 1900 to 2100. Each
+  boundary must carry an explicit offset or `Z`. The range is half-open: the start is
+  included, the end is not.
+- `list_events` and `search_events` read several calendars in one call. `calendar_ids` is
+  optional (1 to 20 ids from `list_calendars`); when it is omitted, every calendar that holds
+  events is read. The result has a status for each calendar (`ok`, `not_found`,
+  `reconnect_required`, `temporarily_unavailable`, `upstream_error`, `result_too_large` or
+  `not_read`). One failing calendar does not fail the call.
+- Result limits: `limit` defaults to 25 and is at most 100. The whole serialized response is
+  capped at 96 KiB. The tool result carries the JSON twice (structured and text), which is
+  why 100 full events do not always fit. When a result is cut, it has `truncated: true`, the
+  reasons (`result_limit`, `response_bytes`) and a `resume_hint` with the civil start of the
+  last event returned. The hint is not a cursor: the agent queries again from that time and
+  removes duplicates by `calendar_id`, `resource_href` and `recurrence_id`.
+- Events come from iCloud's server-side expansion (`calendar-query` with `expand`), one
+  query per calendar, three calendars at a time. The server does not expand recurrences
+  itself and does not fetch the original event for list or search. Results are sorted by the
+  stored local start time, not on one time axis, because the zones differ.
+- `search_events` fetches the range and matches text in this server, case-insensitively, as
+  literal text, against the full title, description and location before they are shortened.
+  The server ignores a text-match filter, so matching here is required.
+- Cancelled events are shown, with `status: "CANCELLED"`.
+- `get_event` takes `calendar_id` and `resource_href` from a list or search result, and
+  `recurrence_id` for one occurrence. It returns the stored master or single event when
+  `recurrence_id` is omitted. `expected_version` (the ETag from the list) turns a change in
+  between into the error `calendar_changed`. It returns attendees, the organizer, attachment
+  metadata for the master and every override, and the stored iCalendar text when
+  `include_raw` is true. The raw text is unmodified, with attachment links and base64
+  included; it is cut to a 16 KiB prefix with `raw_truncated` set when longer.
+- An event the server cannot read goes into `unreadable` (at most 50 entries, with a
+  count). It does not fail the call.
 - Shared calendars appear in `list_calendars`. Whether a calendar is owned, shared with the
-  owner or shared by the owner can be read from `resourcetype`, `owner` and `invite`, and
-  could be added to the tool output in phase 2.
-- All calendar text (titles, notes, locations, attendee names) is untrusted data.
+  owner or shared by the owner can be read from `resourcetype`, `owner` and `invite`. No tool
+  returns it yet.
+- All calendar text (titles, notes, locations, attendee names, time zone names, file names
+  and the raw iCalendar text) is untrusted data.
+
+The planned `get_event_attachment_download` returns a short-lived link to a copy of one
+attachment, not the bytes in the tool result. It will fetch inline attachments from the
+event itself and managed attachments from `gateway.icloud.com` without credentials (see
+"Managed attachments" above). It will accept a managed attachment only on exactly that host
+with `https`, the default port, no user info, a `MANAGED-ID` on the `ATTACH` and a declared
+`SIZE` of at most 20 MiB. An attachment link that points into the account's own CalDAV
+paths, to an `.ics` file or to a collection is never fetched, because the server holds the
+account credentials and the link text comes from whoever sent the invitation. An
+attachment link that points anywhere else is reported as an external link and is not
+fetched. Copies are kept for about one day.
 
 ### Libraries
 
 | Purpose | Library | Note |
 |---|---|---|
 | CalDAV protocol | A small client in `src/caldav/` | It runs over the guarded fetch, with `fast-xml-parser` behind a strict wrapper (`src/caldav/xml.ts`). |
-| Parse and edit iCalendar | `ical.js` | It registers no time zones by default. |
-| Recurrence expansion | iCloud, through `calendar-query` with `expand`. `rrule-temporal` is used in tests only, as a cross-check against the server's answer. | iCloud applies `RECURRENCE-ID` overrides and `EXDATE`s. The server does not merge them. |
-| Date arithmetic | built-in `Temporal` | |
-| Test-only cross-check | `node-ical` | A second implementation to compare expansion results against. |
+| Parse and edit iCalendar | `ical.js` | Reads use only `ICAL.parse`, which returns plain jCal arrays. It registers no time zones by default. |
+| Recurrence expansion | iCloud, through `calendar-query` with `expand`. | iCloud applies `RECURRENCE-ID` overrides and `EXDATE`s. The server does not merge them. |
+| Zone conversion | built-in `Temporal` | Used only to add `utc` and `offset` for IANA zone names. Range boundaries and event spans use integer arithmetic. |
 
 The server does not use `tsdav` 2.5.0. It sends extra requests per calendar and a
 `.well-known` lookup. It also reports 403, 5xx and parse failures as the same error, so
 "wrong password" cannot be told apart from "temporarily unavailable". The other rows are
 phase 2 choices.
 
-Do not use `rrule` (unmaintained, known time-zone weaknesses).
+Do not use `rrule` (unmaintained, known time-zone weaknesses). `rrule-temporal` and
+`node-ical` are not dependencies, and the recurrence code in `ical.js` is not used. They
+disagree with iCloud on the 29 February case, and iCloud's answer is the one that counts.
 
-A new event with a `TZID` is sent without a `VTIMEZONE` block. See datetime rule 6.
+A new event with a `TZID` is sent without a `VTIMEZONE` block. See datetime rule 7.
 
 ## Datetime rules
 
-1. Tool inputs are a local wall-clock time plus an IANA zone name, or a plain date for an
-   all-day event. A bare UTC offset is rejected.
-2. Outputs give the local time with its zone and the UTC instant.
-3. All-day events (`VALUE=DATE`, exclusive end date) and floating events (no zone) are never
-   converted to UTC. Floating events are flagged as such.
-4. A local time in a daylight-saving gap is an error. A repeated hour resolves to the first
-   occurrence, as RFC 5545 states, for stored data.
-5. A duration in days is calendar-day arithmetic, not multiples of 24 hours.
-6. An embedded `VTIMEZONE` is preferred when present. Windows zone names are mapped to IANA
-   names; an unknown zone is an error. For a new event, this server sends the IANA `TZID`
-   without a `VTIMEZONE`, and iCloud adds the definition. This is confirmed for
-   `Europe/Berlin` only. An unknown or unusual zone name is untested.
-7. Updates edit the parsed original component, so unknown properties (`X-APPLE-*`, alarms,
+Rules 1 to 6 apply to reads, which are built. Rules 7 and 8 record decisions for the write
+phases, which are not built.
+
+1. Every time that a client sends must carry its timezone: an RFC 3339 timestamp with an
+   explicit UTC offset or `Z`. A time without one is rejected with `invalid_input`, whose
+   message says that a timezone is required. An offset counts as a timezone.
+2. Times that come from the calendar are passed through as stored. The agent always gets the
+   timezone information that is on the calendar card. A time has one of four shapes:
+   - zoned: `local` (wall-clock text) and `zone` (the `TZID` text, unchanged);
+   - UTC: `utc`;
+   - floating (no `TZID`, no `Z`): `local` and `floating: true`;
+   - all-day: `date` and `all_day: true`.
+3. For a zoned time whose `zone` is an IANA name that the runtime's `Temporal` recognises,
+   the server adds `utc` (the instant) and `offset`, computed with `Temporal`'s default
+   disambiguation. They are best-effort extras. For any other zone name they are absent.
+   The server does not second-guess the stored values and does not cross-check iCloud's.
+4. A time can carry a `timezone_warning`. It is a fixed data item, not an error. Its values:
+   - `no_timezone_on_event`: a floating time. The event has no timezone, so the instant is
+     unknown. There is no `utc` or `offset`.
+   - `unrecognized_timezone`: the `zone` is not an IANA name that the runtime recognises
+     (a Windows name such as `Pacific Standard Time`, for example). It is passed through
+     with no `utc` or `offset`.
+   - `timezone_dropped_from_date`: an all-day date carried a timezone, which the server
+     dropped (rule 5).
+   - `utc_uncertain_dst_transition`: the local time falls in a repeated or skipped hour of a
+     recognised zone. `utc` and `offset` are still given, but iCloud may use a different
+     instant. In a repeated hour iCloud uses the second occurrence and `Temporal`'s default
+     is the first, so the extras can be an hour off. iCloud rewrites a skipped-hour time.
+5. All-day events (`VALUE=DATE`) are dates, not times. They never carry a timezone, never
+   get `utc` or `offset`, and never get the floating warning. The end date is exclusive. A
+   stored date that carries a stray `TZID` is returned as the date only, with
+   `timezone_warning: "timezone_dropped_from_date"`. This also applies in the other
+   direction for writes: a client's all-day date that carries a timezone is accepted, the
+   timezone is dropped, a plain `DATE` is sent to iCloud, and the write result carries the
+   same warning.
+6. The server does not read an embedded `VTIMEZONE` and does not map Windows zone names to
+   IANA names. This is a decision, not a gap: the consumer is an agent that can read a zone
+   name itself, and mapping zone names in code is unreliable. iCloud's expansion drops the
+   `VTIMEZONE` anyway.
+7. For writes, an unrecognised zone name is not pre-checked. It is sent to iCloud as given.
+   If iCloud refuses it, the agent gets iCloud's status and a bounded, sanitised form of its
+   message. For a new event this server sends the IANA `TZID` without a `VTIMEZONE`, and
+   iCloud adds the definition. This is confirmed for `Europe/Berlin` only. A time in a
+   skipped or repeated hour is not rejected either, but iCloud changes or reinterprets it
+   (see "Known quirks"), so a write must not assume that iCloud stored the time it was sent.
+8. A duration in days is calendar-day arithmetic, not multiples of 24 hours.
+9. Updates edit the parsed original component, so unknown properties (`X-APPLE-*`, alarms,
    attachments) survive. An event is never regenerated from a simplified object. iCloud
    preserved an unknown `X-` property with a parameter, and a `VALARM`, unchanged on a round
    trip.
-8. Editing a recurring event requires an explicit scope: `this`, `this_and_future`, or
-   `all`. There is no default. Reading with iCloud's expansion does not change this: writes
-   still edit the master event and its overrides.
-   - `this`: a `RECURRENCE-ID` override in the same resource.
-   - `this_and_future`: set `UNTIL` on the original series and create a new series.
-     `RANGE=THISANDFUTURE` is not emitted.
-9. Organizer edits increase `SEQUENCE` and refresh `DTSTAMP`. iCloud changes neither, so this
-   server must.
-10. Leap seconds need no handling.
+10. Editing a recurring event requires an explicit scope: `this`, `this_and_future`, or
+    `all`. There is no default. Reading with iCloud's expansion does not change this: writes
+    still edit the master event and its overrides.
+    - `this`: a `RECURRENCE-ID` override in the same resource.
+    - `this_and_future`: set `UNTIL` on the original series and create a new series.
+      `RANGE=THISANDFUTURE` is not emitted, because iCloud ignores it when it expands.
+11. Organizer edits increase `SEQUENCE` and refresh `DTSTAMP`. iCloud changes neither, so this
+    server must.
+12. Leap seconds need no handling.
 
 ## Write safety
 
@@ -282,8 +426,9 @@ A new event with a `TZID` is sent without a `VTIMEZONE` block. See datetime rule
 | Phase | Work | Done when | Status |
 |---|---|---|---|
 | 0 | Probe script, run locally and from a Lambda with a real account. Tests: requests from AWS addresses, discovery, server-side expansion, text search, sync-collection, shared and subscribed calendars, time-zone handling on round trip, whether invitations are sent. | Results recorded in `docs/`. | Probe written. Local read-only and `--write` runs done (one account, 2026-11-11). Invite and Lambda runs outstanding. |
-| 1 | Skeleton from wildduck-mcp: OAuth, keyring, store, deployment, CI, adapted login page, allowlist, `list_calendars` only. | Deployed and connected from Claude. | Built. Not deployed. "Connected from Claude" not done. |
-| 2 | Read path: time model, parsing, occurrences from iCloud's expansion, `list_events`, `search_events`, `get_event`. | The read path passes a corpus of awkward events under Node and Bun. Occurrences come from iCloud's expansion and are cross-checked in tests against `rrule-temporal` and `node-ical`. | Not started. |
+| 1 | Skeleton from wildduck-mcp: OAuth, keyring, store, deployment, CI, adapted login page, allowlist, `list_calendars` only. | Deployed and connected from Claude. | Done 2026-11-11. Deployed (version 0.1.1, https://caldav-mcp.rungie.com) and connected from a Claude client, by the owner's report; not checked from server logs. |
+| 2 | Read path: time model, parsing, occurrences from iCloud's expansion, `list_events`, `search_events`, `get_event`. | The read path passes a corpus of awkward events under Node and Bun. Occurrences come from iCloud's expansion and are passed through as it returns them. | Built on `develop`; awaiting release. The live service is still 0.1.1 with `list_calendars` only. |
+| 2b | Attachment download: `get_event_attachment_download` for inline and managed attachments, with short-lived staged copies. | An agent can download every attachment that iCloud holds for an event, including managed ones. The "server holds no calendar data" statement is then replaced by "except attachment copies staged for about one day". | Designed, not built. Next after the phase 2 release. |
 | 3 | Writes for single events: create, update, delete, all-day, alarms. | Conflict and retry tests pass; verified in Calendar.app. | Not started. |
 | 4 | Recurring writes with the three edit scopes. | Verified in Calendar.app across a daylight-saving change. | Not started. |
 | 5 | Optional: attendees and invitations, a free-time finder. | Depends on phase 0 results. | Not started. |
@@ -293,7 +438,7 @@ names and details replaced.
 
 ## Open decisions
 
-No decisions are open, and phase 2 starts when the owner asks for it.
+No decisions are open.
 
 ## Accepted limitations
 
@@ -311,3 +456,13 @@ No decisions are open, and phase 2 starts when the owner asks for it.
 - A rotation of the app-specific password signs out every client.
 - Calendar `id` values returned by `list_calendars` contain the account's numeric iCloud
   path.
+- A short `list_events` or `search_events` query can miss an occurrence that was moved more
+  than 31 days away from its original date. A calendar that silently omits events cannot be
+  detected: `complete` reports only that this server finished processing.
+- Results can include all-day and floating events up to 24 hours outside the range edges.
+  They are passed through, not converted to a timezone.
+- Results are sorted by stored local start time, which is not chronological across zones.
+- `get_event` with `include_raw` returns the stored text unmodified, including attachment
+  links. A managed attachment link works without credentials, so anyone who sees it can
+  download that file. The raw text may also contain malicious instructions, like all
+  calendar text.

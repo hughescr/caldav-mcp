@@ -4,14 +4,69 @@ A small remote MCP server that lets Claude clients read Apple iCloud calendars o
 
 ## Status
 
-This is the phase 1 skeleton. It is built and not deployed. The phase 0 probe is written. Its read-only mode and its `--write` mode have each been run once against one real iCloud account, locally, on 2026-11-11. The probe's invite mode and its Lambda run have not been done. The phase 1 backend ran discovery, validation and `list_calendars` against that account.
+Version 0.1.1 is deployed and live at https://caldav-mcp.rungie.com (released on 2026-11-11). It has one tool, `list_calendars`. The owner connected it from a Claude client and reports that it worked. This was not checked independently from server logs.
 
-- One tool exists: `list_calendars`. It returns each calendar's `id`, `displayName`, `components` and `color`, capped at 200, with a `truncated` flag. The `id` contains the account's numeric iCloud path.
-- Calendar names and colors are untrusted data. Clients must never treat them as instructions.
-- iCloud behaviour is confirmed only for what the two local runs covered (read-only and `--write`, one account). Invitations, behaviour from AWS addresses, the response to a wrong password and subscribed calendars are untested. For those the plan relies on other clients' published test results. [docs/plan.md](docs/plan.md) gives the status of each point, and [docs/probe.md](docs/probe.md) describes the probe.
+The phase 2 read tools `list_events`, `search_events` and `get_event` are built on the `develop` branch. They are not released and not deployed. The attachment download tool is designed and not built. Writes are not started.
+
+- The phase 0 probe is written. Its read-only mode and its `--write` mode have been run several times against one real iCloud account, locally, on 2026-11-11. The probe's invite mode and its Lambda run have not been done.
+- iCloud behaviour is confirmed only for what those local runs covered (one account). Invitations, the response to a wrong password and subscribed calendars are untested. Behaviour from AWS addresses is known only from the owner's report of one successful login from the deployed Lambda, for one account. There is no rate-limit or volume evidence. For the untested points the plan relies on other clients' published test results. [docs/plan.md](docs/plan.md) gives the status of each point, and [docs/probe.md](docs/probe.md) describes the probe.
 - The auth and credential-storage code and the probe each had one independent review by a second Claude agent (same model family). The findings were fixed, except the items in "Accepted limitations" in [docs/plan.md](docs/plan.md).
 
 Read next: [docs/plan.md](docs/plan.md) (goals, phases, open decisions, accepted limitations), [docs/probe.md](docs/probe.md) (the iCloud probe) and [docs/auth-design.md](docs/auth-design.md) (login and OAuth design).
+
+## Tools
+
+All tools need the scope `calendar:read` and only read. The three event tools are on `develop` only.
+
+- `list_calendars` returns each calendar that holds events: `id`, `displayName`, `components` and `color`, at most 200, with a `truncated` flag. The `id` is an opaque path that contains the account's numeric iCloud path. Pass it back unchanged.
+- `list_events` returns the events in a half-open time range (`range.start` included, `range.end` not). `calendar_ids` is optional (1 to 20 ids from `list_calendars`); omit it to read every calendar that holds events. Each result has a status per calendar, so one failing calendar does not fail the call. Recurring events are returned as separate occurrences, as iCloud expands them. Cancelled events are included, with `status` `CANCELLED`. Each event has `resource_href`, `recurrence_id` (null unless it is an occurrence), `expected_version` (the ETag), `start`, `end`, `title`, `location`, a shortened `description` and the attendee count.
+- `search_events` takes the same inputs plus `query` and optional `fields` (`title`, `description`, `location`). It matches literal, case-insensitive text, not a regular expression, in this server.
+- `get_event` takes `calendar_id` and `resource_href` from a list or search result, and `recurrence_id` for one occurrence. It returns the full event: organizer, attendees, a longer title, location and description, and metadata for every attachment of the event (file name, type, declared size, form). `expected_version` makes the call fail with `calendar_changed` if the event changed since the list. `include_raw: true` adds the stored iCalendar text, unmodified, cut to a 16 KiB prefix with `raw_truncated` set when longer. That text can contain attachment links, base64 data and instructions written by whoever sent the invitation. There is no way to download an attachment yet.
+
+Calendar names, event text, time zone names, file names and raw iCalendar text are untrusted data. Clients must never treat them as instructions.
+
+Errors are structured as `{ error: { code, message, request_id } }`. No upstream text is forwarded.
+
+### Times
+
+**Times you send.** Every time you send carries its timezone: an RFC 3339 timestamp with an explicit UTC offset or `Z`, for example `2026-03-08T00:00:00-08:00`. A time without an offset or `Z` is rejected with `invalid_input`, and the message says that a timezone is required. A range is at most 366 days within the years 1900 to 2100.
+
+**Times you get.** Times are passed through as they are stored on the calendar card. A time has one of four shapes:
+
+| Shape | Fields | Meaning |
+|---|---|---|
+| zoned | `local`, `zone`, optional `utc` and `offset` | Wall-clock time and the `TZID` text from the card. |
+| UTC | `utc` | A true instant. |
+| floating | `local`, `floating: true`, `timezone_warning` | The card has no timezone. The instant is unknown. |
+| all-day | `date`, `all_day: true` | A date, not a time. It never has a timezone. The end date is exclusive. |
+
+For a zoned time, the server adds `utc` and `offset` only when `zone` is an IANA name (such as `America/New_York`) that its runtime recognises. It does not read an embedded `VTIMEZONE` and does not map Windows zone names such as `Pacific Standard Time`; those are passed through as written, and the agent can interpret them.
+
+`timezone_warning` is a data item, not an error. It has four values:
+
+- `no_timezone_on_event`: a floating time. There is no `utc` or `offset`.
+- `unrecognized_timezone`: the `zone` is not recognised. There is no `utc` or `offset`, and a range result may include or miss the event because its position in time is unknown.
+- `timezone_dropped_from_date`: an all-day date carried a timezone on the card. The server returned the date only.
+- `utc_uncertain_dst_transition`: the local time falls in a repeated or skipped hour. `utc` and `offset` are given, but iCloud may use a different instant, up to an hour away.
+
+Events are sorted by their stored local start time, not on one time axis. All-day and floating events up to 24 hours outside the range edges can appear in a result.
+
+### Limits
+
+| Limit | Value |
+|---|---|
+| Events per result (`limit`) | default 25, at most 100 |
+| Serialized response | 96 KiB (the JSON appears twice in a tool result, so fewer events may fit) |
+| Calendars per call (`calendar_ids`) | at most 20 |
+| Range | at most 366 days, years 1900 to 2100 |
+| `query` | at most 256 characters |
+| `description` in a list result | shortened to 280 characters |
+| Raw iCalendar text (`include_raw`) | first 16 KiB |
+| Unreadable events reported | at most 50, with a count |
+
+When a result is cut, it has `truncated: true`, the reasons (`result_limit` or `response_bytes`) and a `resume_hint`. The hint is the local start time of the last event returned. It is not a cursor: query again from that time, with an offset or `Z`, and remove duplicates by `calendar_id`, `resource_href` and `recurrence_id`. `complete` is true only when nothing was cut, no event was unreadable and every calendar was read; it does not prove that iCloud returned every event.
+
+A short query can miss an occurrence that was moved more than 31 days away from its original date. iCloud returns a moved occurrence only when the query window covers both its original time and its new one, so the server queries 31 days beyond each end of your range and filters the result.
 
 ## Account connection
 
@@ -46,7 +101,7 @@ The login throttle allows 5 attempts per account in each 15-minute window. An at
 
 ### Scopes
 
-- `calendar:read` is the default. It allows `list_calendars`.
+- `calendar:read` is the default. It allows `list_calendars`, `list_events`, `search_events` and `get_event`.
 - `calendar:write` is reserved for later phases. No tool uses it yet.
 - `calendar:invite` is also reserved. Saving an event with attendees may make iCloud send invitations, so requesting this scope adds a separate required checkbox on the login page.
 
@@ -97,17 +152,19 @@ To rotate, add a new key and change `activeKeyId`. Keep old keys while records o
 
 The DynamoDB table `caldav-mcp-prod-state` is provisioned at exactly 1 read and 1 write capacity unit, with no indexes and no autoscaling. The login page reads it before authentication, so a small burst of unauthenticated requests can exhaust it and make the service return 503. It is retained when the stack is deleted. Keys use the `caldav-mcp#` prefix, and runtime IAM enforces that prefix. The `expiresAt` TTL is only eventual cleanup; expiry is also checked on every read.
 
-Lambda runs `nodejs26.x` on arm64 with 1024 MB, a 60 second timeout and 14 days of logs. The server holds no calendar data. Each tool call reads iCloud when it needs to.
+Lambda runs `nodejs26.x` on arm64 with 1024 MB, a 60 second timeout and 14 days of logs. The server holds no calendar data. Each tool call reads iCloud when it needs to. This is planned to change when the attachment download tool ships: the server would then hold copies of attachments that an agent asked to download, for about one day.
 
 ## Deployment and rollback
 
-Deployment is disabled. Pushes and pull requests to `main` and `develop` only validate and build. The deploy job runs only on `main` and only when the repository variable `DEPLOY_ENABLED` is `true`. Nothing in the workflow turns that on. When it runs, it uses short-lived GitHub OIDC credentials and deploys the exact artifact the verify job built. The verify job has no AWS credentials. No long-lived AWS key is stored in GitHub. Actions are pinned by tag, not by commit, and the deploy job has no approval gate.
+Deployment is enabled. The repository variable `DEPLOY_ENABLED` is `true`; the owner set it on 2026-11-11, so every push to `main` deploys. Pushes and pull requests to `main` and `develop` validate and build. The deploy job runs only on `main` and only when `DEPLOY_ENABLED` is `true`. The workflow never sets that variable itself. When it runs, it uses short-lived GitHub OIDC credentials and deploys the exact artifact the verify job built. The verify job has no AWS credentials. No long-lived AWS key is stored in GitHub. Actions are pinned by tag, not by commit, and the deploy job has no approval gate.
 
 The public hostname is `caldav-mcp.rungie.com`. The template pins it as the only allowed value of `PublicDomainName`. `HostedZoneId` is the same existing zone wildduck-mcp uses.
 
 The bootstrap stack creates the CloudFront distribution, two challenge-header policies, DNS records in the existing `rungie.com` zone, the artifact bucket and two IAM roles. It needs the existing `GitHubOIDCProvider-Arn` and `CertificateAccepterLambda-Arn` exports. The distribution's origin is the `FunctionUrlOrigin` parameter, an existing Function URL origin without a trailing slash. The service stack imports the bootstrap export `caldav-mcp-prod-public-origin`.
 
 First deployment, run once by the repository owner on a machine where `aws` (v2) and `gh` are already logged in and `bun` is installed. It follows the stages wildduck-mcp went through: roles and bucket first, then the service, then the distribution on the real Function URL.
+
+The first deployment was carried out on 2026-11-11. The stacks `caldav-mcp-bootstrap` and `caldav-mcp-prod` exist in `us-west-2`. Step 1 and setting `DEPLOY_ENABLED` were done with equivalent individual commands, before `scripts/setup-deployment.sh` existed in the checkout. The procedure below is how to repeat it.
 
 1. Run the one-time setup. Put the allowlist hashes (from `bun run apple-id-hash`) in the environment, never in a file:
 
@@ -117,12 +174,18 @@ First deployment, run once by the repository owner on a machine where `aws` (v2)
 
    If `SERVERLESS_ACCESS_KEY` is not already a repository secret, export it too, or run from a terminal and `gh` will ask for it without echoing. Add `--dry-run` to see what would run. Re-running is safe.
 2. When you are ready to deploy: `bun run setup:deployment -- --enable-deploy`
-3. Release to `main` with the gitflow `postversion` flow (see "Branches and releases"). The deploy creates the service and its real Function URL. The live verification step at the end of that first CI deploy fails until step 4 has been run; the deployment itself is not affected, and until then the public hostname answers with CloudFront origin errors.
+3. Release to `main` with the gitflow `postversion` flow (see "Branches and releases"). The deploy creates the service and its real Function URL. On the first CI deploy the deploy step succeeded and the live verification step failed, because the placeholder origin was still in place. Until step 4 has been run, the public hostname answers with CloudFront origin errors. After step 4, re-run the failed job: both steps then pass and the run turns green.
 4. Point the distribution at the real Function URL and verify the live service: `bun run setup:deployment -- --finish`
 
-The script (`scripts/setup-deployment.sh`) uses `us-west-2` and `hughescr/caldav-mcp` and nothing else. Step 1 creates or updates the `caldav-mcp-bootstrap` stack (a new stack gets a placeholder `FunctionUrlOrigin`; an existing one keeps its stored value), sets the repository variables from the stack outputs and from `ALLOWED_APPLE_ID_HASHES`, provisions the SSM keyring if it does not exist, and sets the `SERVERLESS_ACCESS_KEY` secret if it does not exist. It never touches `DEPLOY_ENABLED` unless given `--enable-deploy`. Secret values go to `gh` on stdin and are never printed. Step 4 reads the Function URL from the `caldav-mcp-prod` stack, strips the trailing slash, updates the bootstrap stack with it and runs `node scripts/verify-deployment.mjs`. This script has only been run against stub `aws`, `gh` and `bun` programs, never against real AWS or GitHub.
+The script (`scripts/setup-deployment.sh`) uses `us-west-2` and `hughescr/caldav-mcp` and nothing else. Step 1 creates or updates the `caldav-mcp-bootstrap` stack (a new stack gets a placeholder `FunctionUrlOrigin`; an existing one keeps its stored value), sets the repository variables from the stack outputs and from `ALLOWED_APPLE_ID_HASHES`, provisions the SSM keyring if it does not exist, and sets the `SERVERLESS_ACCESS_KEY` secret if it does not exist. It never touches `DEPLOY_ENABLED` unless given `--enable-deploy`. Secret values go to `gh` on stdin and are never printed. Step 4 reads the Function URL from the `caldav-mcp-prod` stack, strips the trailing slash, updates the bootstrap stack with it and runs `node scripts/verify-deployment.mjs`. Only `--finish` has run against real AWS and GitHub (2026-11-11). It succeeded: the bootstrap stack was updated to the real Function URL origin and `scripts/verify-deployment.mjs` passed. Step 1 and `--enable-deploy` of the script have only been run against stub `aws`, `gh` and `bun` programs.
 
 Re-running step 1 keeps the stored `FunctionUrlOrigin`. Run `--finish` again if the Function URL is ever recreated.
+
+If `aws` on your machine is a shell alias or wrapper that injects credentials (for example the 1Password shell plugin, `op plugin run -- aws`), a bash script and the AWS SDK do not see those credentials. `scripts/setup-deployment.sh` and `scripts/provision-auth-keyring.ts` then have no credentials. The keyring script was seen to hang for over two minutes in that state. In the same shell, run this first:
+
+```sh
+eval "$(aws configure export-credentials --format env)"
+```
 
 The OIDC trust pins the immutable owner and repository IDs and the `main` branch. Verify the subject format with `gh api repos/hughescr/caldav-mcp/actions/oidc/customization/sub`.
 
@@ -134,4 +197,4 @@ Rollback: use the published Lambda versions and the previous artifact. Restore t
 
 ## Branches and releases
 
-This repository uses gitflow, as wildduck-mcp does. Work happens on `develop`. `main` receives merges only for releases, through the `postversion` script, and deployments run from `main`. Tags are bare package versions. Set up git-flow with `bun run gitflow:init`. From a clean `develop`, run `bun pm version patch --no-git-tag-version`. The postversion script updates the lockfile, validates, commits, finishes the git-flow release and merges `main` back into `develop`. Nothing is pushed automatically. `bun run test:release` tries the release path in a disposable repository.
+This repository uses gitflow, as wildduck-mcp does. Work happens on `develop`. `main` receives merges only for releases, through the `postversion` script, and deployments run from `main`. Tags are bare package versions. Set up git-flow with `bun run gitflow:init`. The release script (`scripts/postversion.sh`) refuses to run when untracked files exist. From a clean `develop`, run `bun pm version patch --no-git-tag-version`. The postversion script updates the lockfile, validates, commits, finishes the git-flow release and merges `main` back into `develop`. Nothing is pushed automatically. `bun run test:release` tries the release path in a disposable repository.
