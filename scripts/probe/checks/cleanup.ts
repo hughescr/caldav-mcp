@@ -26,7 +26,8 @@ export const PROBE_PREFIX = 'caldav-mcp-probe-';
 const STRICT_NAME = /^caldav-mcp-probe-[0-9a-f]{8}$/;
 const PROBE_RESOURCE = /^(caldav-mcp-probe-[0-9a-f]{8}-[0-9a-z]{1,12})\.ics$/;
 const PROBE_SUMMARY = /^caldav-mcp probe /;
-const MAX_RESOURCES = 50;
+/** A 0.6.0 `--write` run leaves about 90 events in its first temporary calendar if its deletion fails. */
+const MAX_RESOURCES = 100;
 const LISTING_PROPS = ['D:resourcetype', 'D:displayname', 'D:owner', 'CS:invite', 'CS:shared-url', 'CS:source'];
 const SHARING_PROPS = ['invite', 'shared-url', 'source'];
 

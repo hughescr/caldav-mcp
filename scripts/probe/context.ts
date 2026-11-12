@@ -84,6 +84,46 @@ export interface ProbeState {
     created?: { href: string; etag: string | null; staleEtag?: string | null; uid: string } | undefined;
     roundTrips: RoundTripDiff[];
     eventCounter: number;
+    /** The shape of every refused write (status >= 400) of this run, for `write-error-bodies`. In memory only. */
+    refusals: RefusalShape[];
+    /** Filled by the strictness census from its wide query; read by `census-recurrence-shapes` (counts only). */
+    recurrenceCensus?: { tally: Record<string, number>; coverageComplete: boolean };
+    /** What one phase 3 check found that a later one needs. */
+    phase3: { overrideRid?: 'b-utc-token' | 'a-stored-text' | 'other'; overrideSeries?: Phase3Series[]; splitUtcStarts?: string[] };
+    /** Invite steps: when the previous one ended, so the next waits the configured gap. */
+    lastInviteStepAt?: number;
+}
+
+/** One probe-written series that P3B-1, P3B-2 and P3B-3 edit in turn (in memory only). */
+export interface Phase3Series {
+    key: string;
+    url: string;
+    uid: string;
+    etag: string | null;
+    /** The master VEVENT exactly as sent, re-sent byte for byte with every edit. */
+    master: string[];
+    /** The expanded instances before any override, sorted by RECURRENCE-ID. */
+    slots: IcalComponent[];
+    /** The override VEVENTs currently stored, as sent. */
+    overrides: string[][];
+    /** The stored master's unfolded lines after the first override (P3B-3 compares). */
+    storedMaster?: string[] | undefined;
+}
+
+/** A refused write's response body, reduced to its form (names are reduced by the check that reports them). */
+export interface RefusalShape {
+    method: string;
+    status: number;
+    contentType: 'xml' | 'html' | 'plain' | 'calendar' | 'json' | 'none' | 'other';
+    bytes: number;
+    root: string | undefined;
+    elements: string[];
+}
+
+/** `--invite` options: which steps run, how long to wait between them, and the recipient template. */
+export interface InviteOptions {
+    steps: readonly string[];
+    gapMs: number;
 }
 
 export interface CheckContext {
@@ -94,7 +134,9 @@ export interface CheckContext {
     randomHex(bytes: number): string;
     flags: ProbeFlags;
     credentials: { appleId: string; appPassword: string };
+    /** The invite recipient; may contain the literal `{tag}` in its local part (one per step). */
     inviteAttendee: string | undefined;
+    invite: InviteOptions;
     state: ProbeState;
     limits: ProbeLimits;
     loadBackend: () => Promise<BackendLoad>;
@@ -208,5 +250,7 @@ export function newState(): ProbeState {
         temp: [],
         roundTrips: [],
         eventCounter: 0,
+        refusals: [],
+        phase3: {},
     };
 }

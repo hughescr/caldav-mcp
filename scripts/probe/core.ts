@@ -10,6 +10,8 @@ import { payloadSizesCheck } from './checks/payload';
 import { strictnessCheck } from './checks/strictness';
 import { etagCheck, expandReadCheck, freeBusyCheck, multigetCheck, textMatchReadCheck, timeRangeCheck, uidFilterCheck } from './checks/queries';
 import { syncCheck, syncLimitCheck } from './checks/sync';
+import { DEFAULT_INVITE_GAP_SECONDS, DEFAULT_INVITE_STEPS } from './checks/invite-steps';
+import { recurrenceCensusCheck } from './checks/census-recurrence';
 import { runWritePhase } from './checks/write-phase';
 import { newState, runCheck, type CheckContext, type CheckDef, type CheckRecord } from './context';
 import { DEFAULT_HTTP_LIMITS, ProbeHttp } from './http';
@@ -22,7 +24,7 @@ export const DEFAULT_PROBE_LIMITS: ProbeLimits = { ...DEFAULT_HTTP_LIMITS, windo
 const READ_CHECKS: CheckDef[] = [
     davCapabilitiesCheck, schedulingPropsCheck, stabilityCheck, collectionsCheck, timeRangeCheck, freeBusyCheck, expandReadCheck,
     expandFormsCheck, etagExpandVsMultigetCheck, textMatchReadCheck, uidFilterCheck, multigetCheck, etagCheck, calendarDataVsGetCheck, limitRecurrenceSetCheck,
-    bulkMultigetCheck, payloadSizesCheck, strictnessCheck, attachmentCensusCheck, attachmentFetchCheck, syncCheck, syncLimitCheck, backendCheck,
+    bulkMultigetCheck, payloadSizesCheck, strictnessCheck, recurrenceCensusCheck, attachmentCensusCheck, attachmentFetchCheck, syncCheck, syncLimitCheck, backendCheck,
 ];
 
 export class ProbeConfigError extends Error {
@@ -64,6 +66,7 @@ export async function runProbe(input: ProbeInput, deps: ProbeDeps): Promise<Prob
         flags,
         credentials: { appleId: input.appleId, appPassword: input.appPassword },
         inviteAttendee: input.inviteAttendee,
+        invite: { steps: input.inviteSteps ?? DEFAULT_INVITE_STEPS, gapMs: (input.inviteGapSeconds ?? DEFAULT_INVITE_GAP_SECONDS) * 1000 },
         state: newState(),
         limits,
         loadBackend: deps.loadBackend ?? (async () => ({ status: 'absent' })),

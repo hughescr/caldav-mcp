@@ -6,7 +6,7 @@
 import { comps, parseIcal, prop, props } from '../../../scripts/probe/ical';
 import { child, childrenNamed, descendants, escapeXml, parseXml, type XmlNode } from '../../../scripts/probe/xml';
 import {
-    embeddedZones, expandResource, limitRecurrenceSet, occurrences, overlaps, parseDt, pointOf, utc, zoneFromVtimezone, BUILTIN_ZONES,
+    embeddedZones, expandResource, instantOf, limitRecurrenceSet, occurrences, orphanOverrides, overlaps, parseDt, pointOf, utc, zoneFromVtimezone, BUILTIN_ZONES,
     type ExpandStyle, type TimeEnv, type ZoneRules,
 } from './fake-time';
 
@@ -28,7 +28,8 @@ export interface FakeCalendarSeed {
     events?: FakeEventSeed[];
 }
 
-export interface FakeRequest { method: string; url: URL; headers: Headers; body: string }
+/** `body` is the request body decoded as sent; `unfolded` (iCalendar bodies only) was unfolded as octets first. */
+export interface FakeRequest { method: string; url: URL; headers: Headers; body: string; unfolded?: string }
 
 export interface FakeBehaviour {
     davHeader: string;
@@ -104,6 +105,45 @@ export interface FakeBehaviour {
     attachmentGet: 'ok' | 'ignores-range' | 'redirect-allowed' | 'redirect-content' | 'forbidden' | 'unauthorized';
     /** PUT of an event with ATTACH: kept as sent, an inline one turned into a managed attachment, or every ATTACH dropped. */
     attachmentPut: 'preserve' | 'inline-to-managed' | 'drop';
+    /**
+     * PUT of a TZID the fake does not know (not in KNOWN_TZIDS) without a VTIMEZONE: kept, stored
+     * floating, or refused with HTTP 400. GUESS: not measured on iCloud (P3A-1 asks); `keep` is the
+     * fake's long-standing behaviour. W4 measured only a custom TZID *with* a VTIMEZONE (floating).
+     */
+    unknownTzidPut: 'keep' | 'floating' | 'refuse';
+    /**
+     * A timed event whose DTEND instant is before its DTSTART instant: accepted, or refused with 400.
+     * GUESS: not measured on iCloud (P3A-7 asks); `accept` is the fake's long-standing behaviour.
+     */
+    endBeforeStart: 'accept' | 'refuse';
+    /**
+     * FREQ=WEEKLY with BYMONTHDAY (RFC 5545 forbids it): refused with 400, stored with no
+     * instances, or stored with BYMONTHDAY/BYDAY ignored. GUESS: not measured (P3A-9 asks).
+     */
+    weeklyByMonthDay: 'refuse' | 'no-instances' | 'ignored';
+    /**
+     * GET folds content lines longer than 75 octets (at UTF-8 character boundaries) instead of
+     * returning them unfolded. GUESS: not measured (P3A-4 asks); the fake stores lines unfolded.
+     */
+    foldOnGet: boolean;
+    /**
+     * How expansion renders the RECURRENCE-ID of an overridden instance in the `icloud` expand style:
+     * as the same `…Z` token an unmoved instance gets, or as the override's stored RECURRENCE-ID text.
+     * GUESS: not measured (P3B-2 asks); unmoved instances are measured (W1-W3).
+     */
+    overrideRid: 'utc-token' | 'stored-text';
+    /**
+     * Which overrides replace an instance: any whose RECURRENCE-ID names the instance's instant, or
+     * only those written in UTC (an override with a TZID, DATE or floating RECURRENCE-ID is then an
+     * extra instance). Divergent-behaviour option for tests; `instant` is RFC 5545.
+     */
+    ridMatching: 'instant' | 'utc-only';
+    /**
+     * An override whose RECURRENCE-ID matches no instance of its series (beyond UNTIL/COUNT, or off
+     * the rule's slots): shown as an extra instance, hidden, or the PUT refused with 400. GUESS: not
+     * measured (P3C-4 asks); `shown` is the fake's long-standing behaviour.
+     */
+    orphanOverride: 'shown' | 'hidden' | 'refused';
     /** Transform a normal response for adversarial evidence/coverage tests (in-memory only). */
     transformResponse?: (req: FakeRequest, response: Response) => Promise<Response>;
     /** Return a response to override normal handling. */
@@ -185,7 +225,28 @@ const DEFAULT_BEHAVIOUR: FakeBehaviour = {
     attachmentAnonymous: false,
     attachmentGet: 'ok',
     attachmentPut: 'preserve',
+    unknownTzidPut: 'keep',
+    endBeforeStart: 'accept',
+    weeklyByMonthDay: 'refuse',
+    foldOnGet: false,
+    overrideRid: 'utc-token',
+    ridMatching: 'instant',
+    orphanOverride: 'shown',
 };
+
+/**
+ * The behaviour probe-evidence.md measured on the owner's iCloud account (runs 1-6), as far as
+ * the fake can model it: expansion keeps the DTSTART/DTEND forms and drops VTIMEZONE, an unmoved
+ * instance's RECURRENCE-ID is a `…Z` token (W1-W3), a TZID without VTIMEZONE gains one, a known
+ * zone uses its own rules (not an embedded copy), and the second 01:30 is used in a repeated hour.
+ * Options left at their defaults are the fake's guesses, labelled on `FakeBehaviour`.
+ */
+export const ICLOUD_MEASURED: Partial<FakeBehaviour> = {
+    expand: true, expandStyle: 'icloud', addsVtimezone: true, tzPolicy: 'tzdb-first', repeatedHour: 'second', feb29: 'clamp',
+};
+
+/** Zone names the fake knows (by name only; rules exist only for BUILTIN_ZONES). */
+const KNOWN_TZIDS = new Set([...Object.keys(BUILTIN_ZONES), 'Asia/Kolkata', 'Australia/Lord_Howe', 'America/Sao_Paulo', 'Etc/GMT+5', 'UTC']);
 
 /** A file the fake serves at an attachment URL. */
 export interface FakeBlob { text: string; type: string }
@@ -241,6 +302,39 @@ function unfoldedLines(ical: string): string[] {
     return ical.replace(/\r?\n[ \t]/g, '').split(/\r?\n/).filter((l) => l !== '');
 }
 
+/** Removes every line break that is followed by a space or a tab, as octets. */
+function unfoldOctets(bytes: Uint8Array): Uint8Array {
+    const out: number[] = [];
+    for (let i = 0; i < bytes.length; i++) {
+        const crlf = bytes[i] === 13 && bytes[i + 1] === 10 && (bytes[i + 2] === 32 || bytes[i + 2] === 9);
+        const lf = bytes[i] === 10 && (bytes[i + 1] === 32 || bytes[i + 1] === 9);
+        if (crlf || lf) {
+            i += crlf ? 2 : 1;
+            continue;
+        }
+        out.push(bytes[i] ?? 0);
+    }
+    return new Uint8Array(out);
+}
+
+/** Folds every line longer than 75 octets at character boundaries (`foldOnGet`). */
+function foldAtCharacters(ical: string): string {
+    return ical.split('\r\n').map((line) => {
+        const pieces: string[] = [];
+        let current = '';
+        for (const ch of line) {
+            const limit = pieces.length === 0 ? 75 : 74;
+            if (Buffer.byteLength(current + ch) > limit) {
+                pieces.push(current);
+                current = '';
+            }
+            current += ch;
+        }
+        pieces.push(current);
+        return pieces.join('\r\n ');
+    }).join('\r\n');
+}
+
 export class FakeICloud {
     readonly requests: FakeRequest[] = [];
     readonly calendars = new Map<string, FakeCalendar>();
@@ -294,7 +388,13 @@ export class FakeICloud {
 
     readonly fetch = async (input: string | URL | Request, init?: RequestInit): Promise<Response> => {
         const req = new Request(input, init);
-        const fake: FakeRequest = { method: req.method.toUpperCase(), url: new URL(req.url), headers: req.headers, body: req.body === null ? '' : await req.text() };
+        // iCalendar bodies are unfolded as octets before decoding, so a fold inside a UTF-8 sequence is legal (RFC 5545 3.1).
+        const bytes = req.body === null ? new Uint8Array(0) : new Uint8Array(await req.arrayBuffer());
+        const calendarBody = (req.headers.get('content-type') ?? '').toLowerCase().startsWith('text/calendar');
+        const fake: FakeRequest = {
+            method: req.method.toUpperCase(), url: new URL(req.url), headers: req.headers, body: new TextDecoder().decode(bytes),
+            ...(calendarBody ? { unfolded: new TextDecoder().decode(unfoldOctets(bytes)) } : {}),
+        };
         this.requests.push(fake);
         if (init?.redirect !== 'manual') {
             throw new Error('fake server: probe must use redirect: manual');
@@ -635,6 +735,7 @@ export class FakeICloud {
             floating, embedded: embeddedZones(resource), tzPolicy: this.behaviour.tzPolicy, unknownTzid: this.behaviour.unknownTzid,
             overrideMatching: this.behaviour.overrideMatching, thisAndFuture: this.behaviour.thisAndFuture, feb29: this.behaviour.feb29,
             repeatedHour: this.behaviour.repeatedHour, skippedHour: this.behaviour.skippedHour,
+            weeklyByMonthDay: this.behaviour.weeklyByMonthDay, ridMatching: this.behaviour.ridMatching, orphanOverride: this.behaviour.orphanOverride,
         };
     }
 
@@ -659,7 +760,7 @@ export class FakeICloud {
                 const parsed = view.expandRange !== undefined || view.limitRange !== undefined ? parseIcal(event.ical) : undefined;
                 let ical = view.query === true ? this.queryText(event.ical) : event.ical;
                 if (view.expandRange !== undefined) {
-                    ical = expandResource(event.ical, view.expandRange.start, view.expandRange.end, this.env(cal, parsed), { style: this.behaviour.expandStyle, keepDuration: this.behaviour.expandKeepsDuration });
+                    ical = expandResource(event.ical, view.expandRange.start, view.expandRange.end, this.env(cal, parsed), { style: this.behaviour.expandStyle, keepDuration: this.behaviour.expandKeepsDuration, overrideRid: this.behaviour.overrideRid });
                 } else if (view.limitRange !== undefined) {
                     ical = limitRecurrenceSet(event.ical, view.limitRange.start, view.limitRange.end, this.env(cal, parsed));
                 }
@@ -803,7 +904,8 @@ export class FakeICloud {
         lines = this.applyAttachmentPolicy(lines);
         const hasOrganizer = lines.some((l) => l.startsWith('ORGANIZER'));
         if (this.behaviour.scheduleStatus !== null && hasOrganizer) {
-            lines = lines.map((l) => (l.startsWith('ATTENDEE') ? l.replace(/^ATTENDEE/, `ATTENDEE;SCHEDULE-STATUS=${this.behaviour.scheduleStatus}`) : l));
+            // SCHEDULE-AGENT=CLIENT/NONE: the server does not schedule that attendee (RFC 6638). GUESS for iCloud (invite step I10 asks).
+            lines = lines.map((l) => (l.startsWith('ATTENDEE') && !/;SCHEDULE-AGENT=(?:CLIENT|NONE)[;:]/i.test(l) ? l.replace(/^ATTENDEE/, `ATTENDEE;SCHEDULE-STATUS=${this.behaviour.scheduleStatus}`) : l));
         }
         if (this.behaviour.addsVtimezone) {
             const tzids = new Set(lines.flatMap((l) => [...l.matchAll(/;TZID=([^;:]+)/g)].map((m) => m[1] ?? '')));
@@ -819,9 +921,30 @@ export class FakeICloud {
     }
 
     /** Server-side rules on what is stored: zero-length DATE events, RANGE parameters, unknown VTIMEZONEs. */
-    private policies(body: string, parsed: NonNullable<ReturnType<typeof parseIcal>>): { text: string } | { refuse: Response } {
+    private policies(body: string, parsed: NonNullable<ReturnType<typeof parseIcal>>, env: TimeEnv): { text: string } | { refuse: Response } {
         const refuse = (): { refuse: Response } => ({ refuse: errorResponse(400, 'cal:valid-calendar-object-resource') });
         let lines = unfoldedLines(body);
+        const defined = new Set(comps(parsed, 'VTIMEZONE').map((tz) => prop(tz, 'TZID')?.value ?? ''));
+        const strange = new Set(lines.flatMap((l) => [...l.matchAll(/;TZID=([^;:]+)/g)].map((m) => m[1] ?? '')).filter((id) => !defined.has(id) && !KNOWN_TZIDS.has(id)));
+        if (strange.size > 0 && this.behaviour.unknownTzidPut === 'refuse') {
+            return refuse();
+        }
+        if (strange.size > 0 && this.behaviour.unknownTzidPut === 'floating') {
+            lines = lines.map((l) => l.replace(/;TZID=([^;:]+)/g, (whole, id: string) => (strange.has(id) ? '' : whole)));
+        }
+        const events = comps(parsed, 'VEVENT');
+        if (this.behaviour.endBeforeStart === 'refuse' && events.some((e) => {
+            const [start, end] = [pointOf(prop(e, 'DTSTART')), pointOf(prop(e, 'DTEND'))];
+            return start !== undefined && end !== undefined && start.kind !== 'date' && instantOf(end, env) < instantOf(start, env);
+        })) {
+            return refuse();
+        }
+        if (this.behaviour.weeklyByMonthDay === 'refuse' && events.some((e) => props(e, 'RRULE').some((r) => /(?:^|;)FREQ=WEEKLY(?:;|$)/.test(r.value) && /(?:^|;)BYMONTHDAY=/.test(r.value)))) {
+            return refuse();
+        }
+        if (this.behaviour.orphanOverride === 'refused' && orphanOverrides(parsed, env) > 0) {
+            return refuse();
+        }
         const zeroLengthDate = comps(parsed, 'VEVENT').some((e) => {
             const start = prop(e, 'DTSTART');
             const end = prop(e, 'DTEND');
@@ -889,7 +1012,9 @@ export class FakeICloud {
         };
         switch (req.method) {
             case 'GET':
-                return existing === undefined ? new Response('not found', { status: 404 }) : new Response(existing.ical, { status: 200, headers: { 'content-type': 'text/calendar; charset=utf-8', etag: existing.etag } });
+                return existing === undefined
+                    ? new Response('not found', { status: 404 })
+                    : new Response(this.behaviour.foldOnGet ? foldAtCharacters(existing.ical) : existing.ical, { status: 200, headers: { 'content-type': 'text/calendar; charset=utf-8', etag: existing.etag } });
             case 'PROPFIND':
                 return existing === undefined ? new Response('not found', { status: 404 }) : this.propfind(req, [{ href: `${this.homePath}${cal.id}/${name}`, props: (p) => (p === 'getetag' ? existing.etag : undefined) }]);
             case 'DELETE':
@@ -913,7 +1038,8 @@ export class FakeICloud {
                 if (preconditionFails()) {
                     return new Response(null, { status: 412 });
                 }
-                const parsed = parseIcal(req.body);
+                const text = req.unfolded ?? req.body;
+                const parsed = parseIcal(text);
                 const components = parsed === undefined ? [] : [...comps(parsed, 'VEVENT'), ...comps(parsed, 'VTODO')];
                 const first = components[0];
                 const uid = first === undefined ? undefined : prop(first, 'UID')?.value;
@@ -927,7 +1053,7 @@ export class FakeICloud {
                 if (clash !== undefined && (clash.cal !== cal || clash.name !== name) && (this.behaviour.uniqueUidAcrossCalendars || clash.cal === cal)) {
                     return errorResponse(403, 'cal:no-uid-conflict', `<d:href>${this.homePath}${clash.cal.id}/${clash.name}</d:href>`);
                 }
-                const policy = this.policies(req.body, parsed);
+                const policy = this.policies(text, parsed, this.env(cal, parsed));
                 if ('refuse' in policy) {
                     return policy.refuse;
                 }
@@ -936,7 +1062,7 @@ export class FakeICloud {
                 cal.events.set(name, { ical: this.transform(policy.text), etag, rev: cal.rev });
                 cal.tombstones.delete(name);
                 const headers: Record<string, string> = this.behaviour.putReturnsEtag ? { etag } : {};
-                if (this.behaviour.scheduleStatus !== null && /^ORGANIZER/m.test(req.body)) {
+                if (this.behaviour.scheduleStatus !== null && /^ORGANIZER/m.test(text)) {
                     headers['schedule-tag'] = `"${this.options.etagPrefix ?? ''}st${this.etagCounter}"`;
                 }
                 return new Response(null, { status: existing === undefined ? 201 : 204, headers });

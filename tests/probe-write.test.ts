@@ -68,7 +68,7 @@ describe('write mode', () => {
         expect(check(report, 'write-create-if-none-match').evidence).toMatchObject({ createStatus: 201, etagHeaderOnCreate: true, secondCreateStatus: 412 });
         expect(check(report, 'write-duplicate-uid').evidence).toMatchObject({ otherCalendarStatus: 403, otherCalendarPreconditions: ['no-uid-conflict'] });
         expect(check(report, 'write-if-match-star').evidence).toMatchObject({ existingStatus: 412, missingStatus: 412 });
-        expect(report.totals.requests).toBeLessThan(220);
+        expect(report.totals.requests).toBeLessThan(260);
         expect(report.redaction.scrubbedOccurrences).toBe(0);
     });
 

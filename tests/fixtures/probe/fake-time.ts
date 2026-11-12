@@ -10,7 +10,12 @@ import { comps, parseIcal, prop, props, type IcalComponent, type IcalProperty } 
 export const DAY = 86_400_000;
 const MIN = 60_000;
 
-export type ExpandStyle = 'utc-all' | 'keep-forms' | 'keep-forms-no-vtimezone' | 'date-as-utc';
+/**
+ * `icloud`: what probe-evidence.md measured (W1-W3): DTSTART/DTEND keep their form, VTIMEZONE is
+ * dropped, and RECURRENCE-ID is always a `…Z` token: the true instant for UTC and TZID series, the
+ * local or midnight digits with `Z` appended for floating and DATE series.
+ */
+export type ExpandStyle = 'utc-all' | 'keep-forms' | 'keep-forms-no-vtimezone' | 'date-as-utc' | 'icloud';
 
 export interface TimeEnv {
     /** Zone in which floating and DATE values are placed on the time axis; undefined means UTC. */
@@ -26,11 +31,19 @@ export interface TimeEnv {
     repeatedHour?: 'first' | 'second';
     /** A local time that does not exist: read with the offset before the gap (RFC 5545, the default) or the one after it. */
     skippedHour?: 'before-gap' | 'after-gap';
+    /** FREQ=WEEKLY with BYMONTHDAY: `no-instances` expands to nothing; otherwise the extra parts are ignored. */
+    weeklyByMonthDay?: 'refuse' | 'no-instances' | 'ignored';
+    /** `utc-only`: only an override with a UTC RECURRENCE-ID replaces an instance. */
+    ridMatching?: 'instant' | 'utc-only';
+    /** `hidden`: an override whose RECURRENCE-ID matches no slot of the rule is not expanded. */
+    orphanOverride?: 'shown' | 'hidden' | 'refused';
 }
 
 export interface ExpandOptions {
     style: ExpandStyle;
     keepDuration: boolean;
+    /** `icloud` style: an overridden instance's RECURRENCE-ID as the `…Z` token, or as the override's stored text. */
+    overrideRid?: 'utc-token' | 'stored-text';
 }
 
 export function utc(ms: number): string {
@@ -274,6 +287,19 @@ function* localStarts(base: TimePoint, rule: Record<string, string>, env: TimeEn
             yield Date.UTC(y, month, day) + timeOfDay;
         }
     }
+    if (rule.FREQ === 'MONTHLY') {
+        const d = new Date(base.local);
+        const [year, month, day] = [d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate()];
+        const timeOfDay = base.local - Date.UTC(year, month, day);
+        for (let i = 0; i < 2000; i++) {
+            const at = Date.UTC(year, month + i * interval, day) + timeOfDay;
+            // A month without that day has no instance (RFC 5545).
+            if (new Date(at).getUTCDate() === day) {
+                yield at;
+            }
+        }
+        return;
+    }
     const step = (rule.FREQ === 'DAILY' ? DAY : 7 * DAY) * interval;
     for (let i = 0; ; i++) {
         yield base.local + i * step;
@@ -302,6 +328,55 @@ function eventLength(event: IcalComponent, startPoint: TimePoint, env: TimeEnv):
     return { end: start + (durationMs(prop(event, 'DURATION')?.value) ?? (startPoint.kind === 'date' ? DAY : 0)), endPoint: undefined };
 }
 
+function ruleParts(master: IcalComponent): Record<string, string> | undefined {
+    const rule = prop(master, 'RRULE')?.value;
+    return rule === undefined ? undefined : Object.fromEntries(rule.split(';').map((p) => p.split('=') as [string, string]));
+}
+
+const nothingExpands = (parts: Record<string, string>, env: TimeEnv): boolean => env.weeklyByMonthDay === 'no-instances' && parts.FREQ === 'WEEKLY' && parts.BYMONTHDAY !== undefined;
+
+/** Every instant the master's rule generates (COUNT and UNTIL respected, EXDATE ignored), or its DTSTART alone. */
+function ruleSlots(master: IcalComponent, env: TimeEnv): Set<number> {
+    const base = pointOf(prop(master, 'DTSTART'));
+    const parts = ruleParts(master);
+    if (base === undefined) {
+        return new Set();
+    }
+    if (parts === undefined) {
+        return new Set([instantOf(base, env)]);
+    }
+    const slots = new Set<number>();
+    if (nothingExpands(parts, env)) {
+        return slots;
+    }
+    const count = parts.COUNT === undefined ? Infinity : Number(parts.COUNT);
+    const until = parseDt(parts.UNTIL) ?? Infinity;
+    let n = 0;
+    for (const local of localStarts(base, parts, env)) {
+        const start = instantOf({ ...base, local }, env);
+        if (n >= count || n >= 2000 || start > until) {
+            break;
+        }
+        n++;
+        slots.add(start);
+    }
+    return slots;
+}
+
+/** Overrides whose RECURRENCE-ID names no instant the master's rule generates (per UID). */
+export function orphanOverrides(resource: IcalComponent, env: TimeEnv): number {
+    let orphans = 0;
+    for (const events of Map.groupBy(comps(resource, 'VEVENT'), (e) => prop(e, 'UID')?.value ?? '').values()) {
+        const master = events.find((e) => prop(e, 'RECURRENCE-ID') === undefined);
+        const slots = master === undefined ? new Set<number>() : ruleSlots(master, env);
+        for (const o of events.filter((e) => prop(e, 'RECURRENCE-ID') !== undefined)) {
+            const rid = pointOf(prop(o, 'RECURRENCE-ID'));
+            orphans += rid === undefined || !slots.has(instantOf(rid, env)) ? 1 : 0;
+        }
+    }
+    return orphans;
+}
+
 export function occurrences(resource: IcalComponent, limitEnd: number, env: TimeEnv): Occurrence[] {
     const events = [...comps(resource, 'VEVENT'), ...comps(resource, 'VTODO')];
     const master = events.find((e) => prop(e, 'RECURRENCE-ID') === undefined);
@@ -309,8 +384,9 @@ export function occurrences(resource: IcalComponent, limitEnd: number, env: Time
     const result: Occurrence[] = [];
     const overriddenInstants = new Set(overrides.map((o) => {
         const rid = pointOf(prop(o, 'RECURRENCE-ID'));
-        return rid === undefined ? undefined : instantOf(rid, env);
+        return rid === undefined || (env.ridMatching === 'utc-only' && rid.kind !== 'utc') ? undefined : instantOf(rid, env);
     }));
+    const slots = env.orphanOverride === 'hidden' && master !== undefined ? ruleSlots(master, env) : undefined;
     let masterLength = 0;
     if (master !== undefined) {
         const base = pointOf(prop(master, 'DTSTART'));
@@ -332,7 +408,7 @@ export function occurrences(resource: IcalComponent, limitEnd: number, env: Time
                 const shift = futureRid !== undefined && futureStart !== undefined ? instantOf(futureStart, env) - instantOf(futureRid, env) : 0;
                 const endOffset = first.endPoint === undefined ? 0 : first.endPoint.local - base.local;
                 let n = 0;
-                for (const local of localStarts(base, parts, env)) {
+                for (const local of nothingExpands(parts, env) ? [] : localStarts(base, parts, env)) {
                     if (n >= count || n >= 2000) {
                         break;
                     }
@@ -365,6 +441,9 @@ export function occurrences(resource: IcalComponent, limitEnd: number, env: Time
         const length = eventLength(o, startPoint, env);
         const ridPoint = pointOf(prop(o, 'RECURRENCE-ID'));
         const rid = ridPoint === undefined ? null : instantOf(ridPoint, env);
+        if (slots !== undefined && (rid === null || !slots.has(rid))) {
+            continue;
+        }
         const slot = env.overrideMatching === 'original-slot' && rid !== null;
         result.push({
             start, end: length.end, recurrenceId: rid, component: o, startPoint, endPoint: length.endPoint, ridPoint,
@@ -436,7 +515,16 @@ export function expandResource(ical: string, start: number, end: number, env: Ti
             }
         }
         if (recurring && occ.recurrenceId !== null) {
-            lines.push(pointLine('RECURRENCE-ID', occ.ridPoint ?? { kind: 'utc', local: occ.recurrenceId }, occ.recurrenceId, options.style));
+            const stored = prop(occ.component, 'RECURRENCE-ID');
+            if (options.style === 'icloud' && stored !== undefined && options.overrideRid === 'stored-text') {
+                lines.push(`RECURRENCE-ID${Object.entries(stored.params).map(([k, v]) => `;${k}=${v}`).join('')}:${stored.value}`);
+            } else if (options.style === 'icloud') {
+                const rp = occ.ridPoint ?? { kind: 'utc', local: occ.recurrenceId };
+                const token = rp.kind === 'date' ? `${dateText(rp.local)}T000000Z` : rp.kind === 'floating' ? `${wall(rp.local)}Z` : utc(occ.recurrenceId);
+                lines.push(`RECURRENCE-ID:${token}`);
+            } else {
+                lines.push(pointLine('RECURRENCE-ID', occ.ridPoint ?? { kind: 'utc', local: occ.recurrenceId }, occ.recurrenceId, options.style));
+            }
         }
         lines.push(pointLine('DTSTART', occ.startPoint, occ.start, options.style));
         const duration = prop(occ.component, 'DURATION')?.value;

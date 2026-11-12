@@ -30,6 +30,7 @@ describe('read-only probe against an iCloud-like fake', () => {
             'multiget-bulk': 'confirmed',
             'payload-sizes': 'confirmed',
             'strictness-census': 'confirmed',
+            'census-recurrence-shapes': 'confirmed',
             'attachment-census': 'inconclusive',
             'attachment-fetch': 'inconclusive',
             'sync-collection': 'confirmed',

@@ -32,7 +32,12 @@ export interface ProbeInput {
     appleId: string;
     appPassword: string;
     flags: ProbeFlags;
+    /** The invite recipient; may contain `{tag}` in its local part, replaced per step. */
     inviteAttendee?: string;
+    /** `--invite-steps`: which invite steps run (default: I1 only, the original invite check). */
+    inviteSteps?: readonly string[];
+    /** `--invite-gap`: seconds between invite steps (default 90). */
+    inviteGapSeconds?: number;
     runLocation: RunLocation;
     awsRegion?: string | null;
     /** NODE_EXTRA_CA_CERTS was set where the probe ran (recorded; the CLI also warns). */

@@ -2,6 +2,9 @@ import { normalizeAppleId } from '../../src/account';
 import { ProbeConfigError } from './core';
 import { EXTRA_CA_WARNING, UNSAFE_MESSAGE, extraCaCertsSet, unsafeSetting } from './env-check';
 import { LAMBDA_FUNCTION_NAME, invokeRegion } from './lambda-invoke';
+import {
+    DEFAULT_INVITE_GAP_SECONDS, DEFAULT_INVITE_STEPS, MAIL_UPPER_BOUND, MAX_INVITE_GAP_SECONDS, MIN_INVITE_GAP_SECONDS, inviteBudget, parseInviteSteps, type InviteStep,
+} from './checks/invite-steps';
 import { authMessage, cleanupWarning, formatText } from './report';
 import { Taint, scrubValue } from './safe';
 import type { CleanupCandidates, ProbeFlags, ProbeInput, ProbeReport } from './types';
@@ -37,6 +40,10 @@ Checks what Apple iCloud's CalDAV server really does. Read-only unless --write i
 Options:
   --write              Also run write tests inside a temporary calendar the probe creates and deletes.
   --invite             With --write: save one event with an attendee (may send a real invitation).
+  --invite-steps=<list>
+                       With --invite: which invite steps run, e.g. I2,I3 or all (default I1 only).
+                       Steps I2 to I10 send several real emails each; see docs/probe.md.
+  --invite-gap=<s>     With --invite: seconds between invite steps (10 to 900, default 90).
   --cleanup            Only delete calendars the probe itself left behind, after you type delete.
   --json               Print only the JSON report.
   --lambda <function>  Run the probe inside an AWS Lambda function named caldav-mcp-probe...
@@ -51,12 +58,29 @@ const REFUSED = 'Unrecognised or disallowed argument. Credentials are never acce
 const NO_TTY = 'No terminal for prompts. Set PROBE_APPLE_ID and PROBE_APP_PASSWORD in the environment (see docs/probe.md).\n';
 const NO_REGION = '--lambda needs AWS_REGION (or AWS_DEFAULT_REGION) set to a region such as us-west-2.\n';
 
-interface CliOptions { flags: ProbeFlags; json: boolean; help: boolean; lambda?: string }
+interface CliOptions { flags: ProbeFlags; json: boolean; help: boolean; lambda?: string; inviteSteps?: InviteStep[]; inviteGapSeconds?: number }
 
 function parseArgs(argv: readonly string[]): CliOptions | undefined {
     const options: CliOptions = { flags: { write: false, invite: false, cleanup: false }, json: false, help: false };
     for (let i = 0; i < argv.length; i++) {
         const arg = argv[i];
+        if (arg?.startsWith('--invite-steps=') === true) {
+            const steps = parseInviteSteps(arg.slice('--invite-steps='.length));
+            if (steps === undefined || options.inviteSteps !== undefined) {
+                return undefined;
+            }
+            options.inviteSteps = steps;
+            continue;
+        }
+        if (arg?.startsWith('--invite-gap=') === true) {
+            const text = arg.slice('--invite-gap='.length);
+            const seconds = /^\d{1,4}$/.test(text) ? Number(text) : Number.NaN;
+            if (!(seconds >= MIN_INVITE_GAP_SECONDS && seconds <= MAX_INVITE_GAP_SECONDS) || options.inviteGapSeconds !== undefined) {
+                return undefined;
+            }
+            options.inviteGapSeconds = seconds;
+            continue;
+        }
         switch (arg) {
             case '--write':
                 options.flags.write = true;
@@ -111,14 +135,35 @@ async function readCredential(io: CliIo, envName: string, question: string, hidd
     return hidden ? io.promptHidden(question) : io.promptLine(question);
 }
 
-async function collectInvite(io: CliIo): Promise<string | number> {
+/** The longest tag a step can put in the address (`cmcp` + 8 hex + `i10c`). */
+const LONGEST_TAG = 'cmcp0a0a0a0ai10c';
+
+/**
+ * The recipient as typed, lower-cased: a plain address, or one whose local part contains the
+ * literal `{tag}` once (each step then writes to its own address; the domain never changes).
+ */
+export function normalizeInviteTemplate(raw: string): string | undefined {
+    const template = raw.trim().toLowerCase();
+    const tags = template.split('{tag}').length - 1;
+    if (tags > 1 || (tags === 1 && template.indexOf('{tag}') > template.indexOf('@'))) {
+        return undefined;
+    }
+    return normalizeAppleId(template.replace('{tag}', LONGEST_TAG)) === undefined ? undefined : template;
+}
+
+async function collectInvite(io: CliIo, steps: readonly InviteStep[], gapSeconds: number): Promise<string | number> {
+    const budget = inviteBudget(steps, gapSeconds);
     io.stderr([
         '',
-        'WARNING: --invite saves one event that lists the recipient as an ATTENDEE.',
-        'iCloud may deliver a real invitation: by email, or, for an iCloud recipient, inside their Calendar app',
-        'rather than as an invitation email. The recipient sees your address and name as the organizer.',
-        'Deleting the event afterwards may or may not send them a cancellation.',
-        'Use an address you control.',
+        `WARNING: --invite runs ${steps.length} invite step(s): ${steps.join(', ')}.`,
+        'They save events that list the recipient as an ATTENDEE, change them and delete them. iCloud sends a real',
+        'invitation email (and update and cancellation emails) for these at once and without asking:',
+        `up to ${budget.mails} email(s) in all (${steps.map((s) => `${s}: ${MAIL_UPPER_BOUND[s]}`).join(', ')}).`,
+        'An iCloud recipient may get them inside the Calendar app rather than as an invitation email.',
+        'The recipient sees your address and name as the organizer.',
+        ...(steps.includes('I9') ? ['Step I9 instead makes the recipient address the organizer, and you an attendee who accepts, edits and deletes;', 'iCloud may email that address a reply.'] : []),
+        `The steps wait about ${Math.ceil(budget.waitSeconds / 60)} minute(s) in all (${gapSeconds} s between steps).`,
+        'Use an address you control. A literal {tag} in its local part (for example you.{tag}@example.com) gives each step its own address.',
         '',
     ].join('\n'));
     const raw = await readCredential(io, 'PROBE_INVITE_ATTENDEE', 'Invitation recipient email: ', false);
@@ -126,7 +171,7 @@ async function collectInvite(io: CliIo): Promise<string | number> {
         io.stderr('No terminal for prompts. Set PROBE_INVITE_ATTENDEE and PROBE_INVITE_CONFIRM=send in the environment.\n');
         return 2;
     }
-    const attendee = raw === undefined ? undefined : normalizeAppleId(raw);
+    const attendee = raw === undefined ? undefined : normalizeInviteTemplate(raw);
     if (attendee === undefined) {
         io.stderr('Invalid invitation recipient address.\n');
         return 2;
@@ -190,6 +235,17 @@ export async function runCli(argv: readonly string[], io: CliIo, runtime: CliRun
         io.stderr('--cleanup cannot be combined with --write or --invite.\n');
         return 2;
     }
+    if (!flags.invite && (options.inviteSteps !== undefined || options.inviteGapSeconds !== undefined)) {
+        io.stderr('--invite-steps and --invite-gap require --invite.\n');
+        return 2;
+    }
+    if (options.lambda !== undefined && (options.inviteSteps !== undefined || options.inviteGapSeconds !== undefined)) {
+        // The waits between steps exceed the function's 300 s timeout, and Ctrl-C cannot stop a Lambda run.
+        io.stderr('--invite-steps and --invite-gap run locally only, not with --lambda.\n');
+        return 2;
+    }
+    const inviteSteps = options.inviteSteps ?? (DEFAULT_INVITE_STEPS as InviteStep[]);
+    const inviteGapSeconds = options.inviteGapSeconds ?? DEFAULT_INVITE_GAP_SECONDS;
     const unsafe = unsafeSetting(io.env);
     if (unsafe !== undefined) {
         io.stderr(UNSAFE_MESSAGE[unsafe]);
@@ -227,9 +283,13 @@ export async function runCli(argv: readonly string[], io: CliIo, runtime: CliRun
         }
         let inviteAttendee: string | undefined;
         if (flags.invite) {
-            const invite = await collectInvite(io);
+            const invite = await collectInvite(io, inviteSteps, inviteGapSeconds);
             if (typeof invite === 'number') {
                 return invite;
+            }
+            if (options.lambda !== undefined && invite.includes('{tag}')) {
+                io.stderr('A {tag} recipient template runs locally only, not with --lambda.\n');
+                return 2;
             }
             inviteAttendee = invite;
         }
@@ -239,7 +299,10 @@ export async function runCli(argv: readonly string[], io: CliIo, runtime: CliRun
 
         let report: ProbeReport;
         if (options.lambda === undefined || region === undefined) {
-            report = await runtime.probe({ appleId, appPassword, flags, runLocation: 'local', extraCaCertsSet: extraCa, ...(inviteAttendee === undefined ? {} : { inviteAttendee }) }, localHooks(io));
+            report = await runtime.probe({
+                appleId, appPassword, flags, runLocation: 'local', extraCaCertsSet: extraCa,
+                ...(inviteAttendee === undefined ? {} : { inviteAttendee, inviteSteps, inviteGapSeconds }),
+            }, localHooks(io));
         } else {
             let cleanupOk = false;
             if (flags.cleanup) {

@@ -170,7 +170,7 @@ describe('classification', () => {
         expect(Buffer.byteLength(PROBE_FILE_TEXT, 'utf8')).toBe(32);
         expect(PROBE_FILE_TEXT.length).toBe(32);
         expect(PROBE_FILE_NAME).toBe('probe-attachment.txt');
-        expect(PROBE_VERSION).toBe('0.5.0');
+        expect(PROBE_VERSION).toBe('0.6.0');
     });
 });
 
@@ -765,8 +765,10 @@ describe('write-attachment-inline: what PUT does to inline and external ATTACH p
         const ids = report.checks.map((c) => c.id);
         expect(ids.indexOf('write-attachment-managed')).toBeGreaterThan(ids.indexOf('write-range-thisandfuture'));
         expect(ids.indexOf('write-attachment-inline')).toBe(ids.indexOf('write-attachment-managed') + 1);
-        expect(ids.indexOf('write-delete-calendar')).toBe(ids.indexOf('write-attachment-inline') + 1);
-        expect(report.probeVersion).toBe('0.5.0');
+        // The phase 3 checks of 0.6.0 follow, ending with write-error-bodies.
+        expect(ids.indexOf('write-unknown-zone')).toBe(ids.indexOf('write-attachment-inline') + 1);
+        expect(ids.indexOf('write-delete-calendar')).toBe(ids.indexOf('write-error-bodies') + 1);
+        expect(report.probeVersion).toBe('0.6.0');
         expect(ids.indexOf('write-dst-utc-in-repeated-hour')).toBeLessThan(ids.indexOf('write-attachment-managed'));
     });
 });
