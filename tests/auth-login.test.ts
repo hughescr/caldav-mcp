@@ -43,6 +43,7 @@ describe('single-page login and consent', () => {
         expect(html).toMatch(/<input id="apple" name="apple_id" type="email" autocomplete="username"[^>]* required/);
         expect(html).toMatch(/<input id="password" name="app_password" type="password" autocomplete="off"[^>]* maxlength="256"[^>]* required/);
         expect(html).toContain('Never use your main Apple Account password.');
+        expect(html).toContain('only for this connector');
         expect(html).toContain('Your password is stored encrypted and used only to talk to iCloud.');
         expect(html).toContain('<button class="primary" name="decision" value="allow">Connect and allow</button>');
         expect(html).toContain('<button class="secondary" name="decision" value="cancel" formnovalidate>Cancel</button>');

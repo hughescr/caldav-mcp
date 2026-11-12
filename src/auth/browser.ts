@@ -53,7 +53,7 @@ function render(context: Context, runtime: AuthRuntime, auth: Authorization, flo
     cookie(context, runtime, flow);
     const hidden = [...Object.entries(auth.fields), ['csrf', flow.csrf]].map(([key, value]) => `<input type="hidden" name="${escape(key ?? '')}" value="${escape(value ?? '')}">`).join('');
     const identity = auth.client.clientId.startsWith('https://') ? new URL(auth.client.clientId).hostname : 'Registered OAuth client';
-    // Granted scopes are plain list rows, not inputs: there is no choice to make about them.
+    // Requested scopes are plain list rows, not inputs: there is no choice to make about them.
     const scopes = auth.scopes.map(scope => `<li class="permission"><span>${escape(SCOPE_TEXT[scope] ?? scope)}<small>${escape(scope)}</small></span></li>`).join('');
     const invite = auth.scopes.includes('calendar:invite') ? '<label class="permission"><input type="checkbox" name="allow_invite" value="yes" required><span><em>Sensitive</em>Allow saving events that can send invitations to other people</span></label>' : '';
     return page(context, 'Connect your iCloud calendar', [
