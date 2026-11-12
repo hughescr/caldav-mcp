@@ -474,7 +474,8 @@ released (single-occurrence scopes and series moves are the next build).
   attendees changes or the event is deleted (an alarm-only or `TRANSP`-only change sent none),
   and `SCHEDULE-AGENT` cannot suppress it (probe, 2026-11-12). The write tools take no
   attendee or organizer input. Changing or deleting an event that has any `ATTENDEE` or
-  `ORGANIZER` needs `calendar:invite` (else `attendees_present`), keeps those lines exactly as
+  `ORGANIZER` line anywhere in its stored text (any component, group prefix or not; `X-`
+  names do not count) needs `calendar:invite` (else `attendees_present`), keeps those lines exactly as
   stored, and the result says `guests_may_be_emailed`.
 
 ## Phases

@@ -582,6 +582,33 @@ describe('update_event', () => {
         }
     });
 
+    test('the attendee gate scans the whole resource: a group-prefixed name and a VEVENT inside an unknown wrapper count; X- names do not', async () => {
+        const wrapper = 'BEGIN:X-WRAPPER\r\nBEGIN:VEVENT\r\nUID:6E1F7A3B-SINGLE\r\nDTSTART:20270111T150000Z\r\nattendee;CN=Hidden:mailto:hidden@example.test\r\nEND:VEVENT\r\nEND:X-WRAPPER\r\n';
+        const shapes: [string, string][] = [
+            ['group prefix', SINGLE.replace('SUMMARY:Dentist\r\n', 'SUMMARY:Dentist\r\nitem1.ATTENDEE;CN=Guest:mailto:guest@example.test\r\n')],
+            ['group prefix, organizer, lower case', SINGLE.replace('SUMMARY:Dentist\r\n', 'SUMMARY:Dentist\r\nA.organizer:mailto:owner@example.test\r\n')],
+            ['wrapped VEVENT', SINGLE.replace('END:VCALENDAR\r\n', `${wrapper}END:VCALENDAR\r\n`)],
+        ];
+        for (const [shape, text] of shapes) {
+            const h = harness();
+            const etag = h.fake.seed(WORK, SINGLE_HREF, text);
+            expect<unknown>([shape, await failure(() => update(h, { calendar_id: WORK, resource_href: SINGLE_HREF, expected_version: etag, changes: { transparency: 'TRANSPARENT' } }))]).toEqual([shape, { code: 'attendees_present', reason: 'may_send_invitations' }]);
+            expect<unknown>([shape, await failure(() => remove(h, { calendar_id: WORK, resource_href: SINGLE_HREF, expected_version: etag }))]).toEqual([shape, { code: 'attendees_present', reason: 'may_send_invitations' }]);
+            expect<unknown>([shape, h.fake.count('putEvent'), h.fake.count('deleteEvent')]).toEqual([shape, 0, 0]);
+            const invited = harness({ scopes: ['calendar:read', 'calendar:write', 'calendar:delete', 'calendar:invite'] });
+            const invitedEtag = invited.fake.seed(WORK, SINGLE_HREF, text);
+            const updated = await update(invited, { calendar_id: WORK, resource_href: SINGLE_HREF, expected_version: invitedEtag, changes: { transparency: 'TRANSPARENT' } });
+            expect<unknown>([shape, updated.write_outcome, updated.guests_may_be_emailed]).toEqual([shape, 'applied', true]);
+            const deleted = await remove(invited, { calendar_id: WORK, resource_href: SINGLE_HREF, expected_version: updated.expected_version });
+            expect<unknown>([shape, deleted.write_outcome, deleted.guests_may_be_emailed]).toEqual([shape, 'applied', true]);
+        }
+        // X-ATTENDEE and other extension names are not scheduling properties: no invitation permission needed.
+        const h = harness();
+        const etag = h.fake.seed(WORK, SINGLE_HREF, SINGLE.replace('SUMMARY:Dentist\r\n', 'SUMMARY:Dentist\r\nX-ATTENDEE:mailto:x@example.test\r\nX-ORGANIZER-NOTE:n\r\n'));
+        const result = await update(h, { calendar_id: WORK, resource_href: SINGLE_HREF, expected_version: etag, changes: { transparency: 'TRANSPARENT' } });
+        expect<unknown>([result.write_outcome, result.guests_may_be_emailed]).toEqual(['applied', undefined]);
+    });
+
     test('SEQUENCE: inserted as 1 when absent; a value that cannot be incremented is unsupported data', async () => {
         const h = harness();
         const etag = h.fake.seed(WORK, SINGLE_HREF, SINGLE.replace('SEQUENCE:3\r\n', ''));

@@ -24,7 +24,7 @@ import { strongEtag, type CalDavWriteBackend, type StrongEtag, type UpstreamDeta
 import type { ReadBudget } from './budget';
 import { describeEvents, editResource, IcsEditError, type ComponentEdit, type ComponentSelector } from './ics-edit';
 import {
-    verifyCreateOutcome, verifyEditOutcome, type Companion, type CreateExpectation, type ExpectedAlarm, type ExpectedProperty, type OutcomeVerdict, type PropertyExpectation, type TargetExpectation,
+    hasSchedulingLine, verifyCreateOutcome, verifyEditOutcome, type Companion, type CreateExpectation, type ExpectedAlarm, type ExpectedProperty, type OutcomeVerdict, type PropertyExpectation, type TargetExpectation,
 } from './ics-verify';
 import {
     ALARM_DESCRIPTION, buildCreateResource, displayAlarm, IcsWriteError, MAX_SEQUENCE, rruleProperty, sequenceProperty, statusProperty, textProperty, timeProperty, transparencyProperty,
@@ -207,18 +207,14 @@ function parseStored(deps: WriteDeps, text: string): OriginalResource {
     }
 }
 
-function components(original: OriginalResource): EventComponent[] {
-    return [...(original.master === null ? [] : [original.master]), ...original.overrides];
-}
-
-/** ATTENDEE or ORGANIZER in any VEVENT: iCloud emails guests on every change or delete (probe Run 8). */
-function hasGuests(original: OriginalResource): boolean {
-    return components(original).some(component => component.properties.has('attendee') || component.properties.has('organizer'));
-}
-
-/** Refuses an event with guests unless the user ticked the invitation permission (addendum 1). */
-function attendeeGate(deps: WriteDeps, original: OriginalResource): boolean {
-    const guests = hasGuests(original);
+/**
+ * Refuses an event with guests unless the user ticked the invitation permission (addendum 1): iCloud emails guests on every
+ * change or delete (probe Run 8). Any ATTENDEE or ORGANIZER line anywhere in the stored text counts, by the verifier's own
+ * name policy (group prefixes included, X- names not), including components the parser ignores; it fails closed. The text
+ * was read within the 2 MiB resource cap and has parsed, so the linear scan is bounded.
+ */
+function attendeeGate(deps: WriteDeps, storedText: string): boolean {
+    const guests = hasSchedulingLine(storedText);
     if (guests && !deps.scopes.includes(INVITE_SCOPE)) { throw new WriteError('attendees_present', { reason: 'may_send_invitations' }); }
     return guests;
 }
@@ -575,7 +571,7 @@ export async function updateEvent(deps: WriteDeps, input: UpdateEventArgs): Prom
     const found = await readOriginalText(deps, reporter, calendarId, href);
     if (found === null) { throw new WriteError('not_found'); }
     const original = parseStored(deps, found.calendarData);
-    const guests = attendeeGate(deps, original);
+    const guests = attendeeGate(deps, found.calendarData);
     const selected = targets(original, found.calendarData, input.edit_scope, plan);
 
     // A repeating rule for a single event: UNTIL must fit the form of the (new or stored) start.
@@ -683,7 +679,7 @@ export async function deleteEvent(deps: WriteDeps, input: DeleteEventArgs): Prom
     // Nothing at the href: the requested state already holds (a retry after a lost answer, measured as 404; ORCH).
     if (found === null) { return result('desired_state_present', false); }
     const original = parseStored(deps, found.calendarData);
-    const guests = attendeeGate(deps, original);
+    const guests = attendeeGate(deps, found.calendarData);
     if (original.kind !== 'single' && input.edit_scope !== 'all') { throw invalid('edit_scope_required', 'edit_scope'); }
     if (found.etag !== expected) { throw new WriteError('calendar_changed', { reason: 'version_mismatch' }); }
 

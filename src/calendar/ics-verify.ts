@@ -412,6 +412,40 @@ function agree(doc: Doc, node: VNode, component: EventComponent): void {
 // ---- Hard rules ----
 
 const SCHEDULING: ReadonlySet<string> = new Set(['ATTENDEE', 'ORGANIZER']);
+
+/**
+ * THE scheduling-name policy, shared by the hard rules here and the write path's attendee gate: a property name is ATTENDEE
+ * or ORGANIZER after an optional group prefix (`item1.ATTENDEE`) is stripped, case-insensitively. Extension names such as
+ * `X-ATTENDEE` are not scheduling properties.
+ */
+export function isSchedulingName(name: string): boolean {
+    return SCHEDULING.has(bare(name));
+}
+
+/**
+ * True when any content line anywhere in `text` (every component, nested or unknown wrappers included, after unfolding)
+ * has a scheduling name by {@link isSchedulingName}. One linear pass over the text, no parser, so it also sees what a
+ * parser skips. A line's name ends at its first `;` or `:`. Every CR, LF or CRLF counts as a line break and a continuation
+ * without a line before it counts as a line of its own: an ambiguous text yields more candidate names, never fewer.
+ */
+export function hasSchedulingLine(text: string): boolean {
+    const scheduling = (line: string | null): boolean => {
+        if (line === null) { return false; }
+        const delimiter = line.search(/[;:]/u);
+        return isSchedulingName(delimiter === -1 ? line : line.slice(0, delimiter));
+    };
+    let logical: string | null = null;
+    for (const physical of text.split(/\r\n|\n|\r/u)) {
+        const continuation = physical.startsWith(' ') || physical.startsWith('\t');
+        if (continuation && logical !== null) {
+            logical += physical.slice(1);
+            continue;
+        }
+        if (scheduling(logical)) { return true; }
+        logical = physical === '' ? null : physical;
+    }
+    return scheduling(logical);
+}
 /** Names an expectation may never name: identity, structure, scheduling and attachments. */
 const NEVER_EXPECTED: ReadonlySet<string> = new Set(['BEGIN', 'END', 'UID', 'RECURRENCE-ID', 'ATTENDEE', 'ORGANIZER', 'ATTACH']);
 
@@ -467,7 +501,7 @@ function inventory(reading: Reading): Inventory {
         const key = keys.get(node) ?? refuse('structure_mismatch');
         for (const index of node.direct) {
             const line = lineAt(reading.doc, index);
-            if (SCHEDULING.has(line.bareName)) { bump(result.scheduling, key, line.text); }
+            if (isSchedulingName(line.name)) { bump(result.scheduling, key, line.text); }
             if (line.bareName === 'ATTACH') { bump(result.attach, key, line.text); }
         }
         for (const child of node.children) {

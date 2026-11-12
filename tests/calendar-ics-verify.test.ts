@@ -2,7 +2,7 @@ import { describe, expect, test } from 'bun:test';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { describeEvents, editResource, verifyUntouched, type ComponentEdit, type EditPlan, type EventOutline, type NewComponentItem } from '../src/calendar/ics-edit';
-import { verifyCreateOutcome, verifyEditOutcome, type CreateExpectation, type EditExpectation, type ExpectedProperty, type OutcomeVerdict } from '../src/calendar/ics-verify';
+import { hasSchedulingLine, isSchedulingName, verifyCreateOutcome, verifyEditOutcome, type CreateExpectation, type EditExpectation, type ExpectedProperty, type OutcomeVerdict } from '../src/calendar/ics-verify';
 import {
     buildCreateResource, displayAlarm, rruleProperty, sequenceProperty, statusProperty, textProperty, timeProperty, transparencyProperty, travelDurationProperty, type CreateEventInput,
 } from '../src/calendar/ics-write';
@@ -559,5 +559,26 @@ describe('independence and cost', () => {
         started = performance.now();
         expect<unknown>(verifyEditOutcome(before, removed, { target: { component: { kind: 'master' }, alarms: { kind: 'removed' } } })).toEqual({ ok: true });
         expect<unknown>(performance.now() - started).toBeLessThan(2000);
+    });
+});
+
+describe('the scheduling-name policy shared with the attendee gate (security review finding 6)', () => {
+    test('names: ATTENDEE and ORGANIZER after an optional group prefix, any case; X- names are not scheduling names', () => {
+        for (const name of ['ATTENDEE', 'organizer', 'item1.ATTENDEE', 'A.Organizer']) { expect<unknown>([name, isSchedulingName(name)]).toEqual([name, true]); }
+        for (const name of ['X-ATTENDEE', 'X-ORGANIZER', 'ATTENDEES', 'SUMMARY', 'item1.X-ATTENDEE']) { expect<unknown>([name, isSchedulingName(name)]).toEqual([name, false]); }
+    });
+
+    test('the scan sees every line of the text: nested or unknown components, folded names, any line break', () => {
+        const wrap = (lines: readonly string[]): string => crlf(['BEGIN:VCALENDAR', 'VERSION:2.0', ...lines, 'END:VCALENDAR']);
+        for (const text of [
+            wrap(['BEGIN:X-WRAPPER', 'BEGIN:VEVENT', 'ATTENDEE:mailto:a@example.test', 'END:VEVENT', 'END:X-WRAPPER']),
+            wrap(['BEGIN:VEVENT', 'item1.attendee;CN=a:mailto:a@example.test', 'END:VEVENT']),
+            wrap(['BEGIN:VEVENT', 'ATTEN', ' DEE:mailto:a@example.test', 'END:VEVENT']),
+            wrap(['BEGIN:VEVENT', 'SUMMARY:x\rORGANIZER:mailto:o@example.test', 'END:VEVENT']),
+            'ORGANIZER:mailto:o@example.test',
+        ]) {
+            expect<unknown>([text, hasSchedulingLine(text)]).toEqual([text, true]);
+        }
+        expect(hasSchedulingLine(wrap(['BEGIN:VEVENT', 'X-ATTENDEE:mailto:a@example.test', 'DESCRIPTION:ATTENDEE:mailto:a@example.test', 'SUMMARY:x', ' ATTENDEE:folded text', 'END:VEVENT']))).toBe(false);
     });
 });
