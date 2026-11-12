@@ -69,7 +69,7 @@ function codeForStatus(status: number): CalDavErrorCode {
 }
 
 /** Throws 'unauthorized' (before any request) for an Apple ID that Basic auth cannot carry. */
-function basicAuthorization(auth: CalDavAuth): string {
+export function basicAuthorization(auth: CalDavAuth): string {
     const { appleId, appPassword } = auth;
     if (typeof appleId !== 'string' || typeof appPassword !== 'string'
         || appleId === '' || appleId.includes(':') || CONTROL_CHARS.test(appleId)) {

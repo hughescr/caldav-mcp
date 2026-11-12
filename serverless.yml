@@ -25,6 +25,9 @@ provider:
     ALLOWED_APPLE_ID_HASHES: ${env:ALLOWED_APPLE_ID_HASHES, ''}
     CREDENTIAL_TABLE_NAME:
       Ref: CredentialTable
+    # Private bucket for staged attachment copies, owned by the bootstrap stack.
+    DOWNLOAD_BUCKET_NAME:
+      Fn::ImportValue: caldav-mcp-prod-download-bucket
   stackTags:
     Project: caldav-mcp
 

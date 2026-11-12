@@ -197,6 +197,7 @@ function describe(scan: AttachPrescan, component: 'master' | 'override', recurre
         componentRecurrenceId: recurrenceId,
         managedId: inline ? null : managedId,
         uri: inline ? null : scan.valueText,
+        inlineBase64: inline ? scan.valueText : null,
         filename: only(parameters, 'filename') ?? only(parameters, 'x-apple-filename'),
         contentType: only(parameters, 'fmttype'),
         declaredSize: canonicalSize(only(parameters, 'size')),

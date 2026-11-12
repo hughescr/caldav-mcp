@@ -9,7 +9,7 @@ import {
     parseRangeBoundary, rangeTransportWindow, spanOverlapsRange, storedTimeFromJcal, toEventTime,
 } from '../src/calendar/time-core';
 import {
-    INVALID_INPUT_MESSAGE, attachmentMetadataSchema, attachmentRefSchema, attendeeSchema, calendarStatusSchema, dateSchema, downloadInputSchema, downloadResultSchema,
+    INVALID_INPUT_MESSAGE, attachmentMetadataSchema, attachmentRefSchema, attendeeSchema, calendarStatusSchema, dateSchema, downloadInputSchema, downloadOutputSchema,
     etagSchema, eventTimeSchema, eventsOutputSchema, fullEventSchema, getEventInputSchema, getEventOutputSchema, instantSchema, listEventsInputSchema, localSchema,
     occurrenceIdSchema, pathSchema, rangeBoundarySchema, readToolErrorCodeSchema, searchEventsInputSchema, slimEventSchema, unreadableSchema,
     type EventTimeOutput, type EventsOutput, type FullEvent, type GetEventOutput, type SlimEvent,
@@ -820,20 +820,34 @@ describe('input schemas', () => {
         const base = { calendar_id: '/1/calendars/c/', resource_href: '/1/calendars/c/e.ics', attachment_ref: 'a1_' + 'A'.repeat(43) };
         ok(downloadInputSchema, base);
         ok(downloadInputSchema, { ...base, expected_version: '"v1"' });
+        ok(downloadInputSchema, { ...base, recurrence_id: 'occ1_20270111T100000Z' });
+        ok(downloadInputSchema, { ...base, recurrence_id: null });
+        bad(downloadInputSchema, { ...base, recurrence_id: '20270111T100000Z' });
         bad(downloadInputSchema, { ...base, url: 'https://example.test/' });
         bad(downloadInputSchema, { ...base, attachment_ref: 'a1_short' });
         bad(downloadInputSchema, { ...base, filename: 'x' });
         bad(downloadInputSchema, { calendar_id: base.calendar_id, resource_href: base.resource_href });
     });
-    test('download result metadata has no URL; size is 0..20 MiB and the expiry is UTC', () => {
-        const result = { calendar_id: '/1/calendars/c/', resource_href: '/1/calendars/c/e.ics', expected_version: '"v1"', attachment_ref: 'a1_' + 'A'.repeat(43), filename: 'f.pdf', content_type: 'application/pdf', size: 0, expires_at: '2026-03-08T10:05:00Z' };
-        ok(downloadResultSchema, result);
-        ok(downloadResultSchema, { ...result, size: 20 * 1048576, filename: null });
-        bad(downloadResultSchema, { ...result, size: 20 * 1048576 + 1 });
-        bad(downloadResultSchema, { ...result, size: -1 });
-        bad(downloadResultSchema, { ...result, url: 'https://s3.example.test/x' });
-        bad(downloadResultSchema, { ...result, expires_at: '2026-03-08T10:05:00+01:00' });
-        bad(downloadResultSchema, { ...result, content_type: 'a b' });
+    test('download output: a staged copy has size 0..20 MiB, an https link and a UTC expiry; an external link has only its url', () => {
+        const result = { form: 'managed', attachment_ref: 'a1_' + 'A'.repeat(43), expected_version: '"v1"', filename: 'f.pdf', content_type: 'application/pdf', size: 0, download_url: 'https://s3.example.test/x', expires_at: '2026-03-08T10:05:00Z', fetched_by_server: true };
+        ok(downloadOutputSchema, result);
+        ok(downloadOutputSchema, { ...result, form: 'inline', size: 20 * 1048576 });
+        bad(downloadOutputSchema, { ...result, size: 20 * 1048576 + 1 });
+        bad(downloadOutputSchema, { ...result, size: -1 });
+        bad(downloadOutputSchema, { ...result, filename: null });
+        bad(downloadOutputSchema, { ...result, url: 'https://s3.example.test/x' });
+        bad(downloadOutputSchema, { ...result, download_url: 'http://s3.example.test/x' });
+        bad(downloadOutputSchema, { ...result, expires_at: '2026-03-08T10:05:00+01:00' });
+        bad(downloadOutputSchema, { ...result, content_type: 'a b' });
+        bad(downloadOutputSchema, { ...result, fetched_by_server: false });
+        bad(downloadOutputSchema, { ...result, calendar_id: '/1/calendars/c/' });
+        const external = { form: 'external', attachment_ref: result.attachment_ref, expected_version: '"v1"', filename: null, content_type: 'any text', url: 'https://files.example.test/a', fetched_by_server: false };
+        ok(downloadOutputSchema, external);
+        bad(downloadOutputSchema, { ...external, fetched_by_server: true });
+        bad(downloadOutputSchema, { ...external, url: undefined });
+        bad(downloadOutputSchema, { ...external, url: 'javascript:alert(1)' });
+        bad(downloadOutputSchema, { ...external, download_url: 'https://s3.example.test/x' });
+        bad(downloadOutputSchema, { ...external, size: 1 });
     });
     test('tool error codes: the existing four plus the phase 2 fixed codes', () => {
         for (const code of ['reconnect_required', 'temporarily_unavailable', 'insufficient_scope', 'upstream_error', 'invalid_input', 'not_found', 'result_too_large', 'calendar_changed', 'unsupported_calendar_data', 'unsupported_attachment', 'verification_failed']) { ok(readToolErrorCodeSchema, code); }

@@ -10,10 +10,19 @@ import { beginBrowser, postBrowser } from './auth/browser';
 import { OAuthError } from './auth/contracts';
 import { ClientError } from './auth/clients';
 import { readCredentials } from './auth/caldav-session';
-import { bindCalendarService } from './calendar/service';
-export interface AppOptions { config?: Config; runtime?: RuntimeProvider }
+import { bindCalendarService, type DownloadBinding } from './calendar/service';
+import type { DownloadStore } from './calendar/downloads';
+import { createS3DownloadStore } from './calendar/s3-download-store';
+export interface AppOptions { config?: Config; runtime?: RuntimeProvider; downloads?: DownloadBinding }
+/** One staging store per app, created on the first download, never during startup or ordinary reads. */
+function downloadBinding(config: Config): DownloadBinding {
+    const bucketName = config.downloadBucketName;
+    let store: DownloadStore | undefined;
+    return { store: () => (bucketName === undefined ? undefined : (store ??= createS3DownloadStore({ bucketName }))) };
+}
 export function createApp(options: AppOptions = {}) {
     const config = options.config ?? loadConfig(); const runtime = options.runtime ?? createRuntimeProvider(config);
+    const downloads = options.downloads ?? downloadBinding(config);
     const app = new Hono();
     app.use('*', secureHeaders({ referrerPolicy: false }));
     app.use('*', async (context, next) => { context.header('Cache-Control', 'no-store'); context.header('Referrer-Policy', 'no-referrer'); await next(); });
@@ -68,7 +77,7 @@ export function createApp(options: AppOptions = {}) {
             // No upstream validation request here: the tool call itself reaches iCloud and reports a 401.
             // Credentials are decrypted lazily, only when a tool on an active connection needs iCloud,
             // and stay in the bound closure. initialize and tools/list never decrypt.
-            const calendar = bindCalendarService({ caldav: auth.caldav, connectionStatus, credentials: () => readCredentials(auth.crypto, record), markReconnectRequired: () => auth.engine.markReconnectRequired(record) });
+            const calendar = bindCalendarService({ caldav: auth.caldav, connectionStatus, credentials: () => readCredentials(auth.crypto, record), markReconnectRequired: () => auth.engine.markReconnectRequired(record), downloads });
             return handleMcp(context.req.raw, { token, clientId: grant.clientId, scopes: identity.scopes, resource: new URL(auth.engine.resource) }, calendar);
         } catch (error) { if (error instanceof OAuthError && error.error !== 'temporarily_unavailable') { return unauthorized(); } throw error; }
     });

@@ -11,6 +11,8 @@ const deployed = JSON.parse(execFileSync('aws', ['lambda', 'get-function-configu
 const liveAllowlist = deployed.Environment?.Variables?.ALLOWED_APPLE_ID_HASHES;
 assert.ok(typeof liveAllowlist === 'string' && liveAllowlist.trim() !== '', 'Live Lambda must have a non-empty ALLOWED_APPLE_ID_HASHES (an empty allowlist lets nobody connect)');
 assert.ok(liveAllowlist.split(',').every(entry => /^[A-Za-z0-9_-]{43}$/.test(entry)), 'Live Lambda ALLOWED_APPLE_ID_HASHES must contain only well-formed account hashes');
+const liveDownloadBucket = deployed.Environment?.Variables?.DOWNLOAD_BUCKET_NAME;
+assert.ok(typeof liveDownloadBucket === 'string' && /^(?!.*\.\.)[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$/.test(liveDownloadBucket), 'Live Lambda must have DOWNLOAD_BUCKET_NAME from the bootstrap export (attachment downloads need it)');
 const base = outputs.find(entry => entry.OutputKey === 'PublicBaseUrl')?.OutputValue;
 assert.ok(base, 'Canonical CloudFront origin must be a stack output');
 const issuer = new URL(base).origin;

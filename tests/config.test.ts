@@ -73,6 +73,18 @@ test('disabled TLS certificate verification refuses to start', () => {
 });
 
 test('removed wildduck settings are not part of the configuration', () => {
-    const config = loadConfig({ WILDDUCK_DOT_AS_PLUS: 'true', DOWNLOAD_BUCKET_NAME: 'bucket' }) as unknown as Record<string, unknown>;
+    const config = loadConfig({ WILDDUCK_DOT_AS_PLUS: 'true' }) as unknown as Record<string, unknown>;
     expect(Object.keys(config).sort()).toEqual(['allowedAccountIds']);
+});
+
+test('the download bucket is optional and validated without echoing its value', () => {
+    expect(loadConfig({}).downloadBucketName).toBeUndefined();
+    expect(loadConfig({ DOWNLOAD_BUCKET_NAME: '' }).downloadBucketName).toBeUndefined();
+    expect(loadConfig({ DOWNLOAD_BUCKET_NAME: 'caldav-mcp-bootstrap-downloadbucket-1a2b3c' }).downloadBucketName).toBe('caldav-mcp-bootstrap-downloadbucket-1a2b3c');
+    for (const bad of ['Upper', 'a..b', 'x', 'secret value']) {
+        let message = '';
+        try { loadConfig({ DOWNLOAD_BUCKET_NAME: bad }); } catch (error) { message = String(error); }
+        expect(message).toContain('DOWNLOAD_BUCKET_NAME');
+        expect(message).not.toContain(bad);
+    }
 });
