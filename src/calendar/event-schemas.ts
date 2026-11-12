@@ -185,7 +185,8 @@ export const attachmentMetadataSchema = z.strictObject({
     content_type: z.string(FIXED).max(MIME_MAX, FIXED).nullable().describe(`Declared MIME type. ${UNTRUSTED}`),
     declared_size: count.nullable(),
     form: z.enum(['managed', 'inline', 'external_url'], FIXED),
-    download_supported: z.boolean(FIXED),
+    download_supported: z.boolean(FIXED)
+        .describe('True when get_event_attachment_download can stage a copy (inline, managed) or return the external link (external_url).'),
     sanitized: flag,
     truncated: flag,
 }, FIXED);
@@ -239,22 +240,43 @@ export const getEventInputSchema = z.strictObject({
 export const downloadInputSchema = z.strictObject({
     calendar_id: pathSchema,
     resource_href: pathSchema,
-    attachment_ref: attachmentRefSchema,
-    expected_version: etagSchema.optional(),
+    recurrence_id: occurrenceIdSchema.nullable().optional()
+        .describe('Optional occurrence token, as passed to get_event. Attachments are resource-wide, so attachment_ref alone selects the attachment.'),
+    attachment_ref: attachmentRefSchema.describe('attachment_ref from get_event\'s attachments for this calendar_id and resource_href. The server reads the event again and selects the attachment itself; it never takes a URL.'),
+    expected_version: etagSchema.optional().describe('Optional ETag from get_event; the call fails with calendar_changed if the event changed.'),
 }, FIXED);
 
-// ---- Download result metadata (the presigned URL is never part of this schema) ----
+// ---- Download result ----
 
-export const downloadResultSchema = z.strictObject({
-    calendar_id: pathSchema,
-    resource_href: pathSchema,
-    expected_version: etagSchema,
+const MIME_TYPE_RE = /^[a-z0-9!#$&^_.+-]+\/[a-z0-9!#$&^_.+-]+$/u;
+/** Presigned S3 links are about 1-2 KB; external links are bounded at 4096 characters. */
+const LINK_MAX = 8192;
+
+export const downloadOutputSchema = z.strictObject({
+    form: z.enum(['inline', 'managed', 'external'], FIXED)
+        .describe('inline and managed: the server staged a copy and download_url fetches it. external: the event links to another server; url is that link, which this server did not fetch or check.'),
     attachment_ref: attachmentRefSchema,
+    expected_version: etagSchema.describe('The ETag of the event version the attachment was read from.'),
     filename: z.string(FIXED).max(FILENAME_MAX, FIXED).nullable().describe(`Attachment filename. ${UNTRUSTED}`),
-    content_type: z.string(FIXED).max(MIME_MAX, FIXED).regex(/^[A-Za-z0-9!#$&^_.+-]+\/[A-Za-z0-9!#$&^_.+-]+$/u, FIXED),
-    size: count.max(MAX_DOWNLOAD_BYTES, FIXED),
-    expires_at: instantSchema,
-}, FIXED);
+    content_type: z.string(FIXED).max(MIME_MAX, FIXED).nullable().describe(`Content type. For a staged copy, the type it is served with; for an external link, the declared type. ${UNTRUSTED}`),
+    size: count.max(MAX_DOWNLOAD_BYTES, FIXED).optional().describe('Exact byte size of the staged copy.'),
+    download_url: z.string(FIXED).max(LINK_MAX, FIXED).optional()
+        .describe('Presigned HTTPS link to the staged copy, valid until expires_at (at most five minutes). A bearer credential: anyone holding it can download the file until then. Do not log or store it.'),
+    expires_at: instantSchema.optional(),
+    url: z.string(FIXED).max(LINK_MAX, FIXED).optional().describe(`External link from the event, not fetched or checked by this server. ${UNTRUSTED}`),
+    fetched_by_server: z.boolean(FIXED).describe('True when this server produced the staged copy; false for an external link it did not fetch.'),
+}, FIXED).superRefine((value, context) => {
+    const fail = (message: string): void => { context.addIssue({ code: 'custom', message }); };
+    const staged = [value.size, value.download_url, value.expires_at];
+    if (value.form === 'external') {
+        if (value.url === undefined || staged.some(field => field !== undefined) || value.fetched_by_server) { fail('an external result carries only the unfetched url'); }
+        if (value.url !== undefined && !/^https?:\/\//u.test(value.url)) { fail('an external url must be http or https'); }
+        return;
+    }
+    if (value.url !== undefined || staged.some(field => field === undefined) || !value.fetched_by_server) { fail('a staged result carries size, download_url and expires_at'); }
+    if (value.download_url !== undefined && !value.download_url.startsWith('https://')) { fail('download_url must be https'); }
+    if (value.filename === null || value.content_type === null || !MIME_TYPE_RE.test(value.content_type)) { fail('a staged result has a filename and a plain content type'); }
+});
 
 // ---- Tool errors ----
 
@@ -275,7 +297,7 @@ export type Unreadable = z.output<typeof unreadableSchema>;
 export type EventsOutput = z.output<typeof eventsOutputSchema>;
 export type AttachmentMetadata = z.output<typeof attachmentMetadataSchema>;
 export type GetEventOutput = z.output<typeof getEventOutputSchema>;
-export type DownloadResult = z.output<typeof downloadResultSchema>;
+export type DownloadOutput = z.output<typeof downloadOutputSchema>;
 export type ListEventsInput = z.input<typeof listEventsInputSchema>;
 export type SearchEventsInput = z.input<typeof searchEventsInputSchema>;
 export type GetEventInput = z.input<typeof getEventInputSchema>;

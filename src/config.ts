@@ -4,11 +4,19 @@ export interface Config {
     readonly authKeyringParameter?: string;
     /** Account ids (see src/account.ts) allowed to connect. Empty means nobody (fail closed). */
     readonly allowedAccountIds: ReadonlySet<string>;
+    /** Private S3 bucket for staged attachment copies. Absent disables staging only; reads are unaffected. */
+    readonly downloadBucketName?: string;
 }
 
 const ACCOUNT_ID = /^[A-Za-z0-9_-]{43}$/;
 const TABLE_NAME = /^[A-Za-z0-9_.-]{3,255}$/;
 const PARAMETER_NAME = /^\/(?!aws(?:\/|$)|ssm(?:\/|$))[A-Za-z0-9_./-]{1,1000}$/;
+const BUCKET_NAME = /^(?!.*\.\.)[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$/u;
+
+/** S3 general-purpose bucket naming: 3-63 lower-case letters, digits, dots and hyphens, no `..`. */
+export function isValidBucketName(name: string): boolean {
+    return BUCKET_NAME.test(name);
+}
 
 /** A set callers cannot widen: the allowlist is configuration, never runtime state. */
 class FrozenSet<T> implements ReadonlySet<T> {
@@ -50,8 +58,11 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
     if (credentialTableName !== undefined && !TABLE_NAME.test(credentialTableName)) { throw new Error('CREDENTIAL_TABLE_NAME is not a valid DynamoDB table name'); }
     const authKeyringParameter = env['AUTH_KEYRING_PARAMETER'] || undefined;
     if (authKeyringParameter !== undefined && (!PARAMETER_NAME.test(authKeyringParameter) || authKeyringParameter.includes('//'))) { throw new Error('AUTH_KEYRING_PARAMETER is not a valid SSM parameter name'); }
+    const downloadBucketName = env['DOWNLOAD_BUCKET_NAME'] || undefined;
+    if (downloadBucketName !== undefined && !isValidBucketName(downloadBucketName)) { throw new Error('DOWNLOAD_BUCKET_NAME is not a valid S3 bucket name'); }
     return {
         allowedAccountIds: allowlist(env['ALLOWED_APPLE_ID_HASHES']),
+        ...(downloadBucketName ? { downloadBucketName } : {}),
         ...(publicBaseUrl ? { publicBaseUrl } : {}),
         ...(credentialTableName ? { credentialTableName } : {}),
         ...(authKeyringParameter ? { authKeyringParameter } : {}),

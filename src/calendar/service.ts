@@ -2,14 +2,19 @@ import { CalDavError, type CalDavBackend } from '../caldav/contracts';
 import { UnreadableCredentials, type ConnectionStatus, type UpstreamCredentials } from '../auth/contracts';
 import { MAX_CALENDARS, calendarSummarySchema, type ListCalendarsOutput, type ToolErrorCode } from './schemas';
 import type { CalDavReadBackend } from '../caldav/read-contracts';
-import { createReadBudget } from './budget';
-import type { GetEventArgs, ListEventsArgs, SearchEventsArgs } from './event-schemas';
+import { createManagedAttachmentFetcher, type ManagedAttachmentFetcher } from '../caldav/attachment-fetch';
+import type { FetchLike } from '../caldav/hosts';
+import { MANAGED_ATTACHMENT_POLICY, type ManagedAttachmentPolicy } from '../caldav/managed-attachment-policy';
+import { getAttachmentDownload } from './attachment-read';
+import { createDownloadBudget, createReadBudget, type ReadBudget } from './budget';
+import type { DownloadStore } from './downloads';
+import type { DownloadArgs, DownloadOutput, GetEventArgs, ListEventsArgs, SearchEventsArgs } from './event-schemas';
 import { BudgetError } from './model';
-import { getEvent, listEvents, ReadError, searchEvents, type DetailReadResult, type EventsReadResult, type ReadDeps } from './read';
+import { getEvent, listEvents, ReadError, searchEvents, type DetailReadResult, type ErrorDetail, type EventsReadResult, type ReadDeps } from './read';
 
 /** A fixed, sanitized tool failure. It never carries upstream text. */
 export class CalendarError extends Error {
-    constructor(public readonly code: ToolErrorCode) { super(code); }
+    constructor(public readonly code: ToolErrorCode, public readonly detail?: ErrorDetail) { super(code); }
 }
 
 export interface BoundCalendarService {
@@ -17,6 +22,17 @@ export interface BoundCalendarService {
     list_events(input: ListEventsArgs): Promise<EventsReadResult>;
     search_events(input: SearchEventsArgs): Promise<EventsReadResult>;
     get_event(input: GetEventArgs): Promise<DetailReadResult>;
+    get_event_attachment_download(input: DownloadArgs): Promise<DownloadOutput>;
+}
+
+export interface DownloadBinding {
+    /** Returns the staging store, created on first use; undefined when no download bucket is configured. */
+    store?: () => DownloadStore | undefined;
+    /** Transport for managed attachment GETs. Defaults to the global fetch. */
+    fetch?: FetchLike;
+    /** Tests only; production always uses the reviewed MANAGED_ATTACHMENT_POLICY. */
+    policy?: ManagedAttachmentPolicy;
+    now?: () => number;
 }
 
 export interface CalendarBinding {
@@ -31,12 +47,19 @@ export interface CalendarBinding {
     credentials: () => UpstreamCredentials;
     /** CAS transition of the observed connection to reconnect_required. */
     markReconnectRequired: () => Promise<boolean>;
+    /** Attachment download wiring. Absent means no staging store: inline and managed downloads fail, links still work. */
+    downloads?: DownloadBinding;
 }
 
 const calendarList = calendarSummarySchema.array();
 
 /** Builds a request-local service whose closures hold the credentials, outside tool arguments, results and authInfo. */
 export function bindCalendarService(binding: CalendarBinding): BoundCalendarService {
+    const { downloads } = binding;
+    const fetchManaged: ManagedAttachmentFetcher = createManagedAttachmentFetcher({
+        ...(downloads?.fetch === undefined ? {} : { fetch: downloads.fetch }),
+        policy: downloads?.policy ?? MANAGED_ATTACHMENT_POLICY,
+    });
     const markReconnectRequired = async () => {
         // The client is told to reconnect even if recording fails, because that is still true.
         try { await binding.markReconnectRequired(); } catch { /* the next call re-detects it */ }
@@ -59,7 +82,7 @@ export function bindCalendarService(binding: CalendarBinding): BoundCalendarServ
         try {
             return await call(credentials, unauthorized);
         } catch (error) {
-            if (read && (error instanceof ReadError || error instanceof CalendarError)) { throw new CalendarError(error.code); }
+            if (read && (error instanceof ReadError || error instanceof CalendarError)) { throw new CalendarError(error.code, error.detail); }
             if (read && error instanceof BudgetError) { throw new CalendarError(error.kind === 'deadline' ? 'temporarily_unavailable' : 'result_too_large'); }
             if (!(error instanceof CalDavError)) { throw new CalendarError('temporarily_unavailable'); }
             if (error.code === 'unauthorized') {
@@ -72,9 +95,8 @@ export function bindCalendarService(binding: CalendarBinding): BoundCalendarServ
             throw new CalendarError(error.code === 'temporary' ? 'temporarily_unavailable' : 'upstream_error');
         }
     };
-    const read = <T>(call: (deps: ReadDeps) => Promise<T>): Promise<T> => {
-        // Starts before credential binding/membership, not anew for each calendar or HTTP send.
-        const budget = createReadBudget();
+    const read = <T>(call: (deps: ReadDeps) => Promise<T>, budget: ReadBudget = createReadBudget()): Promise<T> => {
+        // The budget starts before credential binding/membership, not anew for each calendar or HTTP send.
         return upstream(async (credentials, onUnauthorized) => {
             const backend = binding.caldav;
             const { queryEvents, multigetEvents } = backend;
@@ -97,6 +119,14 @@ export function bindCalendarService(binding: CalendarBinding): BoundCalendarServ
         list_events: input => read(deps => listEvents(deps, input)),
         search_events: input => read(deps => searchEvents(deps, input)),
         get_event: input => read(deps => getEvent(deps, input)),
+        // The download's 30 s whole-call budget begins here, before credentials and membership.
+        get_event_attachment_download: input => read(deps => getAttachmentDownload({
+            ...deps,
+            store: downloads?.store?.(),
+            fetchManaged,
+            policy: downloads?.policy ?? MANAGED_ATTACHMENT_POLICY,
+            ...(downloads?.now === undefined ? {} : { now: downloads.now }),
+        }, input), createDownloadBudget()),
         list_calendars: async () => {
             const raw = await upstream(credentials => binding.caldav.listCalendars(
                 { appleId: credentials.appleId, appPassword: credentials.appPassword },

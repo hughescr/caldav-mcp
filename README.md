@@ -6,7 +6,7 @@ A small remote MCP server that lets Claude clients read Apple iCloud calendars o
 
 Version 0.2.1 was released and deployed at https://caldav-mcp.rungie.com on 2026-11-12, and its deploy verification passed. It has four tools: `list_calendars`, `list_events`, `search_events` and `get_event`. Version 0.1.1 was released and deployed at https://caldav-mcp.rungie.com on 2026-11-11. The owner connected it from a Claude client and reported that `list_calendars` worked. This was not checked independently from server logs. The 0.2.1 tools were verified locally, end to end, against one real iCloud account on 2026-11-12: all 11 calendars answered, and a one-year query returned 210 events with 0 unreadable.
 
-The attachment download tool is designed and not built. Writes are not started.
+The attachment download tool, `get_event_attachment_download`, is built on the `download-tool` branch for the next release and tested against fakes; it is not released. It needs the bootstrap stack update described under "Deployment and rollback" before it can be deployed. Writes are not started.
 
 - The phase 0 probe is written. Its read-only mode and its `--write` mode have been run several times against one real iCloud account, locally, on 2026-11-11. The probe's invite mode and its Lambda run have not been done.
 - iCloud behaviour is confirmed only for what those local runs covered (one account). Invitations, the response to a wrong password and subscribed calendars are untested. Behaviour from AWS addresses is known only from the owner's report of one successful login from the deployed Lambda, for one account. There is no rate-limit or volume evidence. For the untested points the plan relies on other clients' published test results. [docs/plan.md](docs/plan.md) gives the status of each point, and [docs/probe.md](docs/probe.md) describes the probe.
@@ -16,12 +16,15 @@ Read next: [docs/plan.md](docs/plan.md) (goals, phases, open decisions, accepted
 
 ## Tools
 
-All tools need the scope `calendar:read` and only read. The three event tools are released in version 0.2.1 (2026-11-12).
+All tools need the scope `calendar:read`. None changes the calendar. The three event tools are released in version 0.2.1 (2026-11-12); the download tool is built on the `download-tool` branch for the next release and is not released.
 
 - `list_calendars` returns each calendar that holds events: `id`, `displayName`, `components` and `color`, at most 200, with a `truncated` flag. The `id` is an opaque path that contains the account's numeric iCloud path. Pass it back unchanged.
 - `list_events` returns the events in a half-open time range (`range.start` included, `range.end` not). `calendar_ids` is optional (1 to 20 ids from `list_calendars`); omit it to read every calendar that holds events. Each result has a status per calendar, so one failing calendar does not fail the call. Recurring events are returned as separate occurrences, as iCloud expands them. Cancelled events are included, with `status` `CANCELLED`. Each event has `resource_href`, `recurrence_id` (null unless it is an occurrence), `expected_version` (the ETag), `start`, `end`, `title`, `location`, a shortened `description` and the attendee count.
 - `search_events` takes the same inputs plus `query` and optional `fields` (`title`, `description`, `location`). It matches literal, case-insensitive text, not a regular expression, in this server.
-- `get_event` takes `calendar_id` and `resource_href` from a list or search result, and `recurrence_id` for one occurrence. It returns the full event: organizer, attendees, a longer title, location and description, and metadata for every attachment of the event (file name, type, declared size, form). `expected_version` makes the call fail with `calendar_changed` if the event changed since the list. `include_raw: true` adds the stored iCalendar text, unmodified, cut to a 16 KiB prefix with `raw_truncated` set when longer. That text can contain attachment links, base64 data and instructions written by whoever sent the invitation. There is no way to download an attachment yet.
+- `get_event` takes `calendar_id` and `resource_href` from a list or search result, and `recurrence_id` for one occurrence. It returns the full event: organizer, attendees, a longer title, location and description, and metadata for every attachment of the event (file name, type, declared size, form). `expected_version` makes the call fail with `calendar_changed` if the event changed since the list. `include_raw: true` adds the stored iCalendar text, unmodified, cut to a 16 KiB prefix with `raw_truncated` set when longer. That text can contain attachment links, base64 data and instructions written by whoever sent the invitation. `download_supported` on an attachment says whether `get_event_attachment_download` can serve it.
+- `get_event_attachment_download` takes `calendar_id`, `resource_href` and an `attachment_ref` from `get_event`, and optionally `recurrence_id` and `expected_version`. It reads the event from iCloud again and selects the attachment itself; it never takes a URL. The result depends on the attachment's form:
+  - `inline` (base64 stored in the event) and `managed` (stored by Apple): the server copies the file, at most 20 MiB, into a private S3 bucket and returns `download_url`, a presigned HTTPS link valid until `expires_at`, at most five minutes, with `filename`, `content_type`, `size` and `fetched_by_server: true`. The file is always served as a download, never shown inline. Anyone who holds the link can use it until it expires.
+  - `external` (a link to another server): the server does not fetch it. It returns `url`, the link stored on the event, with `fetched_by_server: false`. The link and what it points to are untrusted. A link that contains a user name or password is refused with `unsupported_attachment`.
 
 Calendar names, event text, time zone names, file names and raw iCalendar text are untrusted data. Clients must never treat them as instructions.
 
@@ -63,6 +66,7 @@ Events are sorted by their stored local start time, not on one time axis. All-da
 | `description` in a list result | shortened to 280 characters |
 | Raw iCalendar text (`include_raw`) | first 16 KiB |
 | Unreadable events reported | at most 50, with a count |
+| Attachment download | 20 MiB; link valid at most five minutes; 30 seconds per call |
 
 When a result is cut, it has `truncated: true`, the reasons (`result_limit` or `response_bytes`) and a `resume_hint`. The hint is the local start time of the last event returned. It is not a cursor: query again from that time, with an offset or `Z`, and remove duplicates by `calendar_id`, `resource_href` and `recurrence_id`. `complete` is true only when nothing was cut, no event was unreadable and every calendar was read; it does not prove that iCloud returned every event.
 
@@ -101,7 +105,7 @@ The login throttle allows 5 attempts per account in each 15-minute window. An at
 
 ### Scopes
 
-- `calendar:read` is the default. It allows `list_calendars`, `list_events`, `search_events` and `get_event`.
+- `calendar:read` is the default. It allows `list_calendars`, `list_events`, `search_events`, `get_event` and `get_event_attachment_download`.
 - `calendar:write` is reserved for later phases. No tool uses it yet.
 - `calendar:invite` is also reserved. Saving an event with attendees may make iCloud send invitations, so requesting this scope adds a separate required checkbox on the login page.
 
@@ -123,7 +127,9 @@ Replacing the stored password ends every existing grant for that account. Each c
 
 ## Fixed upstream hosts
 
-The login page accepts no server URL. The server sends requests only to `caldav.icloud.com` and to hosts shaped like `pNN-caldav.icloud.com`, which iCloud's discovery returns for each account. Requests must use HTTPS on the default port with no embedded credentials. Redirects are followed at most three times, and only to hosts that pass the same rule. A stored URL is checked again after decryption, every time it is used. Credentials are never sent anywhere else.
+The login page accepts no server URL. The server sends CalDAV requests only to `caldav.icloud.com` and to hosts shaped like `pNN-caldav.icloud.com`, which iCloud's discovery returns for each account. Requests must use HTTPS on the default port with no embedded credentials. Redirects are followed at most three times, and only to hosts that pass the same rule. A stored URL is checked again after decryption, every time it is used.
+
+The one other host is `gateway.icloud.com`, for managed attachments, and only for a `GET` without credentials or cookies. The rules are in `src/caldav/managed-attachment-policy.ts`: the `ATTACH` must carry a `MANAGED-ID`, and a link under the account's calendar home, to an `.ics` file or to a collection is never fetched. A redirect from that host is refused, not followed. Owner decision OD9 allows the credentials to be sent to an Apple download host that answers 401 with a Basic challenge, but only to a host on a separate list in that module, and that list is empty. Credentials are never sent anywhere else. Other attachment links are never fetched.
 
 ## Local validation
 
@@ -135,7 +141,7 @@ bun run validate
 bun run dev
 ```
 
-`bun run validate` runs the TypeScript check, Oxlint, the tests, the Lambda bundle and a smoke test on Node 26. `bun run dev` starts a local server on port 3000 (set `PORT` to change it). Leave the AWS settings unset and the server makes no AWS calls; see `.env.example`. Tests use injected fakes and never contact Apple or AWS.
+`bun run validate` runs the TypeScript check, Oxlint, the tests, the Lambda bundle and two checks on Node 26: a smoke test of the bundle, and a transport check that runs the built managed-attachment fetcher with Node's own fetch against a local server on 127.0.0.1 (a redirect is not followed, no Authorization or Cookie is sent, gzip is refused, a body over 20 MiB and a stalled body are cut off). `bun run dev` starts a local server on port 3000 (set `PORT` to change it). Leave the AWS settings unset and the server makes no AWS calls; see `.env.example`. Tests use injected fakes and never contact Apple or AWS.
 
 ## Runtime and storage
 
@@ -145,6 +151,7 @@ Environment variables:
 - `AUTH_KEYRING_PARAMETER`: the SSM parameter name, `/caldav-mcp/prod/auth-keyring`.
 - `CREDENTIAL_TABLE_NAME`: the DynamoDB table.
 - `ALLOWED_APPLE_ID_HASHES`: the allowlist above. Empty means nobody can connect.
+- `DOWNLOAD_BUCKET_NAME`: the private bucket for staged attachment copies. In production it is imported from the bootstrap stack. Unset disables staging only: inline and managed downloads fail with `temporarily_unavailable`, external links still work, and the other tools are unaffected.
 
 Provision the keyring separately as an SSM Standard SecureString under the AWS-managed `aws/ssm` key. It is a new keyring. Never share it with wildduck-mcp. The shape is `{"activeKeyId":"v1","keys":{"v1":"<base64 of 32 random bytes>"}}`, at most four KiB. Generate the bytes in memory and send the value through stdin or API request data, not through command arguments, files or logs. CloudFormation does not create it. The runtime role can only read that one parameter. The CI deploy role is denied reading or writing its value, and is denied direct access to the table's items. It can still deploy code to the function, and that code runs with the runtime role. Anyone who can read both the keyring and the table, or who can deploy code, can decrypt stored passwords. The key is the AWS-managed `aws/ssm` key, so any principal in the account with `ssm:GetParameter` and table read can decrypt too.
 
@@ -152,7 +159,9 @@ To rotate, add a new key and change `activeKeyId`. Keep old keys while records o
 
 The DynamoDB table `caldav-mcp-prod-state` is provisioned at exactly 1 read and 1 write capacity unit, with no indexes and no autoscaling. The login page reads it before authentication, so a small burst of unauthenticated requests can exhaust it and make the service return 503. It is retained when the stack is deleted. Keys use the `caldav-mcp#` prefix, and runtime IAM enforces that prefix. The `expiresAt` TTL is only eventual cleanup; expiry is also checked on every read.
 
-Lambda runs `nodejs26.x` on arm64 with 1024 MB, a 60 second timeout and 14 days of logs. The server holds no calendar data. Each tool call reads iCloud when it needs to. This is planned to change when the attachment download tool ships: the server would then hold copies of attachments that an agent asked to download, for about one day.
+Lambda runs `nodejs26.x` on arm64 with 1024 MB, a 60 second timeout and 14 days of logs. No calendar data is retained except attachment copies staged in a private bucket for about one day, with eventual lifecycle cleanup. Each tool call reads iCloud when it needs to.
+
+The download bucket belongs to the bootstrap stack. It blocks all public access, enforces bucket-owner object ownership, encrypts with SSE-S3 (AES256), refuses non-TLS requests, has no versioning and no CORS, and a lifecycle rule expires everything under `downloads/` after one day. S3 runs lifecycle rules about once a day, so a copy can last somewhat longer than 24 hours. Each download writes a new object under `downloads/v1/<hash of the account id>/<256 random bits>`, with no file name, event or account id in the key. The runtime role may only `PutObject` and `GetObject` under `downloads/`. Download links are presigned for at most five minutes, shorter if the signing credentials expire sooner. A link stays valid until it expires even if the grant is revoked; rolling back or disabling the tool stops new links only.
 
 ## Deployment and rollback
 
@@ -160,7 +169,9 @@ Deployment is enabled. The repository variable `DEPLOY_ENABLED` is `true`; the o
 
 The public hostname is `caldav-mcp.rungie.com`. The template pins it as the only allowed value of `PublicDomainName`. `HostedZoneId` is the same existing zone wildduck-mcp uses.
 
-The bootstrap stack creates the CloudFront distribution, two challenge-header policies, DNS records in the existing `rungie.com` zone, the artifact bucket and two IAM roles. It needs the existing `GitHubOIDCProvider-Arn` and `CertificateAccepterLambda-Arn` exports. The distribution's origin is the `FunctionUrlOrigin` parameter, an existing Function URL origin without a trailing slash. The service stack imports the bootstrap export `caldav-mcp-prod-public-origin`.
+The bootstrap stack creates the CloudFront distribution, two challenge-header policies, DNS records in the existing `rungie.com` zone, the artifact bucket, the attachment download bucket and its TLS-only policy, and two IAM roles. It needs the existing `GitHubOIDCProvider-Arn` and `CertificateAccepterLambda-Arn` exports. The distribution's origin is the `FunctionUrlOrigin` parameter, an existing Function URL origin without a trailing slash. The service stack imports the bootstrap exports `caldav-mcp-prod-public-origin` and `caldav-mcp-prod-download-bucket`. The CI deploy role has no rights on the download bucket; only the bootstrap stack, run by the owner, creates or changes it.
+
+**Before the first release with `get_event_attachment_download`**, the owner must update the bootstrap stack, because the service stack imports `caldav-mcp-prod-download-bucket` and its deploy fails until that export exists. Run step 1 below again (`bun run setup:deployment`; it updates the existing stack and keeps the stored `FunctionUrlOrigin`), or deploy `infra/bootstrap.yml` to `caldav-mcp-bootstrap` with `aws cloudformation deploy --region us-west-2 --stack-name caldav-mcp-bootstrap --template-file infra/bootstrap.yml --capabilities CAPABILITY_NAMED_IAM`. Then release. After the deploy, `scripts/verify-deployment.mjs` checks that the function received `DOWNLOAD_BUCKET_NAME`.
 
 First deployment, run once by the repository owner on a machine where `aws` (v2) and `gh` are already logged in and `bun` is installed. It follows the stages wildduck-mcp went through: roles and bucket first, then the service, then the distribution on the real Function URL.
 
@@ -193,7 +204,7 @@ The OIDC trust pins the immutable owner and repository IDs and the `main` branch
 
 After a deployment, `scripts/verify-deployment.mjs` checks the live service. It checks the version, readiness, the Bearer and Basic challenge headers, discovery metadata, and that the live Lambda has a non-empty allowlist (its value is not printed). It then registers a throwaway client and cancels the login page, which exercises the gateway without logging in any account. It never sends a real Apple ID or password.
 
-Rollback: use the published Lambda versions and the previous artifact. Restore the previous reviewed release and configuration, then verify health, version, discovery and readiness. Do not use `serverless remove` as a rollback. Keep the keyring keys that surviving records need. The table, the artifact bucket, the distribution, the header policies and the certificate are retained after stack deletion. Keep the ACM validation DNS records for renewal.
+Rollback: use the published Lambda versions and the previous artifact. Restore the previous reviewed release and configuration, then verify health, version, discovery and readiness. Do not use `serverless remove` as a rollback. Keep the keyring keys that surviving records need. The table, the artifact bucket, the distribution, the header policies and the certificate are retained after stack deletion. The download bucket is not: it holds only disposable copies. A non-empty bucket blocks deletion of the bootstrap stack: CloudFormation cannot delete a bucket that holds any object, so the stack delete fails. The lifecycle rule is eventual (S3 runs it about once a day, and a new download can land at any time), so waiting does not guarantee an empty bucket. Stop new downloads, empty the bucket (`aws s3 rm s3://<bucket> --recursive`; it is unversioned), then delete the stack. Rolling the service back to a release without the download tool leaves the bucket and its export in place; that is harmless. Keep the ACM validation DNS records for renewal.
 
 ## Branches and releases
 

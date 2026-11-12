@@ -178,6 +178,58 @@ Resources:
             Status: Enabled
             NoncurrentVersionExpiration:
               NoncurrentDays: 30
+  # Attachment copies staged by get_event_attachment_download. Private, no versioning,
+  # no CORS, no website. Objects expire about a day after they are written (S3
+  # lifecycle runs once a day, so deletion is eventual, not exactly 24 h). Not
+  # retained on stack deletion: its contents are disposable copies.
+  DownloadBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireStagedDownloads
+            Status: Enabled
+            Prefix: downloads/
+            ExpirationInDays: 1
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 1
+      Tags:
+        - Key: Project
+          Value: caldav-mcp
+  DownloadBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      Bucket:
+        Ref: DownloadBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: RequireTLS
+            Effect: Deny
+            Principal: '*'
+            Action: s3:*
+            Resource:
+              - Fn::GetAtt: [DownloadBucket, Arn]
+              - Fn::Sub: ${DownloadBucket.Arn}/*
+            Condition:
+              Bool:
+                aws:SecureTransport: false
   ExecutionRole:
     Type: AWS::IAM::Role
     Properties:
@@ -209,6 +261,12 @@ Resources:
                 Condition:
                   ForAllValues:StringLike:
                     dynamodb:LeadingKeys: ['caldav-mcp#*']
+              # Write one staged attachment copy and sign GET links to it. Every download
+              # writes a new random key, so no HEAD, list, delete or multipart action is needed.
+              - Effect: Allow
+                Action: [s3:PutObject, s3:GetObject]
+                Resource:
+                  Fn::Sub: ${DownloadBucket.Arn}/downloads/*
   GitHubDeployRole:
     Type: AWS::IAM::Role
     Properties:
@@ -344,6 +402,11 @@ Outputs:
   ArtifactBucketName:
     Value:
       Ref: ArtifactBucket
+  DownloadBucketName:
+    Value:
+      Ref: DownloadBucket
+    Export:
+      Name: caldav-mcp-prod-download-bucket
   ExecutionRoleArn:
     Value:
       Fn::GetAtt: [ExecutionRole, Arn]

@@ -119,15 +119,16 @@ test('deployment keeps the agreed tiny footprint without hidden indexes or scali
     expect(table?.UpdateReplacePolicy).toBe('Retain');
 });
 
-test('function environment is the caldav set with a fail-closed allowlist and no mail or download settings', () => {
+test('function environment is the caldav set with a fail-closed allowlist, the imported download bucket and no mail settings', () => {
     const environment = configuration.provider.environment;
-    expect(Object.keys(environment).toSorted()).toEqual(['ALLOWED_APPLE_ID_HASHES', 'AUTH_KEYRING_PARAMETER', 'CREDENTIAL_TABLE_NAME', 'PUBLIC_BASE_URL']);
+    expect(Object.keys(environment).toSorted()).toEqual(['ALLOWED_APPLE_ID_HASHES', 'AUTH_KEYRING_PARAMETER', 'CREDENTIAL_TABLE_NAME', 'DOWNLOAD_BUCKET_NAME', 'PUBLIC_BASE_URL']);
+    expect(environment['DOWNLOAD_BUCKET_NAME']).toEqual({ 'Fn::ImportValue': 'caldav-mcp-prod-download-bucket' });
     expect(environment['PUBLIC_BASE_URL']).toEqual({ 'Fn::ImportValue': 'caldav-mcp-prod-public-origin' });
     expect(environment['CREDENTIAL_TABLE_NAME']).toEqual({ Ref: 'CredentialTable' });
     expect(environment['AUTH_KEYRING_PARAMETER']).toBe("${env:AUTH_KEYRING_PARAMETER, ''}");
     // An unset repository variable must deploy as an empty allowlist: nobody may connect.
     expect(environment['ALLOWED_APPLE_ID_HASHES']).toBe("${env:ALLOWED_APPLE_ID_HASHES, ''}");
-    expect(sources.serverless).not.toMatch(/WILDDUCK_|DOWNLOAD_BUCKET/);
+    expect(sources.serverless).not.toMatch(/WILDDUCK_/);
 });
 
 test('no repository infrastructure file still carries wildduck naming', () => {
@@ -136,16 +137,42 @@ test('no repository infrastructure file still carries wildduck naming', () => {
     }
 });
 
-test('there are no S3 download resources, policies, exports or IAM statements', () => {
-    const everything = JSON.stringify([configuration, bootstrap]);
-    expect(everything).not.toMatch(/DownloadBucket|download-bucket|downloads\//);
+test('the download bucket is a separate private, encrypted, unversioned bucket in the bootstrap stack with one-day expiry', () => {
     const buckets = Object.entries(bootstrap.Resources).filter(([, resource]) => resource.Type === 'AWS::S3::Bucket').map(([name]) => name);
-    expect(buckets).toEqual(['ArtifactBucket']);
-    expect(Object.values(bootstrap.Resources).some((resource) => resource.Type === 'AWS::S3::BucketPolicy')).toBe(false);
-    const runtime = statementsOf('ExecutionRole');
-    expect(runtime.some((statement) => actionsOf(statement).some((action) => action.startsWith('s3:')))).toBe(false);
-    expect(Object.keys(bootstrap.Outputs)).not.toContain('DownloadBucketName');
-    expect(Object.values(configuration.resources.Resources).some((resource) => resource.Type === 'AWS::S3::Bucket')).toBe(false);
+    expect(buckets.toSorted()).toEqual(['ArtifactBucket', 'DownloadBucket']);
+    const bucket = bootstrap.Resources['DownloadBucket'];
+    expect(Object.keys(bucket?.Properties ?? {}).toSorted()).toEqual(['BucketEncryption', 'LifecycleConfiguration', 'OwnershipControls', 'PublicAccessBlockConfiguration', 'Tags']);
+    expect(bucket?.Properties['OwnershipControls']).toEqual({ Rules: [{ ObjectOwnership: 'BucketOwnerEnforced' }] });
+    expect(bucket?.Properties['PublicAccessBlockConfiguration']).toEqual({ BlockPublicAcls: true, BlockPublicPolicy: true, IgnorePublicAcls: true, RestrictPublicBuckets: true });
+    expect(bucket?.Properties['BucketEncryption']).toEqual({ ServerSideEncryptionConfiguration: [{ ServerSideEncryptionByDefault: { SSEAlgorithm: 'AES256' } }] });
+    expect(bucket?.Properties['LifecycleConfiguration']).toEqual({ Rules: [{ Id: 'ExpireStagedDownloads', Status: 'Enabled', Prefix: 'downloads/', ExpirationInDays: 1, AbortIncompleteMultipartUpload: { DaysAfterInitiation: 1 } }] });
+    // No versioning (an old version would outlive the expiry), no CORS, no website, no fixed name.
+    for (const absent of ['VersioningConfiguration', 'CorsConfiguration', 'WebsiteConfiguration', 'BucketName', 'AccessControl']) { expect(bucket?.Properties[absent]).toBeUndefined(); }
+    // Staged copies are disposable: the bucket is not retained when the stack is deleted.
+    expect(bucket?.DeletionPolicy).toBe('Delete');
+    expect(bucket?.UpdateReplacePolicy).toBe('Delete');
+    const policies = Object.entries(bootstrap.Resources).filter(([, resource]) => resource.Type === 'AWS::S3::BucketPolicy');
+    expect(policies.map(([name]) => name)).toEqual(['DownloadBucketPolicy']);
+    const policy = bootstrap.Resources['DownloadBucketPolicy']?.Properties ?? {};
+    expect(policy['Bucket']).toEqual({ Ref: 'DownloadBucket' });
+    expect((policy['PolicyDocument'] as { Statement: unknown[] }).Statement).toEqual([{
+        Sid: 'RequireTLS', Effect: 'Deny', Principal: '*', Action: 's3:*',
+        Resource: [{ 'Fn::GetAtt': ['DownloadBucket', 'Arn'] }, { 'Fn::Sub': '${DownloadBucket.Arn}/*' }],
+        Condition: { Bool: { 'aws:SecureTransport': false } },
+    }]);
+    expect(bootstrap.Outputs['DownloadBucketName']).toEqual({ Value: { Ref: 'DownloadBucket' }, Export: { Name: 'caldav-mcp-prod-download-bucket' } });
+    expect(Object.values(configuration.resources.Resources).some((resource) => resource.Type.startsWith('AWS::S3::'))).toBe(false);
+});
+
+test('the CI deploy role gains no download bucket data or control permissions', () => {
+    const deploy = JSON.stringify(bootstrap.Resources['GitHubDeployRole']);
+    expect(deploy).not.toMatch(/DownloadBucket|downloads\//);
+    const s3Resources = statementsOf('GitHubDeployRole').filter((statement) => actionsOf(statement).some((action) => action.startsWith('s3:'))).map((statement) => statement.Resource);
+    expect(s3Resources).toEqual([{ 'Fn::GetAtt': ['ArtifactBucket', 'Arn'] }, { 'Fn::Sub': '${ArtifactBucket.Arn}/serverless/caldav-mcp/prod/*' }]);
+});
+
+test('the live verification checks that the function received the download bucket', () => {
+    expect(sources.verify).toContain('DOWNLOAD_BUCKET_NAME');
 });
 
 test('deployment can discover log groups without granting account-wide log mutations', () => {
@@ -239,7 +266,7 @@ test('deploy role manages the state table control plane only and explicitly cann
     expect(sources.bootstrap).toContain('inside the trust boundary');
 });
 
-test('runtime IAM has exactly logs, one keyring parameter read and leading-key-scoped table item access, no wildcards', () => {
+test('runtime IAM has exactly logs, one keyring parameter read, leading-key-scoped table item access and download-prefix put/get, no action wildcards', () => {
     const statements = statementsOf('ExecutionRole');
     const sub = (value: string) => ({ 'Fn::Sub': value });
     expect(statements).toEqual([
@@ -251,14 +278,18 @@ test('runtime IAM has exactly logs, one keyring parameter read and leading-key-s
             Resource: sub('arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/caldav-mcp-prod-state'),
             Condition: { 'ForAllValues:StringLike': { 'dynamodb:LeadingKeys': ['caldav-mcp#*'] } },
         },
+        { Effect: 'Allow', Action: ['s3:PutObject', 's3:GetObject'], Resource: sub('${DownloadBucket.Arn}/downloads/*') },
     ]);
     for (const statement of statements) {
         expect(statement.Resource).not.toBe('*');
         expect(actionsOf(statement).some((action) => action.endsWith('*'))).toBe(false);
     }
-    // The single permitted resource wildcard is the log-stream suffix of the function's own log group.
+    // The only resource wildcards are the function's own log streams and the download prefix of the download bucket.
     const wildcardResources = statements.map((statement) => JSON.stringify(statement.Resource)).filter((resource) => resource.includes('*'));
-    expect(wildcardResources).toEqual([JSON.stringify(sub(`${logGroup}:*`))]);
+    expect(wildcardResources).toEqual([JSON.stringify(sub(`${logGroup}:*`)), JSON.stringify(sub('${DownloadBucket.Arn}/downloads/*'))]);
+    // No list, delete, ACL, policy or multipart action on any bucket.
+    const s3Actions = statements.flatMap(actionsOf).filter((action) => action.startsWith('s3:'));
+    expect(s3Actions).toEqual(['s3:PutObject', 's3:GetObject']);
 });
 
 test('OIDC trust binds the actual immutable repository identity and main branch only', () => {
@@ -312,7 +343,7 @@ test('CloudFront uses the approved shared certificate and DNS pattern with an in
     expect(bootstrap.Outputs['PublicBaseUrl']).toEqual({ Value: { 'Fn::Sub': 'https://${PublicDomainName}' }, Export: { Name: 'caldav-mcp-prod-public-origin' } });
     expect(JSON.stringify(bootstrap)).not.toContain('Fn::ImportValue":"ApiLambdaFunction');
     const exports = Object.values(bootstrap.Outputs).filter((output) => typeof output === 'object' && output !== null && 'Export' in output);
-    expect(exports).toHaveLength(1);
+    expect(exports.map((output) => (output as { Export: { Name: string } }).Export.Name).toSorted()).toEqual(['caldav-mcp-prod-download-bucket', 'caldav-mcp-prod-public-origin']);
 });
 
 test('all OAuth ingress paths disable caching and forward auth, cookies, origin and query metadata', () => {

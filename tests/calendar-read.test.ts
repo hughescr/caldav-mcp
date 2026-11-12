@@ -300,7 +300,9 @@ describe('get_event details beyond the contract', () => {
             backend.scriptQuery(path('work'), [resource('BEGIN:VCALENDAR\nVERSION:2.0\nBEGIN:VEVENT\nUID:synthetic-attachments\nRECURRENCE-ID:20270112T100000Z\nDTSTART:20270112T100000Z\nDTEND:20270112T110000Z\nEND:VEVENT\nEND:VCALENDAR\n')]);
             const result = await getEvent(deps, { ...getInput, recurrence_id: token });
             expect(result.attachments.map(item => item.form)).toEqual(['managed', 'inline', 'inline', 'external_url', 'inline', 'external_url']);
-            expect(result.attachments.every(item => !item.download_supported)).toBe(true);
+            // The synthetic managed host is not the reviewed gateway, so that attachment is offered as its unfetched link;
+            // the duplicate-ENCODING inline one is unsupported. Every https link is a supported external link.
+            expect(result.attachments.map(item => item.download_supported)).toEqual([true, true, true, true, false, true]);
             expect(result.attachments.at(-1)).toMatchObject({ component: 'override', component_recurrence_id: { local: '2027-01-12T05:00:00', zone: 'America/New_York' } });
             const text = JSON.stringify(result.attachments);
             expect(text).not.toContain('https://');

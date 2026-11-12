@@ -7,7 +7,8 @@
 import { CalDavError, type CalDavAuth, type CalendarSummary, type Discovery } from '../caldav/contracts';
 import { isDirectChildResource } from '../caldav/identifiers';
 import type { CalDavReadBackend, CalendarResource, DavCallOptions } from '../caldav/read-contracts';
-import { buildAttachmentIndex, prescanAttachProperties, toAttachmentMetadata } from './attachments';
+import { downloadSupported } from './attachment-access';
+import { buildAttachmentIndex, prescanAttachProperties, toAttachmentMetadata, type AttachmentIndexEntry } from './attachments';
 import type { ReadBudget } from './budget';
 import type {
     AttachmentMetadata, CalendarStatus, EventTimeOutput, FullEvent, GetEventArgs, ListEventsArgs, ReadToolErrorCode, SearchEventsArgs, SlimEvent, Unreadable,
@@ -59,9 +60,12 @@ export interface DetailReadResult {
     rawIcs: string | null;
 }
 
+/** Why a result_too_large happened, when the message should say so. Only `attachment_size` exists: the attachment itself is over the download cap. */
+export type ErrorDetail = 'attachment_size';
+
 /** A whole-tool read failure with one fixed code. It never carries upstream text, values or causes. */
 export class ReadError extends Error {
-    constructor(public readonly code: ReadToolErrorCode) { super(code); }
+    constructor(public readonly code: ReadToolErrorCode, public readonly detail?: ErrorDetail) { super(code); }
 }
 
 type CalendarStatusCode = CalendarStatus['status'];
@@ -424,16 +428,31 @@ function occurrenceWindow(resource: OriginalResource, token: NonNullable<ReturnT
     }
 }
 
-export async function getEvent(deps: ReadDeps, input: GetEventArgs): Promise<DetailReadResult> {
-    const { budget } = deps;
-    const calendarId = input.calendar_id;
-    const href = input.resource_href;
-    const tokenText = input.recurrence_id ?? null;
+/** A selected original resource: fresh membership, one multiget, the optional version check, parse and attachment refs. */
+export interface OriginalRead {
+    summary: CalendarSummary;
+    resource: CalendarResource;
+    original: OriginalResource;
+    /** Every resource-wide attachment with its ref, recomputed from this read. */
+    attachments: readonly AttachmentIndexEntry[];
+    reporter: { report(): void; settled(): Promise<void> };
+}
+
+/** Validates the identifiers of a detail or download call. Returns the parsed occurrence token, or null. */
+export function detailTarget(calendarId: string, href: string, tokenText: string | null): ReturnType<typeof parseOccurrenceId> {
     const token = tokenText === null ? null : parseOccurrenceId(tokenText);
     if (!isCanonicalPath(calendarId) || !isCanonicalPath(href) || (tokenText !== null && token === null)) { throw new ReadError('invalid_input'); }
     // A path that cannot be a direct child of the calendar can never name one of its events.
     if (!isDirectChildResource(calendarId, href)) { throw new ReadError('invalid_input'); }
+    return token;
+}
 
+/**
+ * Membership, then one original multiget of the resource, then the optional expected_version check, then parse and the
+ * attachment index. Shared by get_event and the download tool, so both authorize against current data the same way.
+ */
+export async function readOriginal(deps: ReadDeps, calendarId: string, href: string, expectedVersion: string | undefined): Promise<OriginalRead> {
+    const { budget } = deps;
     const reporter = unauthorizedReporter(deps);
     const members = await readMembership(deps, reporter);
     const summary = members.get(calendarId);
@@ -448,17 +467,27 @@ export async function getEvent(deps: ReadDeps, input: GetEventArgs): Promise<Det
     }
     const found = lookup.resource;
     if (found.href !== href || !validEtag(found.etag) || typeof found.calendarData !== 'string') { throw new ReadError('upstream_error'); }
-    if (input.expected_version !== undefined && input.expected_version !== found.etag) { throw new ReadError('calendar_changed'); }
+    if (expectedVersion !== undefined && expectedVersion !== found.etag) { throw new ReadError('calendar_changed'); }
 
-    let original: OriginalResource;
-    let attachments: AttachmentMetadata[];
     try {
-        original = parseOriginalResource(found.calendarData, { work: budget.newResourceWork() });
-        attachments = buildAttachmentIndex({ accountId: deps.accountId, calendarId, href, resource: original, prescan: prescanAttachProperties(found.calendarData) })
-            .map(entry => toAttachmentMetadata(entry, false));
+        const original = parseOriginalResource(found.calendarData, { work: budget.newResourceWork() });
+        const attachments = buildAttachmentIndex({ accountId: deps.accountId, calendarId, href, resource: original, prescan: prescanAttachProperties(found.calendarData) });
+        return { summary, resource: found, original, attachments, reporter };
     } catch (error) {
         throw detailDataError(error);
     }
+}
+
+export async function getEvent(deps: ReadDeps, input: GetEventArgs): Promise<DetailReadResult> {
+    const { budget } = deps;
+    const calendarId = input.calendar_id;
+    const href = input.resource_href;
+    const tokenText = input.recurrence_id ?? null;
+    const token = detailTarget(calendarId, href, tokenText);
+
+    const { summary, resource: found, original, attachments: entries, reporter } = await readOriginal(deps, calendarId, href, input.expected_version);
+    const homeUrl = deps.discovery.calendarHomeUrl;
+    const attachments: AttachmentMetadata[] = entries.map(entry => toAttachmentMetadata(entry, downloadSupported(entry.descriptor, homeUrl)));
 
     let event: FullEvent;
     if (token === null) {

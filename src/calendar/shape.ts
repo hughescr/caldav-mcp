@@ -6,7 +6,9 @@
 import { SERVER_INFO_META_KEY, type CallToolResult } from '@modelcontextprotocol/server';
 import { version } from '../../package.json';
 import type { DetailReadResult, EventsReadResult } from './read';
-import { eventsOutputSchema, getEventOutputSchema, type AttachmentMetadata, type EventsOutput, type FullEvent, type GetEventOutput, type SlimEvent, type Unreadable } from './event-schemas';
+import {
+    downloadOutputSchema, eventsOutputSchema, getEventOutputSchema, type AttachmentMetadata, type DownloadOutput, type EventsOutput, type FullEvent, type GetEventOutput, type SlimEvent, type Unreadable,
+} from './event-schemas';
 import {
     MAX_ATTACHMENTS, MAX_EVENTS, MAX_RAW_BYTES, MAX_UNREADABLE, MAX_WIRE_BYTES, RESULT_TOO_LARGE_NOTICE, RESUME_INSTRUCTION, RESUME_INSTRUCTION_NO_ROW,
 } from './limits';
@@ -103,7 +105,7 @@ function errorResult(code: 'result_too_large' | 'upstream_error'): CallToolResul
 }
 
 /** Structured content, its full JSON text copy first (text-only clients see everything), then fixed notices. */
-function toolResult(payload: EventsOutput | GetEventOutput, notices: readonly string[]): CallToolResult {
+function toolResult(payload: EventsOutput | GetEventOutput | DownloadOutput, notices: readonly string[]): CallToolResult {
     return {
         structuredContent: payload,
         content: [{ type: 'text', text: JSON.stringify(payload) }, ...notices.map(text => ({ type: 'text' as const, text }))],
@@ -291,4 +293,27 @@ export function shapeEventDetail(result: DetailReadResult, options: DetailShapeO
 
     const shaped = build(state);
     return getEventOutputSchema.safeParse(shaped.structuredContent).success ? shaped : errorResult('upstream_error');
+}
+
+// ---- get_event_attachment_download ----
+
+/** Fixed notice on an external link: rendered from a trusted constant, never from upstream text. */
+export const EXTERNAL_LINK_NOTICE = 'This attachment is an external link stored on the event. This server did not fetch or check it; what it points to is untrusted.';
+
+/**
+ * Structured result and its JSON text copy; a staged copy also gets one resource_link to the presigned URL, an external
+ * link one fixed notice. Nothing in it is shortened: if it cannot fit, it is result_too_large.
+ */
+export function shapeDownloadResult(result: DownloadOutput, options: DetailShapeOptions): CallToolResult {
+    if (!downloadOutputSchema.safeParse(result).success) { return errorResult('upstream_error'); }
+    const shaped = result.form === 'external' || result.download_url === undefined
+        ? toolResult(result, [EXTERNAL_LINK_NOTICE])
+        : {
+            ...toolResult(result, []),
+            content: [
+                { type: 'text' as const, text: JSON.stringify(result) },
+                { type: 'resource_link' as const, uri: result.download_url, name: result.filename ?? 'attachment', mimeType: result.content_type ?? 'application/octet-stream', ...(result.size === undefined ? {} : { size: result.size }) },
+            ],
+        };
+    return fits(shaped, options.wire) ? shaped : errorResult('result_too_large');
 }

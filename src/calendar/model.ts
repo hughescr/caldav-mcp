@@ -86,6 +86,8 @@ export interface AttachmentDescriptor {
     componentRecurrenceId: RawProperty | null;
     managedId: string | null;
     uri: string | null;
+    /** The exact unfolded base64 text of an inline attachment, null otherwise. Never part of metadata. */
+    inlineBase64: string | null;
     filename: string | null;
     contentType: string | null;
     declaredSize: number | null;
