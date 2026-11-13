@@ -518,7 +518,14 @@ series moves are built on `develop`, not released).
 - A split (`this_and_future`) is two writes: the new series first (`If-None-Match: *`), then the
   original (`If-Match`), sent only with time left for both and a re-read. A failure between them
   leaves the later occurrences shown twice (nothing lost); the result is then `split_incomplete`
-  with `created_series`, never "nothing saved", and the same call finishes the split.
+  with `created_series`, never "nothing saved", and the same call finishes the split. It
+  finishes only when the new series still holds its complete intended content: the master's
+  requested lines, the exact set of `EXDATE` values, and every carried override line for line
+  (its UID and its `ATTENDEE`/`ORGANIZER` lines aside, whose scheduling status iCloud rewrites).
+  Otherwise the truncation would lose what the new series lacks from both, so it is not sent
+  (`split_incomplete`, `created_series_differs`). The read-back compares the same content. A
+  stale `expected_version` after the original was shortened proves the new series only for a
+  split that dropped its exceptions; else `calendar_changed`.
 
 ## Phases
 

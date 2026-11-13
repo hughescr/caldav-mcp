@@ -21,7 +21,9 @@
  * | Step 1                                  | Step 2                                   | Result                                              |
  * |-----------------------------------------|------------------------------------------|-----------------------------------------------------|
  * | refused, or not sent                    | not sent                                 | that error; nothing was saved by this call          |
- * | 412, the stored new series differs      | not sent                                 | calendar_changed (existing_resource_differs)        |
+ * | 412, its master is not this request's   | not sent                                 | calendar_changed (existing_resource_differs)        |
+ * | 412 or uncertain, its master is this    | not sent                                 | split_incomplete (created_series_differs), its      |
+ * | request's but its exceptions differ     |                                          | created_series `unconfirmed`                        |
  * | 412, nothing at the href                | not sent                                 | create_conflict                                     |
  * | uncertain, the new series not observed  | not sent                                 | outcome_unknown (the original is unchanged)         |
  * | 2xx, or the new series observed         | 2xx                                      | applied (created_series.write_outcome per step 1)   |
@@ -33,8 +35,18 @@
  *
  * split_incomplete always carries created_series and says that the new series WAS saved and the original was not shortened,
  * so occurrences from the split on show twice; the agent can retry the same call (same operation_id) to finish, with the
- * original's current expected_version, or delete the new series to undo. A stale expected_version is answered by text: both
- * halves observed → desired_state_present; only the new series → split_incomplete; else calendar_changed.
+ * original's current expected_version, or delete the new series to undo.
+ *
+ * "Observed" for the new series means its complete content (review finding 1): the master's requested lines and UID, the
+ * exact set of EXDATE values, every carried override line for line as stored in the original (UID aside; ATTENDEE and
+ * ORGANIZER lines aside, whose scheduling status iCloud rewrites), and no other VEVENT. A series whose master is this
+ * request's but whose exceptions differ is never finished: truncating would drop the original's copy of what it lacks
+ * (created_series_differs). The read-back compares the same content (a difference is `recurrence`).
+ *
+ * A stale expected_version is answered by text: the original not truncated and this request's master at the href →
+ * split_incomplete (original_changed_since); the original truncated → desired_state_present only for a split that dropped
+ * its exceptions and a new series that holds no EXDATE and no other VEVENT, because a truncated original no longer holds
+ * the source of carried exceptions; else calendar_changed (version_mismatch).
  */
 import type { CalendarResource } from '../caldav/read-contracts';
 import type { StrongEtag } from '../caldav/write-contracts';
@@ -47,7 +59,7 @@ import { droppedExceptions } from './write-move';
 import { exdateValues, occurrencesBefore, sameSlot, sideOf, slotOf } from './occurrence-target';
 import { calendarStatus, originalEventView, readStoredResources } from './read';
 import { eventSpan, padTransportWindow } from './time-core';
-import { normaliseLine, storedEvents, type ComponentRequest, type FieldLine, type StoredExpectation } from './write-compare';
+import { copyLines, normaliseLine, oneValueLines, storedEvents, type ComponentRequest, type FieldLine, type StoredEvent, type StoredExpectation } from './write-compare';
 import {
     builderError, classify, componentRequest, deterministicUid, etagOf, expectedTime, GUEST_FIELDS, holds, invalid, nextSequence, notSupported, orderedFields, parseStored, parseWork, putIfMatch,
     readFailure, readOriginalText, refusal, requireMaster, requireVerified, reread, resourceTarget, sendOnce, stampExpectations, stampOf, storedDiffers, unsupported, upstreamOf, WRITE_SEND_RESERVE_MS,
@@ -65,17 +77,42 @@ interface NewSeries {
     href: string;
     uid: string;
     body: string;
-    /** What the stored new series must hold (requested fields, times, the rule line), for re-reads and the read-back. */
+    /**
+     * The new series' complete intended content, for re-reads and the read-back: the master's requested lines (fields,
+     * times, rule, UID) and its exact set of EXDATE values, every carried override as a copy of its stored source (UID
+     * aside), and no other VEVENT.
+     */
     stored: StoredExpectation;
+    /** The master's requested lines alone: only tells an altered series of this split from another resource. */
+    masterOnly: StoredExpectation;
 }
 
-/** The new series' master holds the requested lines and our UID. */
-function holdsNew(resource: CalendarResource, series: { uid: string; stored: StoredExpectation }): boolean {
-    const master = storedEvents(resource.calendarData)?.find(event => event.rid === null);
-    return master !== undefined && master.lines.filter(line => line.name === 'UID').map(line => line.text).join('\n') === `UID:${series.uid}` && holds(resource, series.stored);
+const uidField = (uid: string): FieldLine => ({ field: 'recurrence', name: 'UID', line: `UID:${uid}` });
+
+/**
+ * The complete expectation of a new series (review finding 1): `master` (its requested lines) plus the UID line and the
+ * exact EXDATE values (`exdateLines` split into values, or none), and each carried override (`carried`, RECURRENCE-ID
+ * lines) as a copy of the same override of `sourceText` with the UID line replaced. Exclusive: nothing else.
+ */
+function seriesExpectation(sourceText: string, master: ComponentRequest, uid: string, exdateLines: readonly string[], carried: readonly string[]): StoredExpectation {
+    const requests: ComponentRequest[] = [{ ...master, fields: [...master.fields, uidField(uid), { field: 'recurrence', name: 'EXDATE', line: null, values: oneValueLines(exdateLines.map(normaliseLine)) }] }];
+    if (carried.length > 0) {
+        const sources = new Map<string | null, StoredEvent>();
+        for (const event of storedEvents(sourceText) ?? []) { sources.set(event.rid, event); }
+        for (const rid of carried) {
+            const source = sources.get(normaliseLine(rid));
+            if (source === undefined) { throw unsupported('stored_data_not_editable'); }
+            const lines = copyLines(source.lines.map(line => (line.name === 'UID' ? { name: 'UID', text: `UID:${uid}` } : line)));
+            requests.push({ rid: normaliseLine(rid), fields: [], copy: { lines, nested: source.nested } });
+        }
+    }
+    return { kind: 'components', requests, exclusive: true };
 }
 
 const incomplete = (reason: NonNullable<WriteErrorExtra['reason']>, created: CreatedSeries, extra: Omit<WriteErrorExtra, 'reason' | 'created_series'> = {}): WriteError => new WriteError('split_incomplete', { reason, created_series: created, ...extra });
+
+/** A series of this split is at the href, but this call did not confirm that it holds everything the split writes. */
+const unconfirmed = (href: string, resource: CalendarResource): CreatedSeries => ({ resource_href: href, expected_version: resource.etag as StrongEtag, write_outcome: 'unconfirmed' });
 
 /** Changes an occurrence and every later one by splitting the series (two writes, see the module comment). */
 export async function updateFollowing(deps: WriteDeps, input: UpdateEventArgs, plan: ChangePlan, target: ScopeTarget): Promise<WriteEventResult> {
@@ -95,17 +132,23 @@ export async function updateFollowing(deps: WriteDeps, input: UpdateEventArgs, p
     const storedRule = storedRuleOf(master, masterOutline);
     const zoneDropped = plan.span?.zoneDropped ?? [];
 
-    // The request-only part of the new series' expectation (a stale version cannot see the split occurrence's slot).
+    // A stale version (design 3.5, review finding 1). The request-only lines of the new master are all this version shows of
+    // it: the split occurrence's slot and iCloud's count are of the version the request named. Once the original is
+    // truncated, the overrides and EXDATEs a carrying split moved are gone from it, so the new series' complete content is
+    // provable by text only for a split that dropped them (then: no EXDATE, no other VEVENT). Anything else is not claimed.
     const requestLines: ComponentRequest = componentRequest(null, plan);
     if (found.etag !== target.expected) {
         const trunc = staleTruncationHolds(read, master, token);
         let existing: CalendarResource | null;
         try { existing = await readOriginalText(deps, reporter, target.calendarId, newHref); } catch (error) { throw readFailure(error); }
-        const series = { uid, stored: { kind: 'components' as const, requests: [requestLines] } };
-        if (existing !== null && holdsNew(existing, series)) {
-            const created: CreatedSeries = { resource_href: newHref, expected_version: existing.etag as StrongEtag, write_outcome: 'desired_state_present' };
-            if (trunc !== null) { return splitResult(deps, read, target, { href: newHref, uid, stored: series.stored }, truncationStored(trunc), 'desired_state_present', created, null, zoneDropped, [found, existing]); }
-            throw incomplete('original_changed_since', created);
+        const masterOnly: StoredExpectation = { kind: 'components', requests: [{ ...requestLines, fields: [...requestLines.fields, uidField(uid)] }] };
+        if (existing !== null && holds(existing, masterOnly)) {
+            if (trunc === null) { throw incomplete('original_changed_since', unconfirmed(newHref, existing)); }
+            const withoutExceptions = seriesExpectation(found.calendarData, requestLines, uid, [], []);
+            if (input.exceptions === 'drop' && holds(existing, withoutExceptions)) {
+                const created: CreatedSeries = { resource_href: newHref, expected_version: existing.etag as StrongEtag, write_outcome: 'desired_state_present' };
+                return splitResult(deps, read, target, { href: newHref, uid, stored: withoutExceptions }, truncationStored(trunc), 'desired_state_present', created, null, zoneDropped, [found, existing]);
+            }
         }
         throw new WriteError('calendar_changed', { reason: 'version_mismatch' });
     }
@@ -213,9 +256,11 @@ export async function updateFollowing(deps: WriteDeps, input: UpdateEventArgs, p
         throw builderError(error);
     }
     const ruleFor: FieldLine = { field: 'recurrence', name: 'RRULE', line: rule === null ? (ruleLine === undefined ? null : normaliseLine(ruleLine.text)) : rule.written.line };
+    const masterRequest = componentRequest(null, plan, [{ field: 'start', name: 'DTSTART', line: start.property.line }, { field: 'end', name: 'DTEND', line: end.property.line }, ruleFor], false);
     const series: NewSeries = {
         href: newHref, uid, body,
-        stored: { kind: 'components', requests: [componentRequest(null, plan, [{ field: 'start', name: 'DTSTART', line: start.property.line }, { field: 'end', name: 'DTEND', line: end.property.line }, ruleFor], false)] },
+        stored: seriesExpectation(found.calendarData, masterRequest, uid, carry ? exdateLines.map(line => line.text) : [], carry ? trunc.removed : []),
+        masterOnly: { kind: 'components', requests: [{ ...masterRequest, fields: [...masterRequest.fields, uidField(uid)] }] },
     };
 
     // The truncation of the original.
@@ -245,8 +290,11 @@ export async function updateFollowing(deps: WriteDeps, input: UpdateEventArgs, p
             throw new WriteError('write_refused', upstream === undefined ? {} : { upstream });
         }
         const after = await reread(deps, reporter, target.calendarId, newHref);
-        if (after.kind === 'found' && holdsNew(after.resource, series)) {
+        if (after.kind === 'found' && holds(after.resource, series.stored)) {
             created = { resource_href: newHref, expected_version: after.resource.etag as StrongEtag, write_outcome: 'desired_state_present' };
+        } else if (after.kind === 'found' && holds(after.resource, series.masterOnly)) {
+            // This split's series, altered since (an exception lost or changed): truncating now would lose what it lacks.
+            throw incomplete('created_series_differs', unconfirmed(newHref, after.resource), dropped);
         } else if (answer === 'precondition' && after.kind === 'found') {
             throw new WriteError('calendar_changed', { reason: 'existing_resource_differs' });
         } else if (answer === 'precondition' && after.kind === 'absent') {

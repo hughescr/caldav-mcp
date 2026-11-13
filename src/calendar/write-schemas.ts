@@ -157,7 +157,7 @@ export const droppedExceptionsSchema = z.strictObject({
 export const createdSeriesSchema = z.strictObject({
     resource_href: pathSchema.describe('The new series for the occurrences from the split on. Pass it to later calls for those occurrences.'),
     expected_version: etagSchema.nullable(),
-    write_outcome: writeOutcomeSchema.describe('applied: this call created it. desired_state_present: it was already there with the requested values (a retry).'),
+    write_outcome: z.enum(['applied', 'desired_state_present', 'unconfirmed']).describe('applied: this call created it. desired_state_present: it was already there with everything the split writes (a retry). unconfirmed (errors only): a series of this split, from an earlier call with this operation_id, is at this href, but this call did not confirm that it holds everything the split writes (see reason); inspect it.'),
 });
 
 export const writeEventResultSchema = z.strictObject({
@@ -185,6 +185,7 @@ export const writeEventResultSchema = z.strictObject({
     if ((value.event === null) !== (value.readback === 'unavailable')) { fail('event is null exactly when readback is unavailable'); }
     if ((value.stored_differs_from_request === null) !== (value.readback === 'unavailable')) { fail('stored_differs_from_request is null exactly when readback is unavailable'); }
     if ((value.guests_may_be_emailed === true) !== (value.guest_notice !== undefined)) { fail('guest_notice accompanies guests_may_be_emailed'); }
+    if (value.created_series?.write_outcome === 'unconfirmed') { fail('a result names only a confirmed new series'); }
     const href = value.created_series?.resource_href ?? value.resource_href;
     if (value.event !== null && (value.event.resource_href !== href || value.event.calendar_id !== value.calendar_id || value.event.calendar !== 0)) { fail('event must be the written resource (the new series for a split)'); }
     if (value.recurrence_id !== undefined && value.event !== null && (value.event.view !== 'occurrence' || value.event.recurrence_id !== value.recurrence_id)) { fail('an occurrence result shows that occurrence'); }
@@ -244,7 +245,7 @@ export const writeErrorReasonSchema = z.enum([
     // occurrence_identity_unprovable
     'override_not_matched', 'form_mismatch', 'unrecognized_zone', 'shares_time_with_other_occurrence', 'override_exists_unmatched', 'split_near_changed_occurrence', 'window_too_wide',
     // split_incomplete
-    'second_write_refused', 'second_write_conflict', 'no_time_for_second_write', 'second_write_not_sent', 'original_changed_since',
+    'second_write_refused', 'second_write_conflict', 'no_time_for_second_write', 'second_write_not_sent', 'original_changed_since', 'created_series_differs',
     // unsupported_calendar_data
     'stored_data_not_editable', 'self_verification_failed', 'sequence_unsupported',
 ]);

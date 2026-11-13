@@ -257,6 +257,9 @@ describe('the write tools through the MCP boundary, in both protocol eras', () =
                 const shown = (listed?.changed.length ?? 0) + (listed?.deleted.length ?? 0);
                 expect<unknown>([size <= 8192, listed?.changed_occurrences, listed?.deleted_occurrences, listed?.truncated, shown < 100, !some || shown > 0]).toEqual([true, 60, 70, true, true, true]);
             }
+            // created_series_differs: its own message (do not finish), an unconfirmed created_series, within 8 KiB at the worst.
+            const differs = await send({ reason: 'created_series_differs', created_series: { ...worst, write_outcome: 'unconfirmed' }, upstream: worstUpstream, exceptions_dropped: full });
+            expect<unknown>([differs.size <= 8192, (differs.error as { created_series?: { write_outcome?: string } }).created_series?.write_outcome, String(differs.error['message']).includes('Do not repeat this call')]).toEqual([true, 'unconfirmed', true]);
             // A forged inventory is dropped whole.
             expect((await send({ reason: 'second_write_refused', created_series: short, exceptions_dropped: { ...small, changed_occurrences: -1 } })).error.exceptions_dropped).toBeUndefined();
         });

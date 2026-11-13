@@ -5,9 +5,14 @@
  * compared exactly, the name case-insensitively); a requested removal when no line of that name is left. Alarms compare
  * the multiset of TRIGGER lines of the component's VALARMs only, nothing else of an alarm.
  *
- * The reader here is deliberately small and independent of the editor and the verifier: it only splits logical lines and
- * nests BEGIN/END. Text that does not nest is unreadable (null), which callers treat as "not as requested".
+ * A component that must be a copy (a split's carried override) compares all its lines but the scheduling ones; a property
+ * with value lists (EXDATE) can compare its exact set of values.
+ *
+ * The reader here is deliberately small and independent of the editor and the verifier (it shares only the scheduling-name
+ * policy): it only splits logical lines and nests BEGIN/END. Text that does not nest is unreadable (null), which callers
+ * treat as "not as requested".
  */
+import { isSchedulingName } from './ics-verify';
 import type { StoredField } from './write-schemas';
 
 export interface StoredLine {
@@ -24,6 +29,8 @@ export interface StoredEvent {
     readonly lines: readonly StoredLine[];
     /** TRIGGER lines (unfolded, name upper-cased) of the directly nested VALARMs. */
     readonly triggers: readonly string[];
+    /** Every line of the nested components (their BEGIN and END included), unfolded, names upper-cased, in order. */
+    readonly nested: readonly string[];
 }
 
 function logicalLines(text: string): string[] | null {
@@ -59,7 +66,7 @@ export function storedEvents(text: string): StoredEvent[] | null {
     if (lines === null) { return null; }
     const events: StoredEvent[] = [];
     const stack: string[] = [];
-    let current: { rid: string | null; lines: StoredLine[]; triggers: string[] } | null = null;
+    let current: { rid: string | null; lines: StoredLine[]; triggers: string[]; nested: string[] } | null = null;
     for (const line of lines) {
         const name = nameOf(line);
         if (name === null) { return null; }
@@ -68,8 +75,10 @@ export function storedEvents(text: string): StoredEvent[] | null {
             const component = line.slice(name.length + 1).toUpperCase();
             if (name === 'BEGIN') {
                 stack.push(component);
-                if (stack.length === 2 && component === 'VEVENT') { current = { rid: null, lines: [], triggers: [] }; }
+                if (stack.length === 2 && component === 'VEVENT') { current = { rid: null, lines: [], triggers: [], nested: [] }; }
+                if (stack.length > 2) { current?.nested.push(normalised); }
             } else {
+                if (stack.length > 2) { current?.nested.push(normalised); }
                 if (stack.pop() !== component) { return null; }
                 if (stack.length === 1 && component === 'VEVENT' && current !== null) {
                     events.push(current);
@@ -82,8 +91,9 @@ export function storedEvents(text: string): StoredEvent[] | null {
         if (stack.length === 2) {
             current.lines.push({ name, text: normalised });
             if (name === 'RECURRENCE-ID') { current.rid = normalised; }
-        } else if (stack.length === 3 && stack[2] === 'VALARM' && name === 'TRIGGER') {
-            current.triggers.push(normalised);
+        } else {
+            current.nested.push(normalised);
+            if (stack.length === 3 && stack[2] === 'VALARM' && name === 'TRIGGER') { current.triggers.push(normalised); }
         }
     }
     return stack.length === 0 ? events : null;
@@ -102,6 +112,20 @@ export interface FieldLine {
      */
     readonly lines?: readonly string[] | undefined;
     readonly includes?: readonly string[] | undefined;
+    /**
+     * A property that may repeat with value lists (EXDATE): the stored lines of that name, each split into one-value lines
+     * (`NAME;PARAMS:value`), must give exactly this set of one-value lines, however they are grouped into lines.
+     */
+    readonly values?: readonly string[] | undefined;
+}
+
+/**
+ * A component that must be a copy: its direct lines, ATTENDEE/ORGANIZER lines aside (iCloud rewrites their scheduling
+ * status, Run 8), are exactly `lines` in any order, and its nested components' lines are exactly `nested`, in order.
+ */
+export interface ComponentCopy {
+    readonly lines: readonly string[];
+    readonly nested: readonly string[];
 }
 
 /** What one component should hold after the request. */
@@ -113,6 +137,27 @@ export interface ComponentRequest {
     readonly triggers?: readonly string[] | undefined;
     /** Names that must be absent afterwards (the Apple companions a LOCATION or DESCRIPTION change removes). */
     readonly absent?: readonly string[] | undefined;
+    /** The whole component must be this copy (a split's carried override); a difference counts as `recurrence`. */
+    readonly copy?: ComponentCopy | undefined;
+}
+
+/** The direct lines a copy compares: every one but the scheduling lines. */
+export function copyLines(lines: readonly StoredLine[]): string[] {
+    return lines.filter(line => !isSchedulingName(line.name)).map(line => line.text);
+}
+
+/** One-value lines (`NAME;PARAMS:value`) of value-list lines; values here are date/time digits, which never contain a colon. */
+export function oneValueLines(lines: readonly string[]): string[] {
+    return lines.flatMap(line => {
+        const cut = line.lastIndexOf(':');
+        return cut < 1 ? [line] : line.slice(cut + 1).split(',').map(value => `${line.slice(0, cut + 1)}${value}`);
+    });
+}
+
+function sameSet(a: readonly string[], b: readonly string[]): boolean {
+    const left = new Set(a);
+    const right = new Set(b);
+    return left.size === right.size && [...left].every(item => right.has(item));
 }
 
 function sameMultiset(a: readonly string[], b: readonly string[]): boolean {
@@ -147,6 +192,8 @@ export function differingFields(stored: StoredEvent | undefined, request: Compon
             ok = false;
         } else if (field.lines !== undefined) {
             ok = sameMultiset(lines, field.lines);
+        } else if (field.values !== undefined) {
+            ok = sameSet(oneValueLines(lines), field.values);
         } else if (field.includes !== undefined) {
             ok = field.includes.every(wanted => lines.some(line => holdsValue(line, wanted)));
         } else {
@@ -155,6 +202,11 @@ export function differingFields(stored: StoredEvent | undefined, request: Compon
         if (!ok && !differs.includes(field.field)) { differs.push(field.field); }
     }
     if (request.triggers !== undefined && (stored === undefined || !sameMultiset(stored.triggers, request.triggers))) { differs.push('alarms'); }
+    const copy = request.copy;
+    if (copy !== undefined && !differs.includes('recurrence')) {
+        const nested = stored?.nested ?? [];
+        if (stored === undefined || !sameMultiset(copyLines(stored.lines), copy.lines) || nested.length !== copy.nested.length || nested.some((line, index) => line !== copy.nested[index])) { differs.push('recurrence'); }
+    }
     return differs;
 }
 

@@ -406,9 +406,21 @@ describe('update_event, edit_scope this_and_future (split)', () => {
         // Together the two series show each slot once: 3 before, 5 from the split on.
         expect((await instances(h.fake, UTC_HREF)).length).toBe(3);
         expect((await instances(h.fake, NEW_HREF)).map(line => line.slice(0, 16))).toEqual(['20270126T150000Z', '20270202T150000Z', '20270209T150000Z', '20270216T150000Z', '20270223T150000Z']);
-        // The same call again: both halves observed by text, nothing sent.
-        const again = await update(h, splitRequest(etag));
+        // The same call again on the old version: the truncation removed the source of what the new series carried, so its
+        // content cannot be proven by text; nothing is sent and the call says the event changed.
+        expect(await failure(() => update(h, splitRequest(etag)))).toEqual({ code: 'calendar_changed', reason: 'version_mismatch' });
+        expect(h.fake.count('putEvent')).toBe(2);
+    });
+
+    test('a stale retry of a split that dropped its exceptions is provable by text: desired_state_present; a changed new series is not', async () => {
+        const h = harness();
+        const etag = h.fake.seed(WORK, UTC_HREF, withOverride(UTC_SERIES, ['UID:WEEKLY-UTC', 'RECURRENCE-ID:20270202T150000Z', 'DTSTART:20270202T160000Z', 'DTEND:20270202T163000Z', 'SUMMARY:Late']));
+        const request = splitRequest(etag, { exceptions: 'drop', changes: { title: 'Later', start: '2027-01-26T17:00:00Z', end: '2027-01-26T17:30:00Z', recurrence: { rrule: 'FREQ=WEEKLY;COUNT=5' } } });
+        await update(h, request);
+        const again = await update(h, request);
         expect<unknown>([again.write_outcome, again.created_series?.write_outcome, h.fake.count('putEvent')]).toEqual(['desired_state_present', 'desired_state_present', 2]);
+        h.fake.externalEdit(WORK, NEW_HREF, body => body.replace('END:VCALENDAR', 'BEGIN:VEVENT\r\nUID:' + splitUid(OP) + '\r\nRECURRENCE-ID:20270209T170000Z\r\nDTSTART:20270209T180000Z\r\nDTEND:20270209T183000Z\r\nSUMMARY:Added\r\nEND:VEVENT\r\nEND:VCALENDAR'));
+        expect(await failure(() => update(h, request))).toEqual({ code: 'calendar_changed', reason: 'version_mismatch' });
     });
 
     test('exceptions from the split on move to the new series (UID replaced); EXDATEs are copied; earlier ones stay (P3C-3)', async () => {
@@ -443,6 +455,51 @@ describe('update_event, edit_scope this_and_future (split)', () => {
         const finished = await update(h, splitRequest(etag));
         expect<unknown>([finished.write_outcome, finished.created_series?.write_outcome, h.fake.count('putEvent')]).toEqual(['applied', 'desired_state_present', 4]);
         expect((await instances(h.fake, UTC_HREF)).length).toBe(3);
+    });
+
+    test('a retry never truncates when the new series lost a copied override or EXDATE: split_incomplete (created_series_differs)', async () => {
+        const text = withOverride(UTC_SERIES.replace('RRULE:FREQ=WEEKLY;COUNT=8', 'RRULE:FREQ=WEEKLY;COUNT=8\r\nEXDATE:20270209T150000Z'),
+            ['UID:WEEKLY-UTC', 'RECURRENCE-ID:20270202T150000Z', 'DTSTART:20270202T160000Z', 'DTEND:20270202T163000Z', 'SUMMARY:Late']);
+        const cases: [string, (body: string) => string][] = [
+            ['override removed', body => body.replace(/BEGIN:VEVENT\r\nUID:[^\r]*\r\nRECURRENCE-ID[\s\S]*?END:VEVENT\r\n/u, '')],
+            ['EXDATE removed', body => body.replace('EXDATE:20270209T150000Z\r\n', '')],
+            ['override changed', body => body.replace('SUMMARY:Late', 'SUMMARY:Edited')],
+        ];
+        for (const [name, change] of cases) {
+            const h = harness();
+            const etag = h.fake.seed(WORK, UTC_HREF, text);
+            h.fake.failNextWrite({ kind: 'none' }, { kind: 'status', status: 403, apply: false });
+            expect<unknown>([name, (await failure(() => update(h, splitRequest(etag)))).reason]).toEqual([name, 'second_write_refused']);
+            const before = h.fake.get(WORK, NEW_HREF)?.text ?? '';
+            const edited = h.fake.externalEdit(WORK, NEW_HREF, change);
+            expect<unknown>([name, h.fake.get(WORK, NEW_HREF)?.text !== before]).toEqual([name, true]);
+            expect<unknown>([name, await failure(() => update(h, splitRequest(etag)))]).toEqual([name, { code: 'split_incomplete', reason: 'created_series_differs', created_series: { resource_href: NEW_HREF, expected_version: edited, write_outcome: 'unconfirmed' } }]);
+            // The retry's create was refused (412) and nothing else was sent: the original still holds the exception.
+            expect<unknown>([name, h.fake.count('putEvent'), h.fake.get(WORK, UTC_HREF)?.etag]).toEqual([name, 3, etag]);
+        }
+
+        // The new series intact: the retry finishes, and the read-back finds every exception in place.
+        const h = harness();
+        const etag = h.fake.seed(WORK, UTC_HREF, text);
+        h.fake.failNextWrite({ kind: 'none' }, { kind: 'status', status: 403, apply: false });
+        await failure(() => update(h, splitRequest(etag)));
+        const finished = await update(h, splitRequest(etag));
+        expect<unknown>([finished.write_outcome, finished.created_series?.write_outcome, finished.stored_differs_from_request, h.fake.count('putEvent')]).toEqual(['applied', 'desired_state_present', [], 4]);
+        expect(unfold(h.fake.get(WORK, UTC_HREF)?.text ?? '').some(line => line.startsWith('RECURRENCE-ID'))).toBe(false);
+    });
+
+    test('the read-back covers the copied exceptions: one lost after the write is reported as recurrence', async () => {
+        const h = harness();
+        const etag = h.fake.seed(WORK, UTC_HREF, withOverride(UTC_SERIES, ['UID:WEEKLY-UTC', 'RECURRENCE-ID:20270202T150000Z', 'DTSTART:20270202T160000Z', 'DTEND:20270202T163000Z', 'SUMMARY:Late']));
+        const put = h.fake.putEvent.bind(h.fake);
+        let sent = 0;
+        h.fake.putEvent = async (...args) => {
+            const answer = await put(...args);
+            if (++sent === 2) { h.fake.externalEdit(WORK, NEW_HREF, body => body.replace('SUMMARY:Late', 'SUMMARY:Edited')); }
+            return answer;
+        };
+        const result = await update(h, splitRequest(etag));
+        expect<unknown>([result.write_outcome, result.stored_differs_from_request]).toEqual(['applied', ['recurrence']]);
     });
 
     test('the second write uncertain: observed → desired_state_present; not observed → outcome_unknown naming the new series; a concurrent edit → split_incomplete', async () => {

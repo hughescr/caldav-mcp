@@ -49,7 +49,7 @@ export interface WriteDeps {
 }
 
 /** The series a split created, when a split's error must say where it is (B2: never claim nothing was saved). */
-export interface CreatedSeries { resource_href: string; expected_version: string | null; write_outcome: 'applied' | 'desired_state_present' }
+export interface CreatedSeries { resource_href: string; expected_version: string | null; write_outcome: 'applied' | 'desired_state_present' | 'unconfirmed' }
 
 export interface WriteErrorExtra {
     reason?: WriteErrorReason;
