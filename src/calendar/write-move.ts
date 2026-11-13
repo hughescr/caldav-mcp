@@ -50,15 +50,20 @@ const untilGroup = (kind: StartForm): string => (kind === 'utc' || kind === 'zon
 
 const ruleText = (line: string): string | null => (/^RRULE:/iu.test(line) ? line.slice(6) : null);
 
-function dropped(original: OriginalResource, exdates: readonly StoredTime[]): NonNullable<WriteEventResult['exceptions_dropped']> {
-    const changed = original.overrides.slice(0, MAX_LISTED_EXCEPTIONS).flatMap(override => {
+/**
+ * The bounded inventory of dropped exceptions (a series move's `drop`, a split's dropped exceptions from the split on):
+ * complete counts, at most {@link MAX_LISTED_EXCEPTIONS} of each kind listed by value. Deleted occurrences are EXDATE
+ * VALUES (a line can hold several), never lines.
+ */
+export function droppedExceptions(overrides: readonly EventComponent[], exdates: readonly StoredTime[]): NonNullable<WriteEventResult['exceptions_dropped']> {
+    const changed = overrides.slice(0, MAX_LISTED_EXCEPTIONS).flatMap(override => {
         if (override.recurrenceId === null) { return []; }
         const summary = override.properties.get('summary')?.[0]?.values[0];
         return [{ original_start: toEventTime(override.recurrenceId.time), start: toEventTime(override.start), title: typeof summary === 'string' ? sanitizeDisplayText(summary, 256).text : null }];
     });
-    const truncated = original.overrides.length > MAX_LISTED_EXCEPTIONS || exdates.length > MAX_LISTED_EXCEPTIONS;
+    const truncated = overrides.length > MAX_LISTED_EXCEPTIONS || exdates.length > MAX_LISTED_EXCEPTIONS;
     return {
-        changed_occurrences: original.overrides.length, deleted_occurrences: exdates.length, changed,
+        changed_occurrences: overrides.length, deleted_occurrences: exdates.length, changed,
         deleted: exdates.slice(0, MAX_LISTED_EXCEPTIONS).map(toEventTime), ...(truncated ? { truncated: true as const } : {}),
     };
 }
@@ -234,7 +239,7 @@ export function planSeriesMove(input: { deps: WriteDeps; original: OriginalResou
         throw builderError(error);
     }
 
-    const fields: ResultContext['fields'] = mode === 'drop' ? { exceptions_dropped: dropped(original, exdates) }
+    const fields: ResultContext['fields'] = mode === 'drop' ? { exceptions_dropped: droppedExceptions(original.overrides, exdates) }
         : mode === 'shift' ? { exceptions_shifted: counts, overrides_changed: original.overrides.length }
         : original.overrides.length > 0 ? { overrides_changed: original.overrides.length } : {};
     const expectation: EditExpectation = {

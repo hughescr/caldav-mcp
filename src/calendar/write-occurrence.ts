@@ -322,6 +322,8 @@ export interface Truncation {
     ruleText: string;
     /** Overrides at or after the split, by RECURRENCE-ID line, in source order. */
     removed: string[];
+    /** The same overrides, parsed (same order as `removed`). */
+    removedOverrides: EventComponent[];
     /** The stored RRULE text and its parsed parts (the new series of an update starts from them). */
     storedRule: { text: string; parsed: ParsedRrule };
 }
@@ -355,13 +357,17 @@ export function truncation(read: SeriesRead, master: EventComponent, point: stri
     let rrule: WrittenProperty;
     try { rrule = rruleProperty({ parts }, master.start.kind, 'rrule'); } catch (error) { throw builderError(error); }
     const removed: string[] = [];
+    const removedOverrides: EventComponent[] = [];
     for (const override of read.original.overrides) {
         if (override.recurrenceId === null) { throw unsupported('stored_data_not_editable'); }
         const side = sideOf(override.recurrenceId.time, master.start, point, slot);
         if (side === 'unprovable') { throw new WriteError('occurrence_identity_unprovable', { reason: 'split_near_changed_occurrence' }); }
-        if (side === 'after') { removed.push(ridLineOf(read, override)); }
+        if (side === 'after') {
+            removed.push(ridLineOf(read, override));
+            removedOverrides.push(override);
+        }
     }
-    return { rrule, ruleText: rrule.line.slice(6), removed, storedRule };
+    return { rrule, ruleText: rrule.line.slice(6), removed, removedOverrides, storedRule };
 }
 
 /** What the original must hold after a truncation: that RRULE line, and none of the removed overrides. */

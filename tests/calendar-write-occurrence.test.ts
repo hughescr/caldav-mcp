@@ -521,6 +521,38 @@ describe('update_event, edit_scope this_and_future (split)', () => {
         expect((await instances(h.fake, NEW_HREF)).map(line => line.slice(0, 16))).toEqual(['20270126T150000Z', '20270209T150000Z', '20270223T150000Z']);
     });
 
+    test('a split that drops lists what it dropped (EXDATE values, not lines), in the result and in split_incomplete and outcome_unknown', async () => {
+        const text = withOverride(UTC_SERIES.replace('RRULE:FREQ=WEEKLY;COUNT=8', 'RRULE:FREQ=WEEKLY;COUNT=8\r\nEXDATE:20270112T150000Z\r\nEXDATE:20270209T150000Z,20270216T150000Z'),
+            ['UID:WEEKLY-UTC', 'RECURRENCE-ID:20270202T150000Z', 'DTSTART:20270202T160000Z', 'DTEND:20270202T163000Z', 'SUMMARY:Late']);
+        const dropped = {
+            changed_occurrences: 1, deleted_occurrences: 2,
+            changed: [{ original_start: { utc: '2027-02-02T15:00:00Z' }, start: { utc: '2027-02-02T16:00:00Z' }, title: 'Late' }],
+            deleted: [{ utc: '2027-02-09T15:00:00Z' }, { utc: '2027-02-16T15:00:00Z' }],
+        };
+        const moved = { exceptions: 'drop', changes: { start: '2027-01-26T17:00:00Z', end: '2027-01-26T17:30:00Z', recurrence: { rrule: 'FREQ=WEEKLY;COUNT=5' } } };
+        const h = harness();
+        const etag = h.fake.seed(WORK, UTC_HREF, text);
+        expect(await failure(() => update(h, splitRequest(etag, { ...moved, exceptions: undefined })))).toEqual({ code: 'edit_not_supported', reason: 'exceptions_choice_required', exceptions: { changed_occurrences: 1, deleted_occurrences: 2 } });
+        const result = await update(h, splitRequest(etag, moved));
+        expect(writeEventResultSchema.parse(result)).toEqual(result);
+        expect<unknown>([result.write_outcome, result.exceptions_dropped]).toEqual(['applied', dropped]);
+
+        const refused = harness();
+        const refusedEtag = refused.fake.seed(WORK, UTC_HREF, text);
+        refused.fake.failNextWrite({ kind: 'none' }, { kind: 'status', status: 403, apply: false });
+        expect(await failure(() => update(refused, splitRequest(refusedEtag, moved)))).toMatchObject({ code: 'split_incomplete', reason: 'second_write_refused', exceptions_dropped: dropped });
+
+        const lost = harness();
+        const lostEtag = lost.fake.seed(WORK, UTC_HREF, text);
+        lost.fake.failNextWrite({ kind: 'none' }, { kind: 'uncertain', apply: false });
+        expect(await failure(() => update(lost, splitRequest(lostEtag, moved)))).toMatchObject({ code: 'outcome_unknown', created_series: { resource_href: NEW_HREF }, exceptions_dropped: dropped });
+
+        // Without anything dropped there is no inventory.
+        const plain = harness();
+        const plainEtag = plain.fake.seed(WORK, UTC_HREF, UTC_SERIES);
+        expect((await update(plain, splitRequest(plainEtag))).exceptions_dropped).toBeUndefined();
+    });
+
     test('shift is refused for every split, also without a time change; nothing is sent', async () => {
         const h = harness();
         const etag = h.fake.seed(WORK, UTC_HREF, withOverride(UTC_SERIES, ['UID:WEEKLY-UTC', 'RECURRENCE-ID:20270202T150000Z', 'DTSTART:20270203T150000Z', 'DTEND:20270203T153000Z', 'SUMMARY:Late']));
@@ -605,6 +637,15 @@ describe('update_event, edit_scope all: moving a series', () => {
         const singleEtag = single.fake.seed(WORK, UTC_HREF, UTC_SERIES);
         const made = await update(single, { calendar_id: WORK, resource_href: UTC_HREF, expected_version: singleEtag, edit_scope: 'all', changes: { recurrence: null } });
         expect<unknown>([made.event?.view, made.event?.recurring, unfold(puts(single.fake)[0]?.body ?? '').some(line => line.startsWith('RRULE'))]).toEqual(['single', false, false]);
+    });
+
+    test('a move counts and lists EXDATE values, not lines', async () => {
+        const h = harness();
+        const etag = h.fake.seed(WORK, SHIFT_HREF, SHIFT_SERIES.replace('EXDATE:20270308T150000Z', 'EXDATE:20270308T150000Z,20270315T150000Z'));
+        const base = { calendar_id: WORK, resource_href: SHIFT_HREF, expected_version: etag, edit_scope: 'all', changes: { start: '2027-02-08T17:00:00Z', end: '2027-02-08T18:00:00Z' } };
+        expect(await failure(() => update(h, base))).toEqual({ code: 'edit_not_supported', reason: 'exceptions_choice_required', exceptions: { changed_occurrences: 2, deleted_occurrences: 2 } });
+        const result = await update(h, { ...base, exceptions: 'drop' });
+        expect<unknown>([result.exceptions_dropped?.deleted_occurrences, result.exceptions_dropped?.deleted]).toEqual([2, [{ utc: '2027-03-08T15:00:00Z' }, { utc: '2027-03-15T15:00:00Z' }]]);
     });
 
     test('drop lists at most 50 exceptions by value, with complete counts and truncated; the list survives the 96 KiB shaping', async () => {

@@ -62,6 +62,8 @@ export interface WriteErrorExtra {
     created_series?: CreatedSeries;
     /** exceptions_choice_required: how many exceptions the series has. */
     exceptions?: { changed_occurrences: number; deleted_occurrences: number };
+    /** split_incomplete and outcome_unknown of a split that drops exceptions: what was or may have been dropped. */
+    exceptions_dropped?: NonNullable<WriteEventResult['exceptions_dropped']>;
 }
 
 /** A fixed, sanitised write failure. Carries enums, counts, identifiers and the sanitised upstream summary only. */

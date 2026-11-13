@@ -143,7 +143,7 @@ export const exceptionCountsSchema = z.strictObject({
     deleted_occurrences: count.describe('Deleted occurrences (EXDATE values).'),
 });
 
-const droppedExceptionsSchema = z.strictObject({
+export const droppedExceptionsSchema = z.strictObject({
     ...exceptionCountsSchema.shape,
     changed: z.array(z.strictObject({
         original_start: eventTimeSchema.describe('The occurrence\'s original slot (its stored RECURRENCE-ID).'),

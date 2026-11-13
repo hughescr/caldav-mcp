@@ -231,6 +231,36 @@ describe('the write tools through the MCP boundary, in both protocol eras', () =
             expect(writeToolErrorCodeSchema.options.every(code => toolErrorCodeSchema.options.includes(code))).toBe(true);
         });
 
+        test(`${protocol}: a split error's exceptions_dropped is listed as far as 8 KiB allows; counts stay complete`, async () => {
+            const longest = [...KNOWN_PRECONDITIONS].sort((a, b) => b.length - a.length).slice(0, 8);
+            const worstUpstream = { status: 409, content_type: 'xml' as const, preconditions: longest, detail: '"\\'.repeat(256), detail_truncated: true as const };
+            const zoned = { local: '2027-02-02T15:00:00', zone: 'Z'.repeat(256), utc: '2027-02-02T20:00:00Z', offset: '-05:00' };
+            const full = {
+                changed_occurrences: 60, deleted_occurrences: 70,
+                changed: Array.from({ length: 50 }, () => ({ original_start: zoned, start: zoned, title: '"\\'.repeat(128) })),
+                deleted: Array.from({ length: 50 }, () => zoned), truncated: true as const,
+            };
+            const small = { changed_occurrences: 1, deleted_occurrences: 1, changed: [{ original_start: { utc: '2027-02-02T15:00:00Z' }, start: { utc: '2027-02-02T16:00:00Z' }, title: 'Late' }], deleted: [{ utc: '2027-02-09T15:00:00Z' }] };
+            const short = { resource_href: '/1/calendars/work/new.ics', expected_version: '"e1"', write_outcome: 'applied' as const };
+            const worst = { resource_href: `/${'a'.repeat(2046)}/`.slice(0, 2048), expected_version: `"${'e'.repeat(1022)}"`, write_outcome: 'applied' as const };
+            const send = async (extra: Record<string, unknown>): Promise<{ size: number; error: Record<string, unknown> & { exceptions_dropped?: typeof full } }> => {
+                const service: BoundCalendarService = { ...harness().service, create_event: async () => { throw new CalendarError('split_incomplete', undefined, extra); } };
+                const response = await handleMcp(request('tools/call', { name: 'create_event', arguments: CREATE }, protocol, '\u0000'.repeat(128)), { token: 't', clientId: 'c', scopes: READ_WRITE }, service);
+                const text = await response.text();
+                return { size: Buffer.byteLength(text), error: JSON.parse(text).result.structuredContent.error };
+            };
+            const exact = await send({ reason: 'second_write_refused', created_series: short, exceptions_dropped: small });
+            expect<unknown>(exact.error.exceptions_dropped).toEqual(small);
+            for (const [extra, some] of [[{ created_series: short }, true], [{ created_series: worst, upstream: worstUpstream }, false]] as const) {
+                const { size, error } = await send({ reason: 'second_write_refused', ...extra, exceptions_dropped: full });
+                const listed = error.exceptions_dropped;
+                const shown = (listed?.changed.length ?? 0) + (listed?.deleted.length ?? 0);
+                expect<unknown>([size <= 8192, listed?.changed_occurrences, listed?.deleted_occurrences, listed?.truncated, shown < 100, !some || shown > 0]).toEqual([true, 60, 70, true, true, true]);
+            }
+            // A forged inventory is dropped whole.
+            expect((await send({ reason: 'second_write_refused', created_series: short, exceptions_dropped: { ...small, changed_occurrences: -1 } })).error.exceptions_dropped).toBeUndefined();
+        });
+
         test(`${protocol}: a split whose second write fails says the new series was saved, through the real pipeline`, async () => {
             const h = harness();
             const series = ['BEGIN:VCALENDAR', 'VERSION:2.0', 'BEGIN:VEVENT', 'UID:mcp-series', 'DTSTAMP:20261101T120000Z', 'DTSTART:20270105T150000Z', 'DTEND:20270105T153000Z', 'RRULE:FREQ=WEEKLY;UNTIL=20270301T000000Z', 'SUMMARY:Standup', 'END:VEVENT', 'END:VCALENDAR', ''].join('\r\n');

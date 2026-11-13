@@ -43,6 +43,7 @@ import { DERIVED_NOT_COPIED, verifyDerivedOutcome, type DerivedExpectation, type
 import { parseRrule, rruleProperty, sequenceProperty, timeProperty, uidProperty, type IcsTime, type RrulePart, type StartForm, type WrittenProperty } from './ics-write';
 import { DAV_LAMBDA_RESERVE_MS, DAV_REQUEST_MS } from './limits';
 import type { EventComponent, Interval } from './model';
+import { droppedExceptions } from './write-move';
 import { exdateValues, occurrencesBefore, sameSlot, sideOf, slotOf } from './occurrence-target';
 import { calendarStatus, originalEventView, readStoredResources } from './read';
 import { eventSpan, padTransportWindow } from './time-core';
@@ -142,14 +143,18 @@ export async function updateFollowing(deps: WriteDeps, input: UpdateEventArgs, p
     // override or EXDATE could then match no occurrence of the new series); else they must be dropped. Never shifted.
     if (input.exceptions === 'shift') { throw notSupported('exceptions_shift_not_supported_for_split'); }
     const exdateLines = masterOutline.properties.filter(line => line.name === 'exdate');
-    const stored = exdateValues(master);
-    if (stored === null) { throw unsupported('stored_data_not_editable'); }
+    const exdates = exdateValues(master);
+    if (exdates === null) { throw unsupported('stored_data_not_editable'); }
     // An EXDATE whose side of the split the text cannot prove counts as after it (it may be carried).
-    const exdatesAfter = stored.filter(value => sideOf(value, master.start, point, slot) !== 'before');
+    const exdatesAfter = exdates.filter(value => sideOf(value, master.start, point, slot) !== 'before');
     if ((moved || plan.recurrence !== undefined) && (trunc.removed.length > 0 || exdatesAfter.length > 0) && input.exceptions !== 'drop') {
         throw notSupported('exceptions_choice_required', { exceptions: { changed_occurrences: trunc.removed.length, deleted_occurrences: exdatesAfter.length } });
     }
     const carry = input.exceptions !== 'drop';
+    // What a drop leaves out of the new series: the overrides and EXDATE values from the split on (earlier EXDATEs stay in
+    // the original). Part of every answer once the new series was or may have been saved.
+    const dropped: Pick<WriteErrorExtra, 'exceptions_dropped'> = !carry && (trunc.removed.length > 0 || exdatesAfter.length > 0)
+        ? { exceptions_dropped: droppedExceptions(trunc.removedOverrides, exdatesAfter) } : {};
 
     // The new series' rule: the agent's; else the stored one copied; with COUNT, the count left after the split, from iCloud.
     let rule: { written: WrittenProperty; text: string } | null = null;
@@ -248,30 +253,30 @@ export async function updateFollowing(deps: WriteDeps, input: UpdateEventArgs, p
             throw new WriteError('create_conflict');
         } else {
             // Nothing of the original was sent; the new series may or may not exist (a retry of the same call is safe).
-            throw new WriteError('outcome_unknown');
+            throw new WriteError('outcome_unknown', dropped);
         }
     }
 
     // Step 2: the original, exact If-Match. From here on the new series exists: no answer may claim nothing was saved.
-    if (deps.budget.workRemainingMs() < WRITE_SEND_RESERVE_MS) { throw incomplete('no_time_for_second_write', created); }
+    if (deps.budget.workRemainingMs() < WRITE_SEND_RESERVE_MS) { throw incomplete('no_time_for_second_write', created, dropped); }
     let second: Awaited<ReturnType<typeof putIfMatch>>;
     try {
         second = await putIfMatch(deps, reporter, { calendarId: target.calendarId, href: target.href, body: truncated, expected: target.expected }, resource => holds(resource, originalStored));
     } catch (error) {
-        if (!(error instanceof WriteError)) { throw incomplete('second_write_not_sent', created); }
+        if (!(error instanceof WriteError)) { throw incomplete('second_write_not_sent', created, dropped); }
         switch (error.code) {
-            case 'outcome_unknown': throw new WriteError('outcome_unknown', { created_series: created });
+            case 'outcome_unknown': throw new WriteError('outcome_unknown', { created_series: created, ...dropped });
             case 'calendar_changed':
-            case 'not_found': throw incomplete('original_changed_since', created);
+            case 'not_found': throw incomplete('original_changed_since', created, dropped);
             case 'write_refused':
             case 'forbidden':
             case 'read_only_calendar':
-            case 'upstream_error': throw incomplete('second_write_refused', created, error.extra.upstream === undefined ? {} : { upstream: error.extra.upstream });
-            default: throw incomplete('second_write_not_sent', created);
+            case 'upstream_error': throw incomplete('second_write_refused', created, { ...dropped, ...(error.extra.upstream === undefined ? {} : { upstream: error.extra.upstream }) });
+            default: throw incomplete('second_write_not_sent', created, dropped);
         }
     }
     const outcome = second.kind === 'applied' ? 'applied' : 'desired_state_present';
-    return splitResult(deps, read, target, series, originalStored, outcome, created, second.kind === 'applied' ? second.etag : null, zoneDropped, null);
+    return splitResult(deps, read, target, series, originalStored, outcome, created, second.kind === 'applied' ? second.etag : null, zoneDropped, null, dropped);
 }
 
 /**
@@ -309,6 +314,7 @@ async function countLeft(deps: WriteDeps, read: SeriesRead, calendarId: string, 
 async function splitResult(
     deps: WriteDeps, read: SeriesRead, target: ScopeTarget, series: Pick<NewSeries, 'href' | 'uid' | 'stored'>, originalStored: StoredExpectation, outcome: WriteEventResult['write_outcome'],
     created: CreatedSeries, answerEtag: StrongEtag | null, zoneDropped: readonly ('start' | 'end')[], known: [CalendarResource, CalendarResource] | null,
+    dropped: Pick<WriteEventResult, 'exceptions_dropped'> = {},
 ): Promise<WriteEventResult> {
     let pair: (CalendarResource | null)[] = known ?? [null, null];
     if (known === null) {
@@ -319,6 +325,7 @@ async function splitResult(
         write_outcome: outcome, calendar_id: target.calendarId, resource_href: target.href,
         request_warnings: zoneDropped.map(field => ({ field, timezone_warning: 'timezone_dropped_from_date' as const })),
         removed_dependent_properties: [],
+        ...dropped,
         ...(read.guests ? GUEST_FIELDS : {}),
         calendars: [calendarStatus(target.calendarId, read.summary, 'ok')] as [ReturnType<typeof calendarStatus>],
     };
