@@ -3,7 +3,7 @@ import { CLIENT_CAPABILITIES_META_KEY, CLIENT_INFO_META_KEY, PROTOCOL_VERSION_ME
 import { handleMcp, insufficientScopeMessage, missingScopes } from '../src/mcp';
 import { createApp } from '../src/app';
 import { bindCalendarService, CalendarError, type BoundCalendarService } from '../src/calendar/service';
-import { MAX_CALENDARS, toolErrorCodeSchema } from '../src/calendar/schemas';
+import { listCalendarsOutputSchema, MAX_CALENDARS, toolErrorCodeSchema } from '../src/calendar/schemas';
 import { CalDavError, type CalendarSummary } from '../src/caldav/contracts';
 import { UnreadableCredentials, type UpstreamCredentials } from '../src/auth/contracts';
 import { currentRequestId } from '../src/request-id';
@@ -146,7 +146,10 @@ test('the server is caldav-mcp and lists five read-only and three write calendar
     const [tool] = reply.result.tools;
     expect(tool.annotations).toEqual({ readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true });
     expect(tool.inputSchema.additionalProperties).toBe(false);
-    expect(tool.outputSchema.properties.calendars.maxItems).toBe(MAX_CALENDARS);
+    // The published output schema gives names and types only (no bound), so a later change never fails a client; the
+    // server still checks MAX_CALENDARS in its strict schema before sending.
+    expect(tool.outputSchema.properties.calendars).toEqual({ type: 'array', items: expect.objectContaining({ type: 'object' }) });
+    expect(listCalendarsOutputSchema.safeParse({ calendars: Array.from({ length: MAX_CALENDARS + 1 }, () => ({ id: '/1/calendars/x/', displayName: null, components: ['VEVENT'], color: null })), truncated: true }).success).toBe(false);
     for (const old of ['mail', 'mailbox', 'draft']) { expect(JSON.stringify(reply.result.tools.map((item: { name: string }) => item.name))).not.toContain(old); }
     const download = reply.result.tools[4];
     expect(download.inputSchema.required.toSorted()).toEqual(['attachment_ref', 'calendar_id', 'resource_href']);

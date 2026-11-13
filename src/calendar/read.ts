@@ -17,11 +17,11 @@ import { parseExpandedListing, parseOriginalResource, type ExpandedListing } fro
 import {
     CALENDAR_CONCURRENCY, DISPLAY_NAME_MAX, ETAG_MAX, ETAG_MIN, MAX_DISCOVERED_CALENDARS, MAX_MEMBERSHIP_BYTES, MAX_MULTIGET_HREFS, MAX_REPORT_BYTES, MAX_RESOURCES_PER_REPORT, MAX_UNREADABLE,
 } from './limits';
-import { BudgetError, IcalError, isCanonicalPath, isResourceHref, type EventComponent, type EventTime, type Interval, type OriginalResource } from './model';
+import { BudgetError, IcalError, isCanonicalPath, isResourceHref, type EventComponent, type EventTime, type Interval, type OriginalResource, type StrippedSeries } from './model';
 import { normalizeFullEvent, normalizeSeriesWithoutOccurrences, normalizeSlimEvent, sanitizeDisplayText } from './normalize';
 import { matchesQuery, normalizeQuery, type SearchField } from './search';
 import {
-    compareCodePoints, compareEventOrder, eventSpan, nominalSpanSeconds, occurrenceServerForm, occurrenceTransportWindow, parseOccurrenceId, parseRange,
+    compareCodePoints, compareEventOrder, eventSpan, nominalSpanSeconds, occurrenceServerForm, occurrenceTransportWindow, parseOccurrenceId, parseRange, pointSpan,
     rangeTransportWindow, spanOverlapsRange, type ParsedRange,
 } from './time-core';
 
@@ -49,8 +49,13 @@ export interface EventsReadResult {
     /** Deterministic sorted prefix of at most 50. */
     unreadable: Unreadable[];
     unreadableCount: number;
-    /** Every series iCloud returned without an occurrence in the window, from ok calendars, sorted; shape.ts caps it. */
+    /**
+     * Every series iCloud returned without an occurrence in the window whose stored EXDATE values include one in the
+     * requested range (or that has none), from ok calendars, sorted; shape.ts caps it.
+     */
     seriesWithoutOccurrences: SeriesWithoutOccurrences[];
+    /** The entries of seriesWithoutOccurrences matched only through the 24-hour margin (no EXDATE in the range has an instant). */
+    seriesByMargin?: ReadonlySet<SeriesWithoutOccurrences>;
 }
 
 export interface DetailReadResult {
@@ -198,6 +203,24 @@ interface CalendarOutcome {
     events: { event: SlimEvent; calendarId: string }[];
     unreadable: Unreadable[];
     seriesWithoutOccurrences: SeriesWithoutOccurrences[];
+    seriesByMargin: Set<SeriesWithoutOccurrences>;
+}
+
+/**
+ * Whether a stripped series belongs to the requested range: some stored EXDATE value, as a point, matches it under the
+ * events' rule (spanOverlapsRange: instants exactly, values without one with the 24-hour margin). `margin` when only values
+ * without an instant match. A series with no EXDATE has nothing to compare, so it is kept, as it was before this filter.
+ */
+function seriesInRange(range: ParsedRange, series: StrippedSeries): { kept: boolean; margin: boolean } {
+    if (series.excludedStarts.length === 0) { return { kept: true, margin: false }; }
+    let kept = false;
+    for (const time of series.excludedStarts) {
+        const span = pointSpan(time);
+        if (!spanOverlapsRange(range, span)) { continue; }
+        if (span.instant !== null) { return { kept: true, margin: false }; }
+        kept = true;
+    }
+    return { kept, margin: kept };
 }
 
 function unreadableReason(error: IcalError): Unreadable['reason'] {
@@ -223,7 +246,7 @@ async function processCalendar(context: CalendarContext, index: number, calendar
     validateReport(calendarId, resources);
     const { budget } = context;
     const work = budget.newCalendarWork();
-    const outcome: CalendarOutcome = { events: [], unreadable: [], seriesWithoutOccurrences: [] };
+    const outcome: CalendarOutcome = { events: [], unreadable: [], seriesWithoutOccurrences: [], seriesByMargin: new Set() };
     let unsupported = 0;
     let recurringReadable = 0;
     for (const resource of resources) {
@@ -247,15 +270,20 @@ async function processCalendar(context: CalendarContext, index: number, calendar
             continue;
         }
         if (listing.kind === 'series_without_occurrences') {
-            // iCloud's answer for a window holding only deleted occurrences: reported as data, never range-filtered (the server
-            // cannot compute occurrences). It counts neither as unsupported nor as recurring readable, so it neither fails the
-            // calendar nor vouches for the expansion of the others: an unexpanded master beside it still fails the calendar.
+            // iCloud's answer for a window holding only deleted occurrences: reported as data. The window is the padded
+            // transport window, so it is kept only when a stored EXDATE value lies in the requested range (the server computes
+            // no occurrence); otherwise it is dropped silently. Kept or not, it counts neither as unsupported nor as recurring
+            // readable, so it neither fails the calendar nor vouches for the expansion of the others: an unexpanded master
+            // beside it still fails the calendar.
             work.chargeComponents(1);
             await budget.afterComponent();
             if (context.cancelled()) { throw new CalDavError('unauthorized'); }
             budget.throwIfExpired();
-            if (context.matcher === null || context.matcher(listing.series.master)) {
-                outcome.seriesWithoutOccurrences.push(normalizeSeriesWithoutOccurrences(listing.series, { calendar: index, resourceHref: resource.href }));
+            const match = seriesInRange(context.range, listing.series);
+            if (match.kept && (context.matcher === null || context.matcher(listing.series.master))) {
+                const entry = normalizeSeriesWithoutOccurrences(listing.series, { calendar: index, resourceHref: resource.href });
+                outcome.seriesWithoutOccurrences.push(entry);
+                if (match.margin) { outcome.seriesByMargin.add(entry); }
             }
             continue;
         }
@@ -388,6 +416,7 @@ async function readEvents(deps: ReadDeps, input: ListEventsArgs, matcher: Matche
         unreadable: unreadable.slice(0, MAX_UNREADABLE),
         unreadableCount: unreadable.length,
         seriesWithoutOccurrences: series,
+        seriesByMargin: new Set([...outcomes.values()].flatMap(outcome => [...outcome.seriesByMargin])),
     };
 }
 

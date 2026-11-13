@@ -4,7 +4,7 @@
  */
 import type { Attendee, FullEvent, SeriesWithoutOccurrences, SlimEvent } from './event-schemas';
 import {
-    ATTENDEE_TEXT_MAX, FULL_DESCRIPTION_MAX, FULL_LOCATION_MAX, FULL_TITLE_MAX, MAX_ATTENDEES, SERIES_WITHOUT_OCCURRENCES_NOTE, SLIM_DESCRIPTION_MAX, SLIM_LOCATION_MAX, SLIM_TITLE_MAX, UID_MAX,
+    ATTENDEE_TEXT_MAX, FULL_DESCRIPTION_MAX, FULL_LOCATION_MAX, FULL_TITLE_MAX, MAX_ATTENDEES, MAX_EXCLUDED_STARTS, SERIES_WITHOUT_OCCURRENCES_NOTE, SLIM_DESCRIPTION_MAX, SLIM_LOCATION_MAX, SLIM_TITLE_MAX, UID_MAX,
 } from './limits';
 import { IcalError, type EventComponent, type RawProperty, type StrippedSeries } from './model';
 import { toEventTime } from './time-core';
@@ -169,7 +169,8 @@ export function normalizeSlimEvent(component: EventComponent, context: Normalize
 
 /**
  * A series iCloud returned without any occurrence in the window (ical.ts parseExpandedListing): its stored title, start,
- * RRULE text and EXDATE values, shaped as events' are, and the fixed note. Nothing is computed from the rule.
+ * RRULE text and first EXDATE values (with the count of all), shaped as events' are, and the fixed note. Nothing is
+ * computed from the rule.
  */
 export function normalizeSeriesWithoutOccurrences(series: StrippedSeries, context: Pick<NormalizeContext, 'calendar' | 'resourceHref'>): SeriesWithoutOccurrences {
     const title = displayField(propertyText(series.master, 'summary'), SLIM_TITLE_MAX);
@@ -181,8 +182,8 @@ export function normalizeSeriesWithoutOccurrences(series: StrippedSeries, contex
         ...(title.sanitized ? { sanitized: true as const } : {}),
         series_start: toEventTime(series.master.start),
         repeat_rule: series.repeatRule,
-        excluded_starts: series.excludedStarts.map(toEventTime),
-        excluded_count: series.excludedCount,
+        excluded_starts: series.excludedStarts.slice(0, MAX_EXCLUDED_STARTS).map(toEventTime),
+        excluded_count: series.excludedStarts.length,
         note: SERIES_WITHOUT_OCCURRENCES_NOTE,
     };
 }

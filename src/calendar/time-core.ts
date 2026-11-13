@@ -401,6 +401,16 @@ export function eventSpan(start: StoredTime, end: StoredTime | null, duration: s
     return { civil, instant: { startNs: low, endNs: high } };
 }
 
+/**
+ * One stored time as a point (zero length) on both axes, for spanOverlapsRange: an excluded start (EXDATE value) is matched
+ * exactly as an event's start is, a DATE included (eventSpan would make it a whole day).
+ */
+export function pointSpan(time: StoredTime): EventSpan {
+    const civil = civilNsOf(time);
+    const instant = instantOf(time);
+    return { civil: { startNs: civil, endNs: civil }, instant: instant === null ? null : { startNs: instant.ns, endNs: instant.ns } };
+}
+
 /** Half-open overlap of `interval` with `[from, to)`; a point (zero length) matches when `from <= start < to`. */
 function intervalOverlaps(from: bigint, to: bigint, interval: Interval): boolean {
     const low = interval.startNs < interval.endNs ? interval.startNs : interval.endNs;

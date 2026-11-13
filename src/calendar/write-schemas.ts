@@ -189,8 +189,8 @@ const writeEventResultShape = {
 };
 
 /**
- * What tools/list publishes for create_event and update_event: the strict schema with the rare-case fields shown without
- * their field schema. Results are checked against writeEventResultSchema first.
+ * What tools/list publishes (in its published form) for create_event and update_event: the strict schema with the
+ * rare-case fields shown without their field schema. Results are checked against writeEventResultSchema first.
  */
 export const listedWriteEventResultSchema = z.strictObject({
     ...writeEventResultShape,
@@ -225,7 +225,7 @@ const deleteEventResultShape = {
     notes: notesSchema,
 };
 
-/** What tools/list publishes for delete_event: the strict schema with the guest notice shown as a string. */
+/** What tools/list publishes (in its published form) for delete_event: the strict schema with the guest notice shown as a string. */
 export const listedDeleteEventResultSchema = z.strictObject({ ...deleteEventResultShape, guest_notice: z.string().optional() });
 
 export const deleteEventResultSchema = z.strictObject(deleteEventResultShape).superRefine((value, context) => {

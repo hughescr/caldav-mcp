@@ -1,9 +1,10 @@
 import { randomUUID } from 'node:crypto';
 import {
     createMcpHandler, isJSONRPCErrorResponse, isJSONRPCRequest, isJSONRPCResultResponse, isLegacyRequest, McpServer, ProtocolErrorCode, WebStandardStreamableHTTPServerTransport,
-    type AuthInfo, type CallToolResult, type ServerContext, type Transport,
+    type AuthInfo, type CallToolResult, type ServerContext, type StandardSchemaWithJSON, type ToolAnnotations, type ToolCallback, type Transport,
 } from '@modelcontextprotocol/server';
 import { version } from '../package.json';
+import { publishedOutputSchema } from './published-schema';
 import { withRequestId } from './request-id';
 import { CalendarError, type BoundCalendarService, type WriteGrant } from './calendar/service';
 import { MAX_CALENDARS, listCalendarsInputSchema, listCalendarsOutputSchema, toolErrorCodeSchema, type ToolErrorCode } from './calendar/schemas';
@@ -269,6 +270,15 @@ class CalendarMcpServer extends McpServer {
         };
     }
 
+    /**
+     * The one way this server registers a tool. tools/list shows the output schema in its published form (names and basic
+     * types only, published-schema.ts), so a reply with a new field never fails a client holding older definitions; the
+     * input schema and the validation of every result stay exactly as strict (tests/tool-budget.test.ts walks the list).
+     */
+    tool<Input extends StandardSchemaWithJSON>(name: ToolName, config: { description: string; inputSchema: Input; outputSchema: StandardSchemaWithJSON; annotations: ToolAnnotations }, handler: ToolCallback<Input>): void {
+        this.registerTool(name, { ...config, outputSchema: publishedOutputSchema(config.outputSchema) }, handler);
+    }
+
     invocation(name: ToolName, context: ServerContext): Invocation {
         const invocation = this.invocations.get(context.mcpReq.id) ?? { name, requestId: randomUUID(), handled: false };
         invocation.handled = true;
@@ -324,7 +334,7 @@ function createServer(calendar: BoundCalendarService): CalendarMcpServer {
             return result;
         } catch (error) { return failure(error, name, requestId); }
     };
-    server.registerTool('list_calendars', {
+    server.tool('list_calendars', {
         description: `List the account's calendars that hold events, at most ${MAX_CALENDARS}. Each id is the calendar_id the other tools take. ${UNTRUSTED_CLAUSE}`,
         inputSchema: listCalendarsInputSchema,
         outputSchema: listCalendarsOutputSchema,
@@ -333,33 +343,33 @@ function createServer(calendar: BoundCalendarService): CalendarMcpServer {
         const result = listCalendarsOutputSchema.parse(await calendar.list_calendars({}));
         return { structuredContent: result, content: [{ type: 'text', text: JSON.stringify(result) }, ...(result.truncated ? [{ type: 'text' as const, text: `Only the first ${MAX_CALENDARS} calendars are listed; more exist.` }] : [])] };
     }));
-    server.registerTool('list_events', {
+    server.tool('list_events', {
         description: LIST_DESCRIPTION,
         inputSchema: listEventsInputSchema, outputSchema: listedEventsOutputSchema, annotations,
     }, (input, context) => execute('list_events', context, async () => shapeEventsResult(await calendar.list_events(input), { limit: input.limit ?? DEFAULT_EVENTS, wire: server.wire(context) })));
-    server.registerTool('search_events', {
+    server.tool('search_events', {
         description: SEARCH_DESCRIPTION,
         inputSchema: searchEventsInputSchema, outputSchema: listedEventsOutputSchema, annotations,
     }, (input, context) => execute('search_events', context, async () => shapeEventsResult(await calendar.search_events(input), { limit: input.limit ?? DEFAULT_EVENTS, wire: server.wire(context) })));
-    server.registerTool('get_event', {
+    server.tool('get_event', {
         description: GET_DESCRIPTION,
         inputSchema: getEventInputSchema, outputSchema: getEventOutputSchema, annotations,
     }, (input, context) => execute('get_event', context, async () => shapeEventDetail(await calendar.get_event(input), { wire: server.wire(context) })));
-    server.registerTool(DOWNLOAD_TOOL, {
+    server.tool(DOWNLOAD_TOOL, {
         description: DOWNLOAD_DESCRIPTION,
         inputSchema: downloadInputSchema, outputSchema: downloadOutputSchema, annotations,
     }, (input, context) => execute(DOWNLOAD_TOOL, context, async () => shapeDownloadResult(await calendar.get_event_attachment_download(input), { wire: server.wire(context) })));
 
     const grant = (context: ServerContext): WriteGrant => ({ scopes: context.http?.authInfo?.scopes ?? [] });
-    server.registerTool('create_event', {
+    server.tool('create_event', {
         description: CREATE_DESCRIPTION,
         inputSchema: createEventInputSchema, outputSchema: listedWriteEventResultSchema, annotations: createAnnotations,
     }, (input, context) => execute('create_event', context, async () => shapeWriteResult(await calendar.create_event(input, grant(context)), { wire: server.wire(context) })));
-    server.registerTool('update_event', {
+    server.tool('update_event', {
         description: UPDATE_DESCRIPTION,
         inputSchema: updateEventInputSchema, outputSchema: listedWriteEventResultSchema, annotations: changeAnnotations,
     }, (input, context) => execute('update_event', context, async () => shapeWriteResult(await calendar.update_event(input, grant(context)), { wire: server.wire(context) })));
-    server.registerTool('delete_event', {
+    server.tool('delete_event', {
         description: DELETE_DESCRIPTION,
         inputSchema: deleteEventInputSchema, outputSchema: listedDeleteEventResultSchema, annotations: changeAnnotations,
     }, (input, context) => execute('delete_event', context, async () => shapeDeleteResult(await calendar.delete_event(input, grant(context)), { wire: server.wire(context) })));

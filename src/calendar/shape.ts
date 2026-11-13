@@ -7,7 +7,8 @@ import { SERVER_INFO_META_KEY, type CallToolResult } from '@modelcontextprotocol
 import { version } from '../../package.json';
 import type { DetailReadResult, EventsReadResult } from './read';
 import {
-    downloadOutputSchema, eventsOutputSchema, getEventOutputSchema, type AttachmentMetadata, type DownloadOutput, type EventsOutput, type FullEvent, type GetEventOutput, type SlimEvent, type Unreadable,
+    downloadOutputSchema, eventsOutputSchema, getEventOutputSchema, type AttachmentMetadata, type DownloadOutput, type EventsOutput, type FullEvent, type GetEventOutput, type SeriesWithoutOccurrences,
+    type SlimEvent, type Unreadable,
 } from './event-schemas';
 import {
     MAX_ATTACHMENTS, MAX_EVENTS, MAX_RAW_BYTES, MAX_SERIES_WITHOUT_OCCURRENCES, MAX_UNREADABLE, MAX_WIRE_BYTES, RESULT_TOO_LARGE_NOTICE, RESUME_INSTRUCTION, RESUME_INSTRUCTION_NO_ROW,
@@ -124,10 +125,14 @@ interface EventsSelection { events: number; unreadable: number; series: number }
 /** A time with a fixed instant: UTC, or a recognised zone. All-day, floating and unrecognised-zone times have none. */
 const hasInstant = (time: SlimEvent['start']): boolean => 'utc' in time && time.utc !== undefined;
 
-/** The notes of a list/search payload: each timezone warning in it, and the range margin when an event has no instant. */
-function eventsNotes(payload: Omit<EventsOutput, 'notes'>): { notes?: string[] } {
+/**
+ * The notes of a list/search payload: each timezone warning in it, and the range margin when an event has no instant or an
+ * entry of series_without_occurrences was matched only through the margin (`byMargin`, from read.ts).
+ */
+function eventsNotes(payload: Omit<EventsOutput, 'notes'>, byMargin: ReadonlySet<SeriesWithoutOccurrences> | undefined): { notes?: string[] } {
     const found = timezoneNotes(payload);
-    if (payload.events.some(event => !hasInstant(event.start) || (event.end !== null && !hasInstant(event.end)))) { found.add(RANGE_MARGIN_NOTE); }
+    if (payload.events.some(event => !hasInstant(event.start) || (event.end !== null && !hasInstant(event.end)))
+        || (byMargin !== undefined && payload.series_without_occurrences?.some(entry => byMargin.has(entry)) === true)) { found.add(RANGE_MARGIN_NOTE); }
     return notesField(found);
 }
 
@@ -170,7 +175,7 @@ function eventsPayload(result: EventsReadResult, limit: number, chosen: EventsSe
         coverage: 'server_reports' as const,
         limitations: ['moved_overrides_unverified', 'silent_server_omissions_undetectable'] as ['moved_overrides_unverified', 'silent_server_omissions_undetectable'],
     };
-    return { ...payload, ...eventsNotes(payload) };
+    return { ...payload, ...eventsNotes(payload, result.seriesByMargin) };
 }
 
 /** Fixed notices, rendered from trusted constants and counts only. */

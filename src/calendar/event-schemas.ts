@@ -27,7 +27,7 @@ export const notesSchema = z.array(z.string(FIXED), FIXED).refine(validNotes, FI
 /**
  * What tools/list publishes for a field only a rare result holds: an array of objects, or an object, without its field
  * schema. The server validates the strict schema before sending; the listing stays small, and a client still validates
- * the rest of the result exactly.
+ * the names and types of the rest (tools/list shows every output schema in its published form, src/published-schema.ts).
  */
 export const listedObjects = () => z.array(z.looseObject({})).optional();
 export const listedObject = () => z.looseObject({}).optional();
@@ -205,8 +205,9 @@ const eventsOutputShape = {
 };
 
 /**
- * What tools/list publishes for list_events and search_events: the strict schema with the rare-case fields (unreadable
- * entries and series without occurrences) shown only as objects. Results are checked against eventsOutputSchema first.
+ * What tools/list publishes (in its published form) for list_events and search_events: the strict schema with the rare-case
+ * fields (unreadable entries and series without occurrences) shown only as objects. Results are checked against
+ * eventsOutputSchema first, then against this.
  */
 export const listedEventsOutputSchema = z.strictObject({
     ...eventsOutputShape,

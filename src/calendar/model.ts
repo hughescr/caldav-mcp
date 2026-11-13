@@ -182,10 +182,8 @@ export interface StrippedSeries {
     master: EventComponent;
     /** The RRULE value text, unfolded, exactly as stored. */
     repeatRule: string;
-    /** The first EXDATE values in stored order (at most MAX_EXCLUDED_STARTS). */
+    /** Every EXDATE value of the master, in stored order (the range filter reads them all; an entry shows the first few). */
     excludedStarts: readonly StoredTime[];
-    /** Every EXDATE value of the master. */
-    excludedCount: number;
 }
 
 export interface OriginalResource {

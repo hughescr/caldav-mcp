@@ -1,20 +1,25 @@
 import { afterEach, beforeEach, describe, expect, spyOn, test, type Mock } from 'bun:test';
+import { createHash } from 'node:crypto';
 import { CLIENT_CAPABILITIES_META_KEY, CLIENT_INFO_META_KEY, PROTOCOL_VERSION_META_KEY, type AuthInfo } from '@modelcontextprotocol/server';
 import { AjvJsonSchemaValidator } from '@modelcontextprotocol/server/validators/ajv';
 import type { UpstreamCredentials } from '../src/auth/contracts';
-import { bindCalendarService } from '../src/calendar/service';
+import { downloadOutputSchema } from '../src/calendar/event-schemas';
+import { EXTERNAL_ATTACHMENT_NOTE } from '../src/calendar/notes';
+import { listCalendarsOutputSchema } from '../src/calendar/schemas';
+import { bindCalendarService, type BoundCalendarService } from '../src/calendar/service';
 import { handleMcp, SERVER_INSTRUCTIONS } from '../src/mcp';
+import { publishedOutputSchema } from '../src/published-schema';
 import { FAKE_DISCOVERY, FakeICloud } from './helpers/fake-caldav-write';
 
 /**
  * The context budget of the tool list. Every client loads the whole `tools/list` result into each conversation that has
  * this connector, so its size is a cost paid on every turn. The limits sit a little above the sizes they were set at
- * (tools/list 46,438 and 46,582 bytes in the two eras, descriptions 3,519 characters, instructions 2,100 characters, and
+ * (tools/list 37,016 and 37,160 bytes in the two eras, descriptions 3,519 characters, instructions 2,100 characters, and
  * 14,778 bytes of model-visible text: every description plus every input schema plus the instructions); raise one only
  * for a rule an agent needs before calling a tool, and say which in the commit. An error, a result field or a rare case is
  * explained where it occurs (the error message, or the result's notes), never here.
  */
-const LIMITS = { description: 1200, descriptions: 3670, toolsList: 46_900, instructions: 2250, modelVisible: 14_930 } as const;
+const LIMITS = { description: 1200, descriptions: 3670, toolsList: 37_480, instructions: 2250, modelVisible: 14_930 } as const;
 
 /**
  * Phrases that explain an error, a result field or a rare case. They belong in the response that holds the situation
@@ -200,14 +205,14 @@ describe('the rules an agent needs are stated, wherever a client shows them', ()
     test('the listed output schemas show rare-case fields only as objects; notes as a plain string array', async () => {
         const { byName } = await listTools();
         const property = (tool: string, field: string): Record<string, unknown> => ((byName.get(tool)?.outputSchema['properties'] ?? {}) as Record<string, Record<string, unknown>>)[field] ?? {};
-        const looseItems = { type: 'array', items: { type: 'object', properties: {}, additionalProperties: {} } };
+        const looseItems = { type: 'array', items: { type: 'object', properties: {} } };
         for (const tool of ['list_events', 'search_events']) {
             expect<unknown>([tool, property(tool, 'unreadable')]).toEqual([tool, looseItems]);
             expect<unknown>([tool, property(tool, 'series_without_occurrences')]).toEqual([tool, { ...looseItems, description: 'Series iCloud returned without occurrences; see each note' }]);
             expect<unknown>([tool, property(tool, 'series_without_occurrences_truncated')]).toEqual([tool, { type: 'boolean' }]);
         }
         for (const tool of ['create_event', 'update_event']) {
-            for (const field of ['exceptions_dropped', 'exceptions_shifted']) { expect<unknown>([tool, field, property(tool, field)]).toEqual([tool, field, { type: 'object', properties: {}, additionalProperties: {} }]); }
+            for (const field of ['exceptions_dropped', 'exceptions_shifted']) { expect<unknown>([tool, field, property(tool, field)]).toEqual([tool, field, { type: 'object', properties: {} }]); }
             expect<unknown>([tool, property(tool, 'request_warnings')]).toEqual([tool, looseItems]);
         }
         for (const tool of ['create_event', 'update_event', 'delete_event']) { expect<unknown>([tool, property(tool, 'guest_notice')]).toEqual([tool, { type: 'string' }]); }
@@ -242,22 +247,29 @@ describe('the listed JSON Schemas are valid draft 2020-12 with local $refs, and 
         expect([...used].toSorted()).toEqual(['attendee', 'event_time', 'write_time']);
     });
 
-    test('real inputs and results of every tool validate against the listed schemas, and malformed times do not', async () => {
-        const { byName } = await listTools();
+    test('real inputs and results of every tool validate against the listed schemas, also with new fields; malformed times do not', async () => {
+        const eras = await Promise.all(ERAS.map(async protocol => (await listTools(protocol)).byName));
         const h = harness();
+        const called = new Set<string>();
         const check = (name: string, kind: 'inputSchema' | 'outputSchema', value: unknown, valid = true) => {
-            const schema = byName.get(name)?.[kind];
-            if (schema === undefined) { throw new Error(`no ${kind} for ${name}`); }
-            const result = validator.getValidator(schema)(value);
-            expect<unknown>([name, kind, result.valid, result.errorMessage]).toEqual([name, kind, valid, valid ? undefined : expect.any(String)]);
+            for (const [index, byName] of eras.entries()) {
+                const schema = byName.get(name)?.[kind];
+                if (schema === undefined) { throw new Error(`no ${kind} for ${name}`); }
+                const result = validator.getValidator(schema)(value);
+                expect<unknown>([ERAS[index], name, kind, result.valid, result.errorMessage]).toEqual([ERAS[index], name, kind, valid, valid ? undefined : expect.any(String)]);
+            }
         };
         const call = async (name: string, args: Record<string, unknown>) => {
             check(name, 'inputSchema', args);
             const result = (await h.rpc('tools/call', { name, arguments: args })).reply.result;
             expect<unknown>([name, result.isError, result.structuredContent?.error]).toEqual([name, undefined, undefined]);
             check(name, 'outputSchema', result.structuredContent);
+            // A later release may add a field anywhere: a client holding these definitions still accepts the reply.
+            check(name, 'outputSchema', withNewFields(result.structuredContent));
+            called.add(name);
             return result.structuredContent;
         };
+        await call('list_calendars', {});
 
         const zoned = await call('create_event', { calendar_id: WORK, operation_id: 'op-budget-zoned', title: 'Zoned', start: { local: '2026-12-02T09:00:00', zone: 'America/New_York' }, end: { local: '2026-12-02T10:00:00', zone: 'America/New_York' } });
         expect(zoned.event.start.zone).toBe('America/New_York');
@@ -282,5 +294,113 @@ describe('the listed JSON Schemas are valid draft 2020-12 with local $refs, and 
         check('get_event', 'inputSchema', { calendar_id: WORK, resource_href: `${WORK}x-apple-reminderkit%3A%252FSYNTHETIC%252F1.ics` });
         const unaddressable = { calendar: 0, resource_href: null, recurrence_id: null, reason: 'unsupported_resource_address' };
         check('list_events', 'outputSchema', { ...listed, unreadable: [unaddressable], unreadable_count: 1, complete: false });
+        // A value the server may add later (a new status, warning or limitation) is accepted too.
+        check('list_events', 'outputSchema', { ...listed, calendars: [{ ...listed.calendars[0], status: 'a_later_status' }], limitations: ['moved_overrides_unverified', 'silent_server_omissions_undetectable', 'a_later_limitation'] });
+        // The fake stages no download, so that result is built and checked by the strict schema first.
+        const download = downloadOutputSchema.parse({
+            form: 'external', attachment_ref: `a1_${'A'.repeat(43)}`, expected_version: '"1"', filename: null, content_type: null, url: 'https://files.example.invalid/a', fetched_by_server: false, notes: [EXTERNAL_ATTACHMENT_NOTE],
+        });
+        check(DOWNLOAD, 'outputSchema', download);
+        check(DOWNLOAD, 'outputSchema', withNewFields(download));
+        expect([...called, DOWNLOAD].toSorted()).toEqual(TOOL_NAMES.toSorted());
+    });
+});
+
+const DOWNLOAD = 'get_event_attachment_download';
+/** Every tool, so a test that should cover each one fails when a tool is added without it. */
+const TOOL_NAMES = ['list_calendars', 'list_events', 'search_events', 'get_event', DOWNLOAD, 'create_event', 'update_event', 'delete_event'];
+
+/** `value` with a new field in every object, at every level, as a later release might add. */
+function withNewFields(value: unknown): unknown {
+    if (Array.isArray(value)) { return value.map(withNewFields); }
+    if (typeof value !== 'object' || value === null) { return value; }
+    return { ...Object.fromEntries(Object.entries(value).map(([key, item]) => [key, withNewFields(item)])), a_later_field: { nested: [1, 'two'] } };
+}
+
+/**
+ * The keywords a published output schema must not carry: each one fails a client's validation of a reply that gains a field
+ * (additionalProperties, unevaluatedProperties, propertyNames, patternProperties, maxProperties), a value (enum, const,
+ * pattern, format, bounds) or an entry (tuples, item counts), or that matches two branches once the others are open (oneOf).
+ */
+const CLOSED_KEYWORDS = [
+    'additionalProperties', 'unevaluatedProperties', 'propertyNames', 'patternProperties', 'minProperties', 'maxProperties', 'enum', 'const', 'pattern', 'format',
+    'minLength', 'maxLength', 'minimum', 'maximum', 'exclusiveMinimum', 'exclusiveMaximum', 'multipleOf', 'prefixItems', 'minItems', 'maxItems', 'uniqueItems',
+    'contains', 'minContains', 'maxContains', 'unevaluatedItems', 'oneOf', 'not', 'if', 'then', 'else', 'dependentRequired', 'dependentSchemas',
+];
+
+/** Every keyword used anywhere in a JSON Schema, with its path; the keys of `properties` and `$defs` are names, not keywords. */
+function schemaKeywords(schema: unknown, path: string, found: [string, string, unknown][] = []): [string, string, unknown][] {
+    if (Array.isArray(schema)) { schema.forEach((item, index) => schemaKeywords(item, `${path}/${index}`, found)); return found; }
+    if (typeof schema !== 'object' || schema === null) { return found; }
+    for (const [key, value] of Object.entries(schema)) {
+        found.push([path, key, value]);
+        if ((key === 'properties' || key === '$defs') && typeof value === 'object' && value !== null) {
+            for (const [name, child] of Object.entries(value)) { schemaKeywords(child, `${path}/${key}/${name}`, found); }
+        } else if (key !== 'description' && key !== 'required') {
+            schemaKeywords(value, `${path}/${key}`, found);
+        }
+    }
+    return found;
+}
+
+describe('the published output schemas give field names and types only, so a reply with new fields never fails a client', () => {
+    test('no output schema of any tool, in either era, at any level, carries a closing keyword or a tuple', async () => {
+        for (const protocol of ERAS) {
+            const { tools } = await listTools(protocol);
+            expect(tools.map(tool => tool.name).toSorted()).toEqual(TOOL_NAMES.toSorted());
+            for (const tool of tools) {
+                const found = schemaKeywords(tool.outputSchema, tool.name);
+                const closed = found.filter(([, key, value]) => CLOSED_KEYWORDS.includes(key) || (key === 'items' && (Array.isArray(value) || typeof value === 'boolean')));
+                expect<unknown>([protocol, tool.name, closed]).toEqual([protocol, tool.name, []]);
+                // Field descriptions stay; every type is a basic one.
+                const types = new Set(found.filter(([, key]) => key === 'type').flatMap(([, , value]) => (Array.isArray(value) ? value : [value])));
+                expect<unknown>([tool.name, [...types].filter(type => !['object', 'array', 'string', 'number', 'integer', 'boolean', 'null'].includes(String(type)))]).toEqual([tool.name, []]);
+            }
+        }
+        const { byName } = await listTools();
+        expect(((byName.get('list_events')?.outputSchema['properties'] ?? {}) as Record<string, { description?: string }>)['complete']?.description).toBe('Processing completeness only, not proof that every event was returned');
+    });
+
+    test('the input schemas and descriptions, which the model reads, are byte for byte those of 1.2.0', async () => {
+        for (const protocol of ERAS) {
+            const { tools } = await listTools(protocol);
+            const inputs = JSON.stringify(tools.map(tool => [tool.name, tool.inputSchema]));
+            expect<unknown>([protocol, Buffer.byteLength(inputs, 'utf8'), createHash('sha256').update(inputs).digest('hex')]).toEqual([protocol, 9320, 'f0d283e416227a625ad73c935013ba10a6fbafb2179a4eb1129d019ed606d7e9']);
+            expect(modelVisibleBytes(tools)).toBe(14_778);
+        }
+    });
+
+    test('the server still checks every result against its strict schema before sending: an unknown field is refused', async () => {
+        const service = bindCalendarService({ caldav: new FakeICloud([WORK]), connectionStatus: 'active', credentials: () => credentials, markReconnectRequired: async () => true, now: () => NOW_MS });
+        const authInfo: AuthInfo = { token: 'synthetic', clientId: 'test', scopes: ALL };
+        const extended: BoundCalendarService = {
+            ...service,
+            list_calendars: async input => ({ ...await service.list_calendars(input), a_later_field: true }),
+            list_events: async input => {
+                const read = await service.list_events(input);
+                return { ...read, events: read.events.map(event => ({ ...event, a_later_field: true })) };
+            },
+            create_event: async (input, grant) => {
+                const result = await service.create_event(input, grant);
+                return { ...result, event: result.event === null ? null : { ...result.event, start: { ...result.event.start, a_later_field: true } } };
+            },
+        };
+        const callWith = async (calendar: BoundCalendarService, name: string, args: Record<string, unknown>) => JSON.parse(await (await handleMcp(request('tools/call', { name, arguments: args }, ERAS[0]), authInfo, calendar)).text()).result;
+        const created = { calendar_id: WORK, title: 'Strict', start: '2026-12-02T09:00:00Z', end: '2026-12-02T10:00:00Z' };
+        const calls: [string, Record<string, unknown>][] = [
+            ['create_event', { ...created, operation_id: 'op-strict-new' }], ['list_calendars', {}], ['list_events', { range: { start: '2026-12-01T00:00:00Z', end: '2026-12-08T00:00:00Z' } }],
+        ];
+        // The plain service answers each call; the one that adds a field gets a fixed error, and the field never reaches the wire.
+        for (const [name, args] of calls) {
+            expect<unknown>([name, (await callWith(service, name, args)).isError]).toEqual([name, undefined]);
+            const refused = await callWith(extended, name, name === 'create_event' ? { ...args, operation_id: 'op-strict-other' } : args);
+            expect<unknown>([name, refused.isError, JSON.stringify(refused).includes('a_later_field')]).toEqual([name, true, false]);
+        }
+        // The published form changes only what tools/list shows: the SDK still validates each result with the strict schema.
+        const published = publishedOutputSchema(listCalendarsOutputSchema)['~standard'];
+        expect((await published.validate({ calendars: [], truncated: false })).issues).toBeUndefined();
+        expect((await published.validate({ calendars: [], truncated: false, a_later_field: true })).issues?.length).toBeGreaterThan(0);
+        expect(published.jsonSchema.output({ target: 'draft-2020-12' })['additionalProperties']).toBeUndefined();
+        expect(listCalendarsOutputSchema['~standard'].jsonSchema.output({ target: 'draft-2020-12' })['additionalProperties']).toBe(false);
     });
 });

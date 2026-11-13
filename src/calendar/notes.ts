@@ -14,7 +14,10 @@ export const TIMEZONE_NOTES = {
 
 export type TimezoneWarning = keyof typeof TIMEZONE_NOTES;
 
-/** list_events and search_events: an event without a fixed instant is in the result. */
+/**
+ * list_events and search_events: an event without a fixed instant is in the result, or a series_without_occurrences entry
+ * whose only EXDATE values in the range have none.
+ */
 export const RANGE_MARGIN_NOTE = 'All-day, floating and unrecognised-zone events have no fixed instant, so they are matched with a 24-hour margin: some in this result may lie up to 24 hours outside the range. Check their dates against the range.';
 
 /**
