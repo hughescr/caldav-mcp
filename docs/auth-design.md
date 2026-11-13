@@ -110,7 +110,7 @@ The POST carries one `grant` field per ticked box. `grant` is the only field tha
 
 Each tool lists its required scopes, and all of them must be granted (`requiredScope` in `src/mcp.ts`, a non-empty list per tool). `insufficient_scope` names the missing scopes and tells the agent that the user must reconnect and tick the named checkbox, quoting its label; for `calendar:read` it says the page includes it whenever the client requests it.
 
-`calendar:write` covers creating and changing events; deleting needs `calendar:delete`. Existing connections and grants are left as they are: nothing migrates, widens or narrows them, and a grant that holds `calendar:write` does not gain `calendar:delete`. A connection that wants the write tools or delete must reconnect and tick the boxes.
+`calendar:write` covers creating and changing events; deleting needs `calendar:delete`. Existing connections and grants are left as they are: nothing migrates, widens or narrows them, and a grant that holds `calendar:write` does not gain `calendar:delete`. A connection without those scopes that wants the write tools or delete must reconnect and tick the boxes; one that holds them needs no new scope for the occurrence and series edits of 1.0.0.
 
 ### One consent per client
 
