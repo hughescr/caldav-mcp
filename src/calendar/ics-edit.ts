@@ -26,7 +26,7 @@
  */
 import { parseContentLine } from './attachments';
 import type { ResourceWork } from './budget';
-import { foldLine, isWrittenComponent, isWrittenProperty, MAX_LINE_OCTETS, type WrittenComponent, type WrittenProperty } from './ics-write';
+import { foldLine, isWrittenComponent, isWrittenProperty, MAX_LINE_OCTETS, PRODID, type WrittenComponent, type WrittenProperty } from './ics-write';
 import { parseOriginalResource } from './ical';
 import { MAX_ICS_NESTING } from './limits';
 import { BudgetError, IcalError, type EventComponent, type OriginalResource } from './model';
@@ -87,7 +87,12 @@ export type ComponentEdit =
     /** Remove every VALARM nested directly in the component. */
     | { op: 'remove_alarms' }
     /** Add one VALARM before the component's END. */
-    | { op: 'add_alarm'; alarm: WrittenComponent };
+    | { op: 'add_alarm'; alarm: WrittenComponent }
+    /**
+     * Replace an override's one RECURRENCE-ID line in place (a series move that shifts its overrides). Only this op may
+     * touch RECURRENCE-ID; the verifier must then expect the new value for that target (`TargetExpectation.recurrenceId`).
+     */
+    | { op: 'replace_recurrence_id'; property: WrittenProperty };
 
 /** One line of a new VEVENT: a written property or alarm, or a byte-for-byte copy from the original. */
 export type NewComponentItem =
@@ -447,11 +452,12 @@ function editName(raw: unknown): string {
 
 function applyComponentEdits(planner: Planner, target: ComponentNode, edits: readonly ComponentEdit[]): void {
     const { tree } = planner;
-    const editedNames = new Map<string, 'single' | 'add'>();
-    const claimName = (name: string, mode: 'single' | 'add'): void => {
+    // `cleared` (remove_all) may be followed by `add`s of the same name: a series move replaces the EXDATE lines.
+    const editedNames = new Map<string, 'single' | 'add' | 'cleared'>();
+    const claimName = (name: string, mode: 'single' | 'add' | 'cleared'): void => {
         const previous = editedNames.get(name);
-        if (previous !== undefined && (previous !== 'add' || mode !== 'add')) { throw new IcsEditError('conflicting_edits'); }
-        editedNames.set(name, mode);
+        if (previous !== undefined && !(mode === 'add' && (previous === 'add' || previous === 'cleared'))) { throw new IcsEditError('conflicting_edits'); }
+        editedNames.set(name, previous === 'cleared' ? 'cleared' : mode);
     };
     const occurrences = (name: string): number[] => directLines(tree, target, name);
     const single = (name: string): number | null => {
@@ -502,7 +508,7 @@ function applyComponentEdits(planner: Planner, target: ComponentNode, edits: rea
             case 'remove_all': {
                 const name = editName(edit.name);
                 if (!MULTI_VALUED.has(name)) { throw new IcsEditError('edit_not_allowed'); }
-                claimName(name, 'single');
+                claimName(name, 'cleared');
                 for (const index of occurrences(name)) { planner.remove(index, name, 'requested'); }
                 break;
             }
@@ -528,6 +534,16 @@ function applyComponentEdits(planner: Planner, target: ComponentNode, edits: rea
                 if (!isWrittenComponent(edit.alarm) || edit.alarm.name !== 'VALARM') { throw new IcsEditError('value_not_written'); }
                 const change = planner.change('added', 'VALARM', 'requested', null);
                 planner.insert(target.end, 1, edit.alarm.lines.map((text, position) => ({ kind: 'written', text, change: position === 0 ? change : null })));
+                break;
+            }
+            case 'replace_recurrence_id': {
+                const property = writtenProperty(edit.property);
+                if (editName(property.name) !== 'recurrence-id') { throw new IcsEditError('edit_not_allowed'); }
+                claimName('recurrence-id', 'single');
+                const found = occurrences('recurrence-id');
+                const index = found[0];
+                if (found.length !== 1 || index === undefined) { throw new IcsEditError(found.length === 0 ? 'property_absent' : 'duplicate_property'); }
+                planner.replace(index, property, 'recurrence-id');
                 break;
             }
             default:
@@ -714,6 +730,96 @@ export function editResource(original: string, plan: EditPlan, options: EditOpti
         throw new IcsEditError('output_invalid');
     }
     return { text: result.text, report };
+}
+
+// ---- A new resource derived from a stored one (the future part of a split) ----
+
+/**
+ * The new resource of a split (design 3.5): a VCALENDAR header written here, every VTIMEZONE of the original copied
+ * line for line, one new master VEVENT, then whole copies of the named original overrides with only their UID line
+ * replaced. The new master's items are lines written by ics-write and copies of the ORIGINAL MASTER's direct lines and
+ * VALARMs only (`copy_line`, `copy_component`); it gets its UID from `uid`, never from an item.
+ */
+export interface DerivedPlan {
+    readonly uid: WrittenProperty;
+    readonly master: readonly NewComponentItem[];
+    /** Original overrides to copy, by the exact text of their RECURRENCE-ID line, in output order. */
+    readonly overrides: readonly string[];
+}
+
+const DERIVED_HEADER: readonly string[] = ['BEGIN:VCALENDAR', 'VERSION:2.0', `PRODID:${PRODID}`, 'CALSCALE:GREGORIAN'];
+
+/**
+ * Builds the text of a derived resource in one pass over the original's lines. Throws {@link IcsEditError} (or the caller's
+ * BudgetError): a master with a nested component other than VALARM, a copy reference outside the master, a UID or
+ * RECURRENCE-ID among the master's items, an unknown or repeated override. The output is re-parsed: one master, the named
+ * overrides, the original's VTIMEZONE count, every VEVENT with the new UID. Line contents of every copy are preserved;
+ * written lines are folded at 75 octets. Proves structure only: `verifyDerivedOutcome` (ics-verify.ts) checks intent.
+ */
+export function buildDerivedResource(original: string, plan: DerivedPlan, options: EditOptions = {}): string {
+    if (typeof plan !== 'object' || plan === null || !Array.isArray(plan.master) || !Array.isArray(plan.overrides)) { throw new IcsEditError('edit_not_allowed'); }
+    const uid = writtenProperty(plan.uid);
+    if (uid.name !== 'UID') { throw new IcsEditError('value_not_written'); }
+    const tree = readTree(original, options);
+    const master = tree.masters[0];
+    if (master === undefined) { throw new IcsEditError('target_not_found'); }
+    if (master.children.some(child => child.name !== 'valarm')) { throw new IcsEditError('component_invalid'); }
+    const copyable = new Set(master.direct);
+    const alarms = new Map(master.children.map(child => [child.begin, child]));
+    const physical: string[] = [];
+    const write = (text: string): void => { for (const part of foldLine(text)) { physical.push(part); } };
+    const copy = (index: number): void => { for (const part of lineAt(tree.lines, index).physical) { physical.push(part); } };
+
+    for (const line of DERIVED_HEADER) { write(line); }
+    for (const zone of tree.root.children.filter(child => child.name === 'vtimezone')) {
+        for (let index = zone.begin; index <= zone.end; index++) { copy(index); }
+    }
+    write('BEGIN:VEVENT');
+    write(uid.line);
+    for (const item of plan.master as readonly unknown[]) {
+        if (isWrittenProperty(item)) {
+            if (['UID', 'RECURRENCE-ID'].includes(item.name.toUpperCase())) { throw new IcsEditError('component_invalid'); }
+            write(item.line);
+        } else if (isWrittenComponent(item)) {
+            for (const text of item.lines) { write(text); }
+        } else if (typeof item === 'object' && item !== null && 'copy_line' in item) {
+            const index = item.copy_line;
+            if (typeof index !== 'number' || !copyable.has(index) || ['uid', 'recurrence-id'].includes(lineAt(tree.lines, index).name)) { throw new IcsEditError('copy_invalid'); }
+            copy(index);
+        } else if (typeof item === 'object' && item !== null && 'copy_component' in item) {
+            const node = typeof item.copy_component === 'number' ? alarms.get(item.copy_component) : undefined;
+            if (node === undefined) { throw new IcsEditError('copy_invalid'); }
+            for (let index = node.begin; index <= node.end; index++) { copy(index); }
+        } else {
+            throw new IcsEditError('value_not_written');
+        }
+    }
+    write('END:VEVENT');
+    const seen = new Set<ComponentNode>();
+    for (const recurrenceId of plan.overrides as readonly unknown[]) {
+        if (typeof recurrenceId !== 'string') { throw new IcsEditError('target_not_found'); }
+        const node = selectEvent(tree, { kind: 'override', recurrenceId });
+        if (seen.has(node)) { throw new IcsEditError('conflicting_edits'); }
+        seen.add(node);
+        const uids = directLines(tree, node, 'uid');
+        if (uids.length !== 1) { throw new IcsEditError('duplicate_property'); }
+        for (let index = node.begin; index <= node.end; index++) {
+            if (index === uids[0]) { write(uid.line); } else { copy(index); }
+        }
+    }
+    write('END:VCALENDAR');
+    const text = `${physical.join('\r\n')}\r\n`;
+
+    let parsed: OriginalResource;
+    try {
+        parsed = parseOriginalResource(text, parseOptions(options));
+    } catch (error) {
+        if (error instanceof BudgetError && options.work !== undefined) { throw error; }
+        const tooLarge = (error instanceof IcalError && error.reason === 'resource_too_large') || error instanceof BudgetError;
+        throw new IcsEditError(tooLarge ? 'output_too_large' : 'output_invalid');
+    }
+    if (parsed.master === null || parsed.overrides.length !== plan.overrides.length || parsed.vtimezoneCount !== tree.parsed.vtimezoneCount) { throw new IcsEditError('output_invalid'); }
+    return text;
 }
 
 // ---- Independent verification ----

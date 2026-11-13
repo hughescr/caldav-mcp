@@ -301,6 +301,18 @@ export function timeProperty(name: TimePropertyName, time: IcsTime, field: strin
     return property(name, `${name}${parameters}:${value}`);
 }
 
+/**
+ * One `EXDATE` line holding several values of one form (a series move shifts a stored comma list line by line). Every value
+ * must have the same kind and, when zoned, the same TZID; at least one value, at most 64.
+ */
+export function exdateListProperty(times: readonly IcsTime[], field: string | null = 'EXDATE'): WrittenProperty {
+    if (!Array.isArray(times) || times.length === 0 || times.length > 64) { throw new IcsWriteError('time_invalid', field); }
+    const parts = times.map(time => timeParts(time, field));
+    const parameters = parts[0]?.parameters ?? '';
+    if (parts.some(part => part.parameters !== parameters)) { throw new IcsWriteError('time_form_not_allowed', field); }
+    return property('EXDATE', `EXDATE${parameters}:${parts.map(part => part.value).join(',')}`);
+}
+
 // ---- UID, enums, SEQUENCE ----
 
 const UID_RE = /^[A-Za-z0-9._~@+=-]+$/u;
