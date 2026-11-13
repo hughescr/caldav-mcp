@@ -1019,8 +1019,10 @@ export function verifyEditOutcome(before: string, after: string, expectation: Ed
             const rid = oldView.get(node)?.rid;
             return rid === undefined || rid === null || !removed.has(rid);
         });
+        const ridCounts = new Map<string | null, number>();
+        for (const event of old.events) { ridCounts.set(event.rid, (ridCounts.get(event.rid) ?? 0) + 1); }
         for (const rid of removed) {
-            if (old.events.filter(event => event.rid === rid).length !== 1) { refuse('override_mismatch', 'removeOverride'); }
+            if (ridCounts.get(rid) !== 1) { refuse('override_mismatch', 'removeOverride'); }
         }
         // Each target names exactly one component of the original.
         const oldCounts = new Map<string, number>();
@@ -1235,9 +1237,14 @@ export function verifyDerivedOutcome(before: string, after: string, expectation:
             checkReplacedAlarms(now.doc, own.alarms, validAlarms(alarms.alarms));
         }
 
-        // The copied overrides: line-identical but for the direct UID line.
+        // The copied overrides: line-identical but for the direct UID line. One index of the source events by RECURRENCE-ID.
+        const sourcesByRid = new Map<string | null, (typeof old.events)[number][]>();
+        for (const event of old.events) {
+            const list = sourcesByRid.get(event.rid);
+            if (list === undefined) { sourcesByRid.set(event.rid, [event]); } else { list.push(event); }
+        }
         for (const [index, rid] of expectation.overrides.entries()) {
-            const source = old.events.filter(event => event.rid === rid);
+            const source = sourcesByRid.get(rid) ?? [];
             const target = rest[index];
             if (source.length !== 1 || source[0] === undefined || target === undefined) { return refuse('override_mismatch', 'overrides'); }
             const node = source[0].node;

@@ -5,6 +5,9 @@ import { deleteEvent, updateEvent, WriteError, type WriteDeps } from '../src/cal
 import {
     deleteEventInputSchema, deleteEventResultSchema, GUEST_NOTICE, updateEventInputSchema, writeEventResultSchema, type DeleteEventArgs, type DeleteEventResult, type UpdateEventArgs, type WriteEventResult,
 } from '../src/calendar/write-schemas';
+import { describeEvents } from '../src/calendar/ics-edit';
+import { parseOriginalResource } from '../src/calendar/ical';
+import { truncation, type SeriesRead } from '../src/calendar/write-occurrence';
 import { FAKE_DISCOVERY, FakeICloud } from './helpers/fake-caldav-write';
 
 // The occurrence scopes against the stateful fake, which models iCloud's measured expansion (see its header). Expected
@@ -552,6 +555,46 @@ describe('update_event, edit_scope this_and_future (split)', () => {
         const plainEtag = plain.fake.seed(WORK, UTC_HREF, UTC_SERIES);
         expect((await update(plain, splitRequest(plainEtag))).exceptions_dropped).toBeUndefined();
     });
+
+    test('a split carrying many overrides does linear work: 250 vs 1,000 carried overrides', async () => {
+        const href = `${WORK}BIG-SPLIT.ics`;
+        const series = (count: number): string => {
+            const overrides = Array.from({ length: count }, (_, index) => {
+                const day = new Date(Date.UTC(2027, 0, 19) + index * 7 * 86_400_000).toISOString().slice(0, 10).replaceAll('-', '');
+                return ['BEGIN:VEVENT', 'UID:BIG-SPLIT', 'DTSTAMP:20261105T120000Z', `RECURRENCE-ID:${day}T150000Z`, `DTSTART:${day}T160000Z`, `DTEND:${day}T170000Z`, `SUMMARY:Weekly ${String(index)}`, 'END:VEVENT'];
+            });
+            return crlf(['BEGIN:VCALENDAR', 'VERSION:2.0', 'PRODID:-//Synthetic//EN', 'BEGIN:VEVENT', 'UID:BIG-SPLIT', 'DTSTAMP:20261101T120000Z', 'SEQUENCE:1', 'DTSTART:20270105T150000Z', 'DTEND:20270105T160000Z', 'RRULE:FREQ=WEEKLY', 'SUMMARY:Weekly', 'END:VEVENT', ...overrides.flat(), 'END:VCALENDAR']);
+        };
+        const timed = async (count: number): Promise<number> => {
+            let best = Number.POSITIVE_INFINITY;
+            for (let run = 0; run < 3; run++) {
+                const h = harness();
+                const etag = h.fake.seed(WORK, href, series(count));
+                const started = performance.now();
+                const result = await update(h, { calendar_id: WORK, resource_href: href, expected_version: etag, edit_scope: 'this_and_future', recurrence_id: 'occ1_20270112T150000Z', operation_id: `op-big-split-${String(count)}`, changes: { title: 'Renamed' } });
+                best = Math.min(best, performance.now() - started);
+                expect<unknown>([count, result.write_outcome, result.stored_differs_from_request]).toEqual([count, 'applied', []]);
+                expect(unfold(puts(h.fake)[0]?.body ?? '').filter(line => line.startsWith('RECURRENCE-ID')).length).toBe(count);
+            }
+            return best;
+        };
+        const small = await timed(250);
+        const large = await timed(1000);
+        // Linear work is about 4x for 4x the overrides; per-override scans of every override are about 16x. Generous bound.
+        expect<unknown>({ small, large, ratio: large / small, linear: large / small < 9 }).toMatchObject({ linear: true });
+
+        // Within the 2 MiB cap a per-override scan costs too little to show in time, so count it: naming the RECURRENCE-ID
+        // line of every carried override visits the overrides a constant number of times each, not once per override.
+        const text = series(1000);
+        let visits = 0;
+        const parsed = parseOriginalResource(text, {});
+        const overrides = new Proxy(parsed.overrides, { get: (items, key, receiver) => { if (typeof key === 'string' && /^\d+$/u.test(key)) { visits++; } return Reflect.get(items, key, receiver) as unknown; } });
+        const read = { summary: {}, reporter: async () => {}, found: { href, etag: '"e"', calendarData: text }, original: { ...parsed, overrides }, guests: false, outlines: describeEvents(text) } as unknown as SeriesRead;
+        const master = parsed.master;
+        if (master === null) { throw new Error('master expected'); }
+        const trunc = truncation(read, master, '20270112T150000Z', { kind: 'utc', utc: '20270112T150000Z' });
+        expect<unknown>([trunc.removed.length, visits <= 4 * 1000]).toEqual([1000, true]);
+    }, 60_000);
 
     test('shift is refused for every split, also without a time change; nothing is sent', async () => {
         const h = harness();

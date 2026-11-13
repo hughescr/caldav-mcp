@@ -92,10 +92,19 @@ export function resolve(original: OriginalResource, token: ParsedOccurrenceId, c
     try { return resolveOccurrence(original, token, components); } catch (error) { throw builderError(error); }
 }
 
-/** The exact RECURRENCE-ID line text of a stored override (the editor's and the verifier's selector). */
+/** Per read: each stored override's RECURRENCE-ID line (overrides and override outlines are in the same source order). */
+const ridIndexes = new WeakMap<SeriesRead, Map<EventComponent, string | null>>();
+
+/** The exact RECURRENCE-ID line text of a stored override (the editor's and the verifier's selector); the index is built once per read. */
 export function ridLineOf(read: SeriesRead, override: EventComponent): string {
-    const index = read.original.overrides.indexOf(override);
-    const rid = read.outlines.filter(outline => outline.recurrenceId !== null)[index]?.recurrenceId;
+    let index = ridIndexes.get(read);
+    if (index === undefined) {
+        index = new Map();
+        const outlines = read.outlines.filter(outline => outline.recurrenceId !== null);
+        for (const [position, item] of read.original.overrides.entries()) { index.set(item, outlines[position]?.recurrenceId ?? null); }
+        ridIndexes.set(read, index);
+    }
+    const rid = index.get(override);
     if (rid === undefined || rid === null) { throw unsupported('stored_data_not_editable'); }
     return rid;
 }

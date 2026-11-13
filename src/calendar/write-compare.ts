@@ -158,10 +158,22 @@ export function differingFields(stored: StoredEvent | undefined, request: Compon
     return differs;
 }
 
+/** The stored events by RECURRENCE-ID line (null: the master), built once per comparison so each lookup is constant time. */
+type EventIndex = ReadonlyMap<string | null, readonly StoredEvent[]>;
+
+function indexEvents(events: readonly StoredEvent[]): EventIndex {
+    const index = new Map<string | null, StoredEvent[]>();
+    for (const event of events) {
+        const list = index.get(event.rid);
+        if (list === undefined) { index.set(event.rid, [event]); } else { list.push(event); }
+    }
+    return index;
+}
+
 /** The stored component for a request: the master (no RECURRENCE-ID) or the override with that exact RECURRENCE-ID line. */
-export function storedComponent(events: readonly StoredEvent[], rid: string | null): StoredEvent | undefined {
-    const matches = events.filter(event => event.rid === rid);
-    return matches.length === 1 ? matches[0] : undefined;
+function storedComponent(index: EventIndex, rid: string | null): StoredEvent | undefined {
+    const matches = index.get(rid);
+    return matches?.length === 1 ? matches[0] : undefined;
 }
 
 /**
@@ -182,9 +194,9 @@ export type StoredExpectation =
     | { readonly kind: 'every_event'; readonly request: ComponentRequest };
 
 /** The component-set rules of a `components` expectation: no extra VEVENT when exclusive, no removed override left. */
-function componentSetHolds(events: readonly StoredEvent[], expectation: Extract<StoredExpectation, { kind: 'components' }>): boolean {
+function componentSetHolds(events: readonly StoredEvent[], index: EventIndex, expectation: Extract<StoredExpectation, { kind: 'components' }>): boolean {
     if (expectation.exclusive === true && events.length !== expectation.requests.length) { return false; }
-    return (expectation.absentRids ?? []).every(rid => !events.some(event => event.rid === rid));
+    return (expectation.absentRids ?? []).every(rid => !index.has(rid));
 }
 
 function holdsIn(stored: StoredEvent, request: ComponentRequest): boolean {
@@ -198,8 +210,9 @@ function holdsIn(stored: StoredEvent, request: ComponentRequest): boolean {
 export function holdsExpectation(events: readonly StoredEvent[] | null, expectation: StoredExpectation): boolean {
     if (events === null) { return false; }
     if (expectation.kind === 'components') {
-        return componentSetHolds(events, expectation) && expectation.requests.every(request => {
-            const stored = storedComponent(events, request.rid);
+        const index = indexEvents(events);
+        return componentSetHolds(events, index, expectation) && expectation.requests.every(request => {
+            const stored = storedComponent(index, request.rid);
             return stored !== undefined && holdsIn(stored, request);
         });
     }
@@ -212,11 +225,12 @@ export function holdsExpectation(events: readonly StoredEvent[] | null, expectat
 export function storedDifferences(events: readonly StoredEvent[] | null, expectation: StoredExpectation): StoredField[] {
     const fields = new Set<StoredField>();
     if (expectation.kind === 'components') {
+        const index = events === null ? null : indexEvents(events);
         for (const request of expectation.requests) {
-            for (const field of differingFields(events === null ? undefined : storedComponent(events, request.rid), request)) { fields.add(field); }
+            for (const field of differingFields(index === null ? undefined : storedComponent(index, request.rid), request)) { fields.add(field); }
         }
         // An override that should be gone, or one more than requested, changes the series' set of occurrences.
-        if (events !== null && !componentSetHolds(events, expectation)) { fields.add('recurrence'); }
+        if (events !== null && index !== null && !componentSetHolds(events, index, expectation)) { fields.add('recurrence'); }
     } else if (events === null || events.length === 0) {
         for (const field of differingFields(undefined, expectation.request)) { fields.add(field); }
     } else {
