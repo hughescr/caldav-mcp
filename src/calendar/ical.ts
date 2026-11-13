@@ -233,7 +233,9 @@ function buildEvent(parsed: ParsedEvent, scans: readonly AttachPrescan[] | null,
     if (expanded) {
         // T0-DECISION: an expanded RID with no token form (another parameter, a DATE with a TZID, an over-long TZID) is
         // unsupported, never a guessed token. A TZID-form RID has an occ2_ token of its text, so it is readable.
-        if (retainsRecurrenceRules) { throw new IcalError('unsupported_recurrence_data'); }
+        // iCloud leaves the master's RDATE on every expanded instance (measured 2026-11); an instance has a RECURRENCE-ID, so
+        // a leftover RDATE or EXDATE there is passed through. RRULE anywhere, or RDATE/EXDATE without one, is an unexpanded master.
+        if (properties.has('rrule') || (recurrenceId === null && retainsRecurrenceRules)) { throw new IcalError('unsupported_recurrence_data'); }
         if (recurrenceId !== null && recurrenceId.token === null) { throw new IcalError('unsupported_recurrence_id'); }
     }
 
