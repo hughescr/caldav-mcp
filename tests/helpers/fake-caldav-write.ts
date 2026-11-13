@@ -45,6 +45,9 @@ import { FAKE_DISCOVERY } from './fake-caldav';
  *   local text, VALUE=DATE, floating, or UTC; measured outcome (a), P3B-2 and P3B-6) and `X-RECURRENCE-EXCEPTION` (measured
  *   name; the value `TRUE` is a GUESS). It is returned only when the window overlaps both its slot and its own time (Run 5).
  * - An override whose RECURRENCE-ID matches no instance (beyond UNTIL, or off every slot) is hidden (P3C-4).
+ * - A window that holds only EXDATE-excluded slots of a series (no remaining instance) still returns the resource: the
+ *   stored master's lines alone, VALARM included, in a VCALENDAR with no properties and no VTIMEZONE (measured 2026-11-13,
+ *   read-only: 1022 bytes for a 3722-byte stored series). A window before the series or between instances returns nothing.
  * - In a TZID series a local time in a repeated hour resolves to the SECOND instant and one in a skipped hour to the
  *   earlier offset (01:30 EST for 02:30 on 2027-03-14); an expanded DTEND is the first resolution plus the master's
  *   duration (measured tuples, P3B-4: 01:30/01:30/06:30Z and 01:30/03:30/06:30Z). Overrides and EXDATEs match a slot by
@@ -240,10 +243,14 @@ function expandResource(text: string, window: Window): string | null {
         }
     }
     slots.sort((a, b) => a.ms - b.ms);
+    let excludedInWindow = false;
     for (const { digits: slotDigits, ms: slotMs, firstMs } of slots) {
-        if (exdates.includes(slotMs)) { continue; }
-        const override = overrideAt.get(slotMs);
         const slotEnd = firstMs + durationMs;
+        if (exdates.includes(slotMs)) {
+            if (overlaps(window, slotMs, slotEnd)) { excludedInWindow = true; }
+            continue;
+        }
+        const override = overrideAt.get(slotMs);
         if (override !== undefined) {
             const own = span(override);
             if (overlaps(window, slotMs, slotEnd) && overlaps(window, own.start, own.end)) {
@@ -263,6 +270,10 @@ function expandResource(text: string, window: Window): string | null {
         const rid = start.kind === 'date' ? `RECURRENCE-ID:${slotDigits}T000000Z` : start.kind === 'floating' ? `RECURRENCE-ID:${slotDigits}Z` : `RECURRENCE-ID:${utcDigits(slotMs)}`;
         out.push(['BEGIN:VEVENT', ...kept, render('DTSTART', slotMs), render('DTEND', slotEnd), rid, ...master.nested, 'END:VEVENT']);
     }
+    // A window whose only slots are EXDATE-excluded still returns the resource, as the stored master alone in a VCALENDAR
+    // with no properties and no VTIMEZONE (measured 2026-11-13, read-only). GUESS: the same when a hidden override shares
+    // the window with an excluded slot.
+    if (out.length === 0 && excludedInWindow) { return `BEGIN:VCALENDAR\n${['BEGIN:VEVENT', ...master.lines, 'END:VEVENT'].join('\n')}\nEND:VCALENDAR\n`; }
     return out.length === 0 ? null : `BEGIN:VCALENDAR\n${out.flat().join('\n')}\nEND:VCALENDAR\n`;
 }
 
