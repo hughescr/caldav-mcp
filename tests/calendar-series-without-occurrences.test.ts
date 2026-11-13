@@ -7,6 +7,7 @@ import { eventsOutputSchema, type SeriesWithoutOccurrences } from '../src/calend
 import { parseExpandedListing, parseExpandedResource } from '../src/calendar/ical';
 import { MAX_EXCLUDED_STARTS, MAX_SERIES_WITHOUT_OCCURRENCES, MAX_WIRE_BYTES, SERIES_WITHOUT_OCCURRENCES_NOTE } from '../src/calendar/limits';
 import { IcalError } from '../src/calendar/model';
+import { RANGE_MARGIN_NOTE, TIMEZONE_NOTES } from '../src/calendar/notes';
 import { getEvent, listEvents, ReadError, searchEvents, type EventsReadResult, type ReadDeps } from '../src/calendar/read';
 import { bindCalendarService } from '../src/calendar/service';
 import { measureWireBytes, shapeEventsResult, type WireContext } from '../src/calendar/shape';
@@ -46,7 +47,6 @@ describe('recognising a series returned without occurrences', () => {
         expect(listing.series.master.alarmCount).toBe(1);
         expect(listing.series.repeatRule).toBe('FREQ=WEEKLY;UNTIL=20220905T235959Z');
         expect<unknown>(listing.series.excludedStarts).toEqual([{ kind: 'zoned', local: '2022-06-07T11:00:00', tzid: LA }]);
-        expect(listing.series.excludedCount).toBe(1);
     });
 
     test('a folded RRULE line is read unfolded, verbatim', () => {
@@ -62,19 +62,18 @@ describe('recognising a series returned without occurrences', () => {
         expect<unknown>(listing.kind === 'instances' ? listing.resource : null).toEqual(parseExpandedResource(text, {}));
     });
 
-    test('several EXDATE values and lines are listed in stored order, capped, with the full count', () => {
+    test('several EXDATE values and lines are all kept in stored order (the range filter reads every one; the entry caps them)', () => {
         const values = Array.from({ length: 12 }, (_, index) => `202206${String(index + 7).padStart(2, '0')}T180000Z`);
         const text = STRIPPED.replace(`EXDATE;TZID=${LA}:20220607T110000`, `EXDATE:${values.slice(0, 9).join(',')}\nEXDATE:${values.slice(9).join(',')}`);
         const listing = parseExpandedListing(text, {});
         if (listing.kind !== 'series_without_occurrences') { throw new Error(`unexpected ${listing.kind}`); }
-        expect(listing.series.excludedCount).toBe(12);
-        expect(listing.series.excludedStarts).toHaveLength(MAX_EXCLUDED_STARTS);
-        expect<unknown>(listing.series.excludedStarts.map(time => (time.kind === 'utc' ? time.utc : null))).toEqual(values.slice(0, MAX_EXCLUDED_STARTS).map(value => `${value.slice(0, 4)}-${value.slice(4, 6)}-${value.slice(6, 8)}T18:00:00Z`));
+        expect(listing.series.excludedStarts.length).toBeGreaterThan(MAX_EXCLUDED_STARTS);
+        expect<unknown>(listing.series.excludedStarts.map(time => (time.kind === 'utc' ? time.utc : null))).toEqual(values.map(value => `${value.slice(0, 4)}-${value.slice(4, 6)}-${value.slice(6, 8)}T18:00:00Z`));
     });
 
     test('a master without EXDATE in the stripped shape is still recognised, with no excluded starts', () => {
         const listing = parseExpandedListing(STRIPPED.replace(`EXDATE;TZID=${LA}:20220607T110000\n`, ''), {});
-        expect<unknown>(listing.kind === 'series_without_occurrences' ? [listing.series.excludedStarts, listing.series.excludedCount] : null).toEqual([[], 0]);
+        expect<unknown>(listing.kind === 'series_without_occurrences' ? listing.series.excludedStarts : null).toEqual([]);
     });
 
     const nearMisses: [string, string][] = [
@@ -122,8 +121,8 @@ describe('recognising a series returned without occurrences', () => {
         const text = STRIPPED.replace(EXDATE_LINE, `EXDATE;VALUE=DATE-TIME;TZID=${LA}:20220614T110000,20220621T110000\nexdate;value=date:20220628`);
         const listing = parseExpandedListing(text, {});
         if (listing.kind !== 'series_without_occurrences') { throw new Error(`unexpected ${listing.kind}`); }
-        expect<unknown>([listing.series.excludedStarts, listing.series.excludedCount]).toEqual([
-            [{ kind: 'zoned', local: '2022-06-14T11:00:00', tzid: LA }, { kind: 'zoned', local: '2022-06-21T11:00:00', tzid: LA }, { kind: 'date', date: '2022-06-28' }], 3,
+        expect<unknown>(listing.series.excludedStarts).toEqual([
+            { kind: 'zoned', local: '2022-06-14T11:00:00', tzid: LA }, { kind: 'zoned', local: '2022-06-21T11:00:00', tzid: LA }, { kind: 'date', date: '2022-06-28' },
         ]);
     });
 
@@ -282,6 +281,125 @@ describe('list_events reports the series as data, not as an error', () => {
     });
 });
 
+// The server queries iCloud 31 days beyond each end of the range (MOVED_PAD_DAYS), so iCloud also answers with this shape
+// for a series whose deleted occurrence lies only in that padding (measured 2026-11-13: a request for 2022-05-01..05-12
+// listed a series whose only EXDATE was 2022-06-07). Each EXDATE value is a point, matched as an event start is.
+describe('an entry is reported only when one of its stored EXDATE values lies in the requested range', () => {
+    const legacy: WireContext = { jsonRpcId: 1, protocolEra: 'legacy' };
+    const shaped = (result: EventsReadResult) => eventsOutputSchema.parse(shapeEventsResult(result, { limit: 25, wire: legacy }).structuredContent);
+    /** Reads `range` and also records every stripped answer the fake gave, so a test proves iCloud did send the series. */
+    const readOver = async (seeds: readonly [string, string][], range: { start: string; end: string }, query?: string, rewrite = (text: string) => text) => {
+        const { fake, read } = setup(seeds);
+        const stripped: string[] = [];
+        fake.expansionHook = (at, expanded) => { if (expanded.startsWith('BEGIN:VCALENDAR\nBEGIN:VEVENT\n')) { stripped.push(at); } return rewrite(expanded); };
+        const result = query === undefined ? await listEvents(read(), { range }) : await searchEvents(read(), { range, query });
+        return { result, stripped, output: shaped(result) };
+    };
+    const dropped = (outcome: Awaited<ReturnType<typeof readOver>>, hrefs: string[]): void => {
+        const { result, stripped, output } = outcome;
+        expect(stripped).toEqual(hrefs);
+        expect(statuses(result)).toEqual(['ok']);
+        expect<unknown>([result.events, result.unreadable, result.unreadableCount, result.seriesWithoutOccurrences]).toEqual([[], [], 0, []]);
+        expect<unknown>([output.complete, output.unreadable_count, output.notes]).toEqual([true, 0, undefined]);
+        expect(Object.keys(output).filter(key => key.startsWith('series_without'))).toEqual([]);
+    };
+
+    test('the deleted occurrence in the range: the entry is reported, with no range-margin note for a zoned value', async () => {
+        const { result, stripped, output } = await readOver([[TZID_HREF, TZID_SERIES]], { start: '2027-06-08T18:00:00Z', end: '2027-06-08T18:00:01Z' });
+        expect(stripped).toEqual([TZID_HREF]);
+        expect(result.seriesWithoutOccurrences.map(entry => entry.resource_href)).toEqual([TZID_HREF]);
+        expect<unknown>([output.series_without_occurrences?.length, output.complete, output.notes]).toEqual([1, true, undefined]);
+    });
+
+    const padded: [string, { start: string; end: string }][] = [
+        ['before the range (the measured case)', { start: '2027-06-20T00:00:00Z', end: '2027-07-01T00:00:00Z' }],
+        ['after the range', { start: '2027-05-20T00:00:00Z', end: '2027-06-01T00:00:00Z' }],
+        ['one second before the range: a value with an instant gets no margin', { start: '2027-06-08T18:00:01Z', end: '2027-06-09T00:00:00Z' }],
+        ['at the exclusive end of the range', { start: '2027-06-08T00:00:00Z', end: '2027-06-08T18:00:00Z' }],
+    ];
+    for (const [label, range] of padded) {
+        test(`the deleted occurrence only in the padding, ${label}: no entry, the calendar ok, complete, nothing unreadable`, async () => {
+            dropped(await readOver([[TZID_HREF, TZID_SERIES]], range), [TZID_HREF]);
+        });
+    }
+
+    test('every stored EXDATE value counts, not only the ten an entry shows: only the 11th and 12th in the range still report it', async () => {
+        const at = href('SYNTH-SWO-TWELVE');
+        const values = Array.from({ length: 12 }, (_, index) => new Date(Date.UTC(2027, 5, 1 + 7 * index, 18)).toISOString().replaceAll(/[-:]|\.000/gu, ''));
+        const text = storedSeries('SYNTH-SWO-TWELVE', 'DTSTART:20270601T180000Z', 'DTEND:20270601T190000Z', 'FREQ=WEEKLY;COUNT=12', [`EXDATE:${values.join(',')}`]);
+        // values[10] is 2027-08-10T18:00Z and values[11] 2027-08-17T18:00Z; the range holds those two only.
+        const { result, stripped } = await readOver([[at, text]], { start: '2027-08-10T00:00:00Z', end: '2027-08-18T00:00:00Z' });
+        expect(stripped).toEqual([at]);
+        const [entry] = result.seriesWithoutOccurrences;
+        expect<unknown>([result.seriesWithoutOccurrences.length, entry?.excluded_count, entry?.excluded_starts.length, entry?.excluded_starts[0]]).toEqual([1, 12, MAX_EXCLUDED_STARTS, { utc: '2027-06-01T18:00:00Z' }]);
+        // The same series over a range that holds none of them is dropped.
+        dropped(await readOver([[at, text]], { start: '2027-08-18T00:00:00Z', end: '2027-08-25T00:00:00Z' }), [at]);
+    });
+
+    // A value without a fixed instant (all-day, floating, unrecognised zone) gets the events' 24-hour margin on its civil
+    // digits read as UTC, and the result then carries the range-margin note, as it does for such an event.
+    const FLOATING = ['DTSTART:20270608T110000', 'DTEND:20270608T120000', 'EXDATE:20270608T110000'] as const;
+    // Injection for the last row: the fake cannot expand a zone it does not know, so the floating series' stripped answer is
+    // given a TZID iCloud keeps but this server does not recognise (no instant either).
+    const unknownZone = (text: string): string => text.replaceAll(/^(DTSTART|DTEND|EXDATE):/gmu, '$1;TZID=Mars/Olympus:');
+    const margins: [string, readonly [string, string, string], string, string, string[], ((text: string) => string)?][] = [
+        ['an all-day value', ['DTSTART;VALUE=DATE:20270608', 'DTEND;VALUE=DATE:20270609', 'EXDATE;VALUE=DATE:20270608'], '2027-06-09T00:00:00Z', '2027-06-07T00:00:00Z', []],
+        ['a floating value', FLOATING, '2027-06-09T11:00:00Z', '2027-06-07T11:00:00Z', [TIMEZONE_NOTES.no_timezone_on_event]],
+        ['an unrecognised-zone value', FLOATING, '2027-06-09T11:00:00Z', '2027-06-07T11:00:00Z', [TIMEZONE_NOTES.unrecognized_timezone], unknownZone],
+    ];
+    for (const [label, [start, end, exdate], latestStart, earliestEnd, zoneNotes, rewrite] of margins) {
+        test(`${label}: reported up to 24 hours outside the range on either side, with the range-margin note; dropped beyond`, async () => {
+            const at = href('SYNTH-SWO-MARGIN');
+            const seeds: [string, string][] = [[at, storedSeries('SYNTH-SWO-MARGIN', start, end, 'FREQ=WEEKLY;INTERVAL=12;COUNT=3', [exdate])]];
+            const plusSecond = (text: string): string => new Date(Date.parse(text) + 1000).toISOString().replace('.000Z', 'Z');
+            for (const range of [{ start: latestStart, end: '2027-06-20T00:00:00Z' }, { start: '2027-06-01T00:00:00Z', end: plusSecond(earliestEnd) }]) {
+                const { result, output } = await readOver(seeds, range, undefined, rewrite);
+                expect<unknown>([range, result.seriesWithoutOccurrences.map(entry => entry.resource_href), output.notes]).toEqual([range, [at], [RANGE_MARGIN_NOTE, ...zoneNotes]]);
+            }
+            dropped(await readOver(seeds, { start: plusSecond(latestStart), end: '2027-06-20T00:00:00Z' }, undefined, rewrite), [at]);
+            dropped(await readOver(seeds, { start: '2027-06-01T00:00:00Z', end: earliestEnd }, undefined, rewrite), [at]);
+        });
+    }
+
+    test('a value with an instant in the range outweighs a margin-only one: no range-margin note', async () => {
+        const at = href('SYNTH-SWO-MIXED');
+        const text = storedSeries('SYNTH-SWO-MIXED', 'DTSTART:20270608T180000Z', 'DTEND:20270608T190000Z', 'FREQ=WEEKLY;COUNT=2', ['EXDATE:20270608T180000Z', 'EXDATE:20270615T180000']);
+        const { result, output } = await readOver([[at, text]], { start: '2027-06-08T00:00:00Z', end: '2027-06-16T00:00:00Z' });
+        expect(result.seriesWithoutOccurrences.map(entry => entry.resource_href)).toEqual([at]);
+        expect(output.notes ?? []).not.toContain(RANGE_MARGIN_NOTE);
+    });
+
+    test('a stripped series with no EXDATE at all has nothing to compare, so it is still reported, as in 1.2.0', async () => {
+        const { fake, read } = setup();
+        // Injection: iCloud's stripped answer for this window without the master's EXDATE line.
+        fake.expansionHook = (_at, expanded) => expanded.replace(`EXDATE;TZID=${LA}:20270608T110000\n`, '');
+        for (const range of [RANGE, { start: '2027-06-20T00:00:00Z', end: '2027-07-01T00:00:00Z' }]) {
+            const result = await listEvents(read(), { range });
+            expect<unknown>([statuses(result), result.unreadable, result.seriesWithoutOccurrences.map(entry => [entry.resource_href, entry.excluded_starts, entry.excluded_count])]).toEqual([['ok'], [], [[TZID_HREF, [], 0]]]);
+            expect(shaped(result).notes).toBeUndefined();
+        }
+    });
+
+    test('search_events applies the same filter: a matching series whose EXDATE is only in the padding is dropped', async () => {
+        expect((await readOver([[TZID_HREF, TZID_SERIES]], RANGE, 'standup')).result.seriesWithoutOccurrences.map(entry => entry.resource_href)).toEqual([TZID_HREF]);
+        dropped(await readOver([[TZID_HREF, TZID_SERIES]], { start: '2027-06-20T00:00:00Z', end: '2027-07-01T00:00:00Z' }, 'standup'), [TZID_HREF]);
+    });
+
+    test('the cap counts only entries that pass the filter', async () => {
+        const inRange: [string, string][] = Array.from({ length: MAX_SERIES_WITHOUT_OCCURRENCES }, (_, index) => {
+            const uid = `SYNTH-SWO-IN-${String(index).padStart(2, '0')}`;
+            return [href(uid), TZID_SERIES.replace('UID:SYNTH-SWO-TZID', `UID:${uid}`)];
+        });
+        // Their only deleted occurrence is on 2027-06-20, inside the padding of RANGE (2027-06-08) but not in it.
+        const padding: [string, string][] = ['A', 'B', 'C'].map(name => [href(`SYNTH-SWO-PAD-${name}`),
+            storedSeries(`SYNTH-SWO-PAD-${name}`, 'DTSTART:20270620T180000Z', 'DTEND:20270620T190000Z', 'FREQ=WEEKLY;INTERVAL=12;COUNT=2', ['EXDATE:20270620T180000Z'])]);
+        const { result, stripped, output } = await readOver([...inRange, ...padding], RANGE);
+        expect(stripped.length).toBe(MAX_SERIES_WITHOUT_OCCURRENCES + 3);
+        expect(result.seriesWithoutOccurrences.map(entry => entry.resource_href)).toEqual(inRange.map(([at]) => at));
+        expect<unknown>([output.series_without_occurrences?.length, output.series_without_occurrences_truncated, output.complete]).toEqual([MAX_SERIES_WITHOUT_OCCURRENCES, undefined, true]);
+    });
+});
+
 describe('search_events includes an entry only when it matches the query', () => {
     test('a title or description match includes it; a miss, or a match outside the given fields, does not', async () => {
         const { read } = setup();
@@ -321,6 +439,14 @@ describe('shaping the entries', () => {
         expect<unknown>([output.series_without_occurrences_truncated, output.complete]).toEqual([true, false]);
         // The strict schema holds the formula: a cut that claims completeness is refused.
         expect(eventsOutputSchema.safeParse({ ...output, complete: true }).success).toBe(false);
+    });
+
+    test('the range-margin note is for an entry matched only through the margin that the result shows, as for events', () => {
+        const entries = Array.from({ length: MAX_SERIES_WITHOUT_OCCURRENCES + 1 }, (_, index) => entry(index));
+        const notesFor = (flagged: SeriesWithoutOccurrences) => eventsOutputSchema.parse(shapeEventsResult({ ...read(entries), seriesByMargin: new Set([flagged]) }, { limit: 25, wire: legacy }).structuredContent).notes;
+        expect(notesFor(entries[0] ?? entry(0))).toEqual([RANGE_MARGIN_NOTE]);
+        // The flagged entry is past the cap, so the result does not hold it.
+        expect(notesFor(entries[MAX_SERIES_WITHOUT_OCCURRENCES] ?? entry(0))).toBeUndefined();
     });
 
     test('shortened, with the flag, when the envelope cannot otherwise fit the wire cap', () => {

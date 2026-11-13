@@ -6,7 +6,7 @@
 import ICAL from 'ical.js';
 import { describeComponentAttachments, parseContentLine, prescanAttachProperties, unfoldLines, type AttachPrescan } from './attachments';
 import { createReadBudget, type ResourceWork } from './budget';
-import { MAX_EXCLUDED_STARTS, MAX_EXPANDED_VEVENTS_PER_CALENDAR, MAX_ICS_NESTING, MAX_ORIGINAL_VEVENTS, MAX_PARAMETERS_PER_PROPERTY, MAX_RESOURCE_BYTES, REPEAT_RULE_MAX } from './limits';
+import { MAX_EXPANDED_VEVENTS_PER_CALENDAR, MAX_ICS_NESTING, MAX_ORIGINAL_VEVENTS, MAX_PARAMETERS_PER_PROPERTY, MAX_RESOURCE_BYTES, REPEAT_RULE_MAX } from './limits';
 import {
     IcalError, type AttachmentDescriptor, type EventComponent, type ExpandedResource, type JCalValue, type OriginalResource, type RawProperty, type RecurrenceIdInfo, type StoredTime,
     type StrippedSeries,
@@ -382,21 +382,17 @@ function strippedSeries(calendarData: string, parsed: ParsedResource): StrippedS
     if (starts.length !== 1 || start === undefined || !plainTimeParameters(start)) { return null; }
     if (rules.length !== 1 || rule === undefined || rule.parameters.size !== 0 || !REPEAT_RULE_RE.test(rule.value)) { return null; }
     const excludedStarts: StoredTime[] = [];
-    let excludedCount = 0;
     for (const line of raw) {
         if (line.name !== 'exdate') { continue; }
         const times = rawExcludedStarts(line);
         if (times === null) { return null; }
-        for (const time of times) {
-            if (excludedStarts.length < MAX_EXCLUDED_STARTS) { excludedStarts.push(time); }
-            excludedCount++;
-        }
+        for (const time of times) { excludedStarts.push(time); }
     }
     // The jCal must hold as many EXDATE values as the raw text: a different split means the two readings disagree.
     let parsedCount = 0;
     for (const property of master.properties.get('exdate') ?? []) { parsedCount += property.values.length; }
-    if (parsedCount !== excludedCount) { return null; }
-    return { master, repeatRule: rule.value, excludedStarts, excludedCount };
+    if (parsedCount !== excludedStarts.length) { return null; }
+    return { master, repeatRule: rule.value, excludedStarts };
 }
 
 function expandedFrom(parsed: ParsedResource): ExpandedResource {
