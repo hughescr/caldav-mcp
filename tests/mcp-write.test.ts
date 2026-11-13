@@ -76,7 +76,20 @@ describe('the write tools through the MCP boundary, in both protocol eras', () =
         expect(byName.get('delete_event')?.description).toContain('calendar:delete');
         expect(byName.get('get_event')?.description).toContain('travel_time');
         expect(JSON.stringify(byName.get('create_event')?.inputSchema)).not.toContain('attendee');
-        expect(JSON.stringify(byName.get('update_event')?.inputSchema)).not.toContain('this_and_future');
+        for (const name of ['update_event', 'delete_event']) {
+            const input = byName.get(name)?.inputSchema as { properties: Record<string, { enum?: string[] }> } | undefined;
+            expect<unknown>([name, input?.properties['edit_scope']?.enum, 'recurrence_id' in (input?.properties ?? {})]).toEqual([name, ['all', 'this', 'this_and_future'], true]);
+        }
+        const update = byName.get('update_event')?.description ?? '';
+        // What each scope does, what is refused, and the measured guest mail (probe Run 8).
+        for (const phrase of ['"this" with recurrence_id', 'this_and_future', 'created_series', 'split_incomplete', 'exceptions', '"drop"', '"shift"', 'occurrence_identity_unprovable', 'refused at the first occurrence', 'RDATE', 'changing one occurrence (this) sends an update', 'a new invitation for the new one']) {
+            expect<unknown>([phrase, update.includes(phrase)]).toEqual([phrase, true]);
+        }
+        const remove = byName.get('delete_event')?.description ?? '';
+        for (const phrase of ['"this" with recurrence_id', '"this_and_future"', 'deleting a whole event sends a cancellation', 'deleting one occurrence sent no mail', 'occurrence_identity_unprovable']) {
+            expect<unknown>([phrase, remove.includes(phrase)]).toEqual([phrase, true]);
+        }
+        expect(JSON.stringify(byName.get('update_event')?.inputSchema)).not.toContain('attendee');
         expect(h.fake.calls).toEqual([]);
     });
 
@@ -139,9 +152,12 @@ describe('the write tools through the MCP boundary, in both protocol eras', () =
                 ['create_event', { ...CREATE, status: 'CANCELLED' }],
                 ['update_event', { calendar_id: WORK, resource_href: SINGLE_HREF, expected_version: '*', changes: { title: 'CANARY' } }],
                 ['update_event', { calendar_id: WORK, resource_href: SINGLE_HREF, expected_version: 'W/"x"', changes: { title: 'CANARY' } }],
-                ['update_event', { calendar_id: WORK, resource_href: SINGLE_HREF, expected_version: '"x"', edit_scope: 'this', changes: { title: 'CANARY' } }],
+                ['update_event', { calendar_id: WORK, resource_href: SINGLE_HREF, expected_version: '"x"', edit_scope: 'CANARY', changes: { title: 'CANARY' } }],
+                ['update_event', { calendar_id: WORK, resource_href: SINGLE_HREF, expected_version: '"x"', edit_scope: 'this', recurrence_id: 'occ1_CANARY', changes: { title: 'x' } }],
+                ['update_event', { calendar_id: WORK, resource_href: SINGLE_HREF, expected_version: '"x"', edit_scope: 'all', exceptions: 'CANARY', changes: { title: 'x' } }],
                 ['update_event', { calendar_id: WORK, resource_href: SINGLE_HREF, changes: { title: 'CANARY' } }],
-                ['delete_event', { calendar_id: WORK, resource_href: SINGLE_HREF, expected_version: '"x"', edit_scope: 'this_and_future' }],
+                ['delete_event', { calendar_id: WORK, resource_href: SINGLE_HREF, expected_version: '"x"', edit_scope: 'next' }],
+                ['delete_event', { calendar_id: WORK, resource_href: SINGLE_HREF, expected_version: '"x"', edit_scope: 'this', recurrence_id: 'occ2_CANARY' }],
                 ['delete_event', { calendar_id: WORK, resource_href: SINGLE_HREF }],
             ] as const) {
                 const reply = (await h.call(name, args, ALL, protocol)).reply;
@@ -201,14 +217,39 @@ describe('the write tools through the MCP boundary, in both protocol eras', () =
         test(`${protocol}: every write error, with the worst upstream summary and the longest id, fits 8 KiB`, async () => {
             const longest = [...KNOWN_PRECONDITIONS].sort((a, b) => b.length - a.length).slice(0, 8);
             const worstUpstream = { status: 409, content_type: 'xml' as const, preconditions: longest, detail: '"\\'.repeat(256), detail_truncated: true as const };
+            // A split's created_series at the longest path and ETag the schemas allow, and the exception counts.
+            const created = { resource_href: `/${'a'.repeat(2046)}/`.slice(0, 2048), expected_version: `"${'e'.repeat(1022)}"`, write_outcome: 'applied' as const };
             for (const code of toolErrorCodeSchema.options) {
-                const service: BoundCalendarService = { ...harness().service, create_event: async () => { throw new CalendarError(code, undefined, { reason: 'existing_resource_differs', field: 'travel_time', upstream: worstUpstream, differs: ['title', 'start', 'end', 'location', 'description', 'status', 'transparency', 'alarms', 'recurrence', 'travel_time'] }); } };
+                const service: BoundCalendarService = { ...harness().service, create_event: async () => { throw new CalendarError(code, undefined, { reason: 'split_occurrence_changed_supply_times', field: 'travel_time', upstream: worstUpstream, differs: ['title', 'start', 'end', 'location', 'description', 'status', 'transparency', 'alarms', 'recurrence', 'travel_time'], created_series: created, exceptions: { changed_occurrences: 2000, deleted_occurrences: 2000 } }); } };
                 const response = await handleMcp(request('tools/call', { name: 'create_event', arguments: CREATE }, protocol, '\u0000'.repeat(128)), { token: 't', clientId: 'c', scopes: READ_WRITE }, service);
                 const text = await response.text();
                 expect<unknown>([code, Buffer.byteLength(text) <= 8192]).toEqual([code, true]);
-                expect(JSON.parse(text).result.structuredContent.error.code).toBe(code === 'insufficient_scope' ? 'insufficient_scope' : code);
+                const error = JSON.parse(text).result.structuredContent.error;
+                expect(error.code).toBe(code === 'insufficient_scope' ? 'insufficient_scope' : code);
+                expect<unknown>([code, error.created_series, error.exceptions]).toEqual([code, created, { changed_occurrences: 2000, deleted_occurrences: 2000 }]);
             }
             expect(writeToolErrorCodeSchema.options.every(code => toolErrorCodeSchema.options.includes(code))).toBe(true);
+        });
+
+        test(`${protocol}: a split whose second write fails says the new series was saved, through the real pipeline`, async () => {
+            const h = harness();
+            const series = ['BEGIN:VCALENDAR', 'VERSION:2.0', 'BEGIN:VEVENT', 'UID:mcp-series', 'DTSTAMP:20261101T120000Z', 'DTSTART:20270105T150000Z', 'DTEND:20270105T153000Z', 'RRULE:FREQ=WEEKLY;UNTIL=20270301T000000Z', 'SUMMARY:Standup', 'END:VEVENT', 'END:VCALENDAR', ''].join('\r\n');
+            const href = `${WORK}mcp-series.ics`;
+            const etag = h.fake.seed(WORK, href, series);
+            const args = { calendar_id: WORK, resource_href: href, expected_version: etag, edit_scope: 'this_and_future', recurrence_id: 'occ1_20270126T150000Z', operation_id: 'op-mcp-split-1', changes: { title: 'New' } };
+            h.fake.failNextWrite({ kind: 'none' }, { kind: 'status', status: 403, apply: false });
+            const incomplete = (await h.call('update_event', args, READ_WRITE, protocol)).reply.result.structuredContent.error;
+            expect<unknown>([incomplete.code, incomplete.reason, incomplete.created_series.write_outcome]).toEqual(['split_incomplete', 'second_write_refused', 'applied']);
+            expect(incomplete.message).toContain('WAS saved');
+            expect(incomplete.message).toContain('show twice');
+            // The retry's first write finds the new series (412); its second is lost.
+            h.fake.failNextWrite({ kind: 'none' }, { kind: 'uncertain', apply: false });
+            const unknown =(await h.call('update_event', args, READ_WRITE, protocol)).reply.result.structuredContent.error;
+            expect<unknown>([unknown.code, unknown.created_series.write_outcome]).toEqual(['outcome_unknown', 'desired_state_present']);
+            expect(unknown.message).toContain('The new series for the occurrences from the split on was saved');
+            const done = (await h.call('update_event', args, READ_WRITE, protocol)).reply.result.structuredContent;
+            expect(writeEventResultSchema.parse(done)).toEqual(done);
+            expect<unknown>([done.write_outcome, done.created_series.write_outcome, done.event.title]).toEqual(['applied', 'desired_state_present', 'New']);
         });
 
         test(`${protocol}: forged extras are dropped: only fixed enums and a schema-valid upstream summary pass`, async () => {
