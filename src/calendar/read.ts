@@ -15,7 +15,7 @@ import type {
 } from './event-schemas';
 import { parseExpandedResource, parseOriginalResource } from './ical';
 import {
-    CALENDAR_CONCURRENCY, DISPLAY_NAME_MAX, ETAG_MAX, ETAG_MIN, MAX_DISCOVERED_CALENDARS, MAX_MEMBERSHIP_BYTES, MAX_REPORT_BYTES, MAX_RESOURCES_PER_REPORT, MAX_UNREADABLE,
+    CALENDAR_CONCURRENCY, DISPLAY_NAME_MAX, ETAG_MAX, ETAG_MIN, MAX_DISCOVERED_CALENDARS, MAX_MEMBERSHIP_BYTES, MAX_MULTIGET_HREFS, MAX_REPORT_BYTES, MAX_RESOURCES_PER_REPORT, MAX_UNREADABLE,
 } from './limits';
 import { BudgetError, IcalError, isCanonicalPath, type EventComponent, type EventTime, type Interval, type OriginalResource } from './model';
 import { normalizeFullEvent, normalizeSlimEvent, sanitizeDisplayText } from './normalize';
@@ -472,16 +472,27 @@ export async function readCalendarMembership(deps: ReadDeps): Promise<{ members:
  * Null when iCloud reports the href absent. Throws ReadError.
  */
 export async function readStoredResource(deps: ReadDeps, reporter: UnauthorizedReporter, calendarId: string, href: string): Promise<CalendarResource | null> {
-    const lookups = await detailRequest(reporter, () => deps.backend.multigetEvents(deps.auth, deps.discovery, { calendarId, hrefs: [href] }, callOptions(deps.budget, MAX_REPORT_BYTES)));
-    const [lookup, ...extra] = lookups;
-    if (lookup === undefined || extra.length > 0) { throw new ReadError('upstream_error'); }
-    if (lookup.kind === 'not_found') {
-        if (lookup.href !== href) { throw new ReadError('upstream_error'); }
-        return null;
+    const [found] = await readStoredResources(deps, reporter, calendarId, [href]);
+    return found ?? null;
+}
+
+/**
+ * ONE calendar-multiget of several originals of one calendar (distinct hrefs, at most MAX_MULTIGET_HREFS), validated like
+ * get_event's: exactly one answer per href, in any order, the same href back, a strong ETag and text data. Returns the
+ * resources in the order asked, null where iCloud reports one absent. Throws ReadError.
+ */
+export async function readStoredResources(deps: ReadDeps, reporter: UnauthorizedReporter, calendarId: string, hrefs: readonly string[]): Promise<(CalendarResource | null)[]> {
+    if (hrefs.length === 0 || hrefs.length > MAX_MULTIGET_HREFS || new Set(hrefs).size !== hrefs.length) { throw new ReadError('invalid_input'); }
+    const lookups = await detailRequest(reporter, () => deps.backend.multigetEvents(deps.auth, deps.discovery, { calendarId, hrefs }, callOptions(deps.budget, MAX_REPORT_BYTES)));
+    if (lookups.length !== hrefs.length) { throw new ReadError('upstream_error'); }
+    const answers = new Map<string, CalendarResource | null>();
+    for (const lookup of lookups) {
+        const href = lookup.kind === 'not_found' ? lookup.href : lookup.resource.href;
+        if (!hrefs.includes(href) || answers.has(href)) { throw new ReadError('upstream_error'); }
+        if (lookup.kind === 'found' && (!validEtag(lookup.resource.etag) || typeof lookup.resource.calendarData !== 'string')) { throw new ReadError('upstream_error'); }
+        answers.set(href, lookup.kind === 'found' ? lookup.resource : null);
     }
-    const found = lookup.resource;
-    if (found.href !== href || !validEtag(found.etag) || typeof found.calendarData !== 'string') { throw new ReadError('upstream_error'); }
-    return found;
+    return hrefs.map(href => answers.get(href) ?? null);
 }
 
 /** The expanded instances of one resource in a window, or `absent` when iCloud returned no instance of it there. */

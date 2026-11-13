@@ -49,6 +49,8 @@ import { FAKE_DISCOVERY } from './fake-caldav';
  * - `expansionHook` lets a test replace the expanded text of one resource (an injection, labelled where used).
  */
 export type WriteFault =
+    /** This write is answered normally (a placeholder, so a later fault hits the second write of a split). */
+    | { kind: 'none' }
     | { kind: 'unauthorized' }
     | { kind: 'redirect'; status: number }
     /** Answer `status` (with `upstream`), after applying the write normally when `apply` is true. */

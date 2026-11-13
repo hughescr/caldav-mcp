@@ -510,14 +510,17 @@ describe('update_event', () => {
         expect(h.fake.count('putEvent')).toBe(0);
     });
 
-    test('series target rules: a scope is required; time and rule changes are not supported yet; occurrence-only resources are refused', async () => {
+    test('series target rules: a scope is required; a move or rule change of a series with exceptions needs a choice; occurrence-only resources are refused', async () => {
         const h = harness();
         const etag = h.fake.seed(WORK, SERIES_HREF, SERIES);
         const base = { calendar_id: WORK, resource_href: SERIES_HREF, expected_version: etag };
+        const counts = { exceptions: { changed_occurrences: 1, deleted_occurrences: 1 } };
         expect(await failure(() => update(h, { ...base, changes: { title: 'x' } }))).toEqual({ code: 'invalid_input', reason: 'edit_scope_required', field: 'edit_scope' });
-        expect(await failure(() => update(h, { ...base, edit_scope: 'all', changes: { start: '2026-12-01T15:00:00Z', end: '2026-12-01T16:00:00Z' } }))).toEqual({ code: 'edit_not_supported', reason: 'series_time_change_not_supported' });
-        expect(await failure(() => update(h, { ...base, edit_scope: 'all', changes: { recurrence: { rrule: 'FREQ=DAILY' } } }))).toEqual({ code: 'edit_not_supported', reason: 'series_rule_change_not_supported' });
-        expect(await failure(() => update(h, { ...base, edit_scope: 'all', changes: { recurrence: null } }))).toEqual({ code: 'edit_not_supported', reason: 'series_rule_change_not_supported' });
+        expect(await failure(() => update(h, { ...base, edit_scope: 'all', changes: { start: '2026-12-01T15:00:00Z', end: '2026-12-01T16:00:00Z' } }))).toEqual({ code: 'edit_not_supported', reason: 'exceptions_choice_required', ...counts });
+        expect(await failure(() => update(h, { ...base, edit_scope: 'all', changes: { recurrence: { rrule: 'FREQ=DAILY' } } }))).toEqual({ code: 'edit_not_supported', reason: 'exceptions_choice_required', ...counts });
+        expect(await failure(() => update(h, { ...base, edit_scope: 'all', changes: { recurrence: null } }))).toEqual({ code: 'edit_not_supported', reason: 'exceptions_choice_required', ...counts });
+        expect(await failure(() => update(h, { ...base, edit_scope: 'all', exceptions: 'shift', changes: { start: '2026-12-01T15:00:00Z', end: '2026-12-01T16:00:00Z' } }))).toEqual({ code: 'edit_not_supported', reason: 'exceptions_shift_not_utc' });
+        expect(await failure(() => update(h, { ...base, edit_scope: 'all', exceptions: 'shift', changes: { recurrence: { rrule: 'FREQ=DAILY' } } }))).toEqual({ code: 'edit_not_supported', reason: 'exceptions_shift_with_rule_change' });
         const detached = SERIES.replace(/BEGIN:VEVENT\r\nUID:SERIES-1\r\nDTSTAMP:20261101T120000Z[\s\S]*?END:VEVENT\r\n/u, '');
         const detachedEtag = h.fake.seed(WORK, `${WORK}detached.ics`, detached);
         expect(await failure(() => update(h, { calendar_id: WORK, resource_href: `${WORK}detached.ics`, expected_version: detachedEtag, edit_scope: 'all', changes: { title: 'x' } }))).toEqual({ code: 'edit_not_supported', reason: 'occurrence_only_resource' });

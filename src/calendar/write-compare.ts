@@ -95,6 +95,13 @@ export interface FieldLine {
     /** Upper-case property name. */
     readonly name: string;
     readonly line: string | null;
+    /**
+     * A property that may repeat (EXDATE): exactly these lines of that name, in any order, instead of one `line`. An
+     * `add` that keeps the stored lines uses `includes` instead: each of these one-value lines must be held by a stored
+     * line of the same name and parameters, alone or in a comma list.
+     */
+    readonly lines?: readonly string[] | undefined;
+    readonly includes?: readonly string[] | undefined;
 }
 
 /** What one component should hold after the request. */
@@ -120,12 +127,31 @@ function sameMultiset(a: readonly string[], b: readonly string[]): boolean {
     return true;
 }
 
+/**
+ * A stored line with the same name and parameter text as `wanted` (a one-value line this server wrote, such as an EXDATE)
+ * holds its value, alone or in a comma list. Values here are date/time digits, which never contain a colon.
+ */
+function holdsValue(line: string, wanted: string): boolean {
+    const cut = wanted.lastIndexOf(':');
+    const prefix = wanted.slice(0, cut + 1);
+    return cut > 0 && line.startsWith(prefix) && line.slice(prefix.length).split(',').includes(wanted.slice(cut + 1));
+}
+
 /** The requested fields of one component that the stored component does not hold as requested, in request order. */
 export function differingFields(stored: StoredEvent | undefined, request: ComponentRequest): StoredField[] {
     const differs: StoredField[] = [];
     for (const field of request.fields) {
         const lines = stored?.lines.filter(line => line.name === field.name).map(line => line.text) ?? null;
-        const ok = lines !== null && (field.line === null ? lines.length === 0 : lines.length === 1 && lines[0] === field.line);
+        let ok: boolean;
+        if (lines === null) {
+            ok = false;
+        } else if (field.lines !== undefined) {
+            ok = sameMultiset(lines, field.lines);
+        } else if (field.includes !== undefined) {
+            ok = field.includes.every(wanted => lines.some(line => holdsValue(line, wanted)));
+        } else {
+            ok = field.line === null ? lines.length === 0 : lines.length === 1 && lines[0] === field.line;
+        }
         if (!ok && !differs.includes(field.field)) { differs.push(field.field); }
     }
     if (request.triggers !== undefined && (stored === undefined || !sameMultiset(stored.triggers, request.triggers))) { differs.push('alarms'); }
@@ -145,8 +171,21 @@ export function storedComponent(events: readonly StoredEvent[], rid: string | nu
  *   client added since the original was read counts too. The `rid` of the request is ignored.
  */
 export type StoredExpectation =
-    | { readonly kind: 'components'; readonly requests: readonly ComponentRequest[] }
+    | {
+        readonly kind: 'components';
+        readonly requests: readonly ComponentRequest[];
+        /** No VEVENT other than the requested ones (a series move that dropped its overrides). */
+        readonly exclusive?: boolean | undefined;
+        /** RECURRENCE-ID lines no VEVENT may have (overrides a split or a delete removed). */
+        readonly absentRids?: readonly string[] | undefined;
+    }
     | { readonly kind: 'every_event'; readonly request: ComponentRequest };
+
+/** The component-set rules of a `components` expectation: no extra VEVENT when exclusive, no removed override left. */
+function componentSetHolds(events: readonly StoredEvent[], expectation: Extract<StoredExpectation, { kind: 'components' }>): boolean {
+    if (expectation.exclusive === true && events.length !== expectation.requests.length) { return false; }
+    return (expectation.absentRids ?? []).every(rid => !events.some(event => event.rid === rid));
+}
 
 function holdsIn(stored: StoredEvent, request: ComponentRequest): boolean {
     return differingFields(stored, request).length === 0 && (request.absent ?? []).every(name => !stored.lines.some(line => line.name === name));
@@ -159,7 +198,7 @@ function holdsIn(stored: StoredEvent, request: ComponentRequest): boolean {
 export function holdsExpectation(events: readonly StoredEvent[] | null, expectation: StoredExpectation): boolean {
     if (events === null) { return false; }
     if (expectation.kind === 'components') {
-        return expectation.requests.every(request => {
+        return componentSetHolds(events, expectation) && expectation.requests.every(request => {
             const stored = storedComponent(events, request.rid);
             return stored !== undefined && holdsIn(stored, request);
         });
@@ -176,6 +215,8 @@ export function storedDifferences(events: readonly StoredEvent[] | null, expecta
         for (const request of expectation.requests) {
             for (const field of differingFields(events === null ? undefined : storedComponent(events, request.rid), request)) { fields.add(field); }
         }
+        // An override that should be gone, or one more than requested, changes the series' set of occurrences.
+        if (events !== null && !componentSetHolds(events, expectation)) { fields.add('recurrence'); }
     } else if (events === null || events.length === 0) {
         for (const field of differingFields(undefined, expectation.request)) { fields.add(field); }
     } else {
