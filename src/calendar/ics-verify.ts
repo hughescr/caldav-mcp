@@ -78,7 +78,9 @@ export type AlarmExpectation =
 export type ExdateExpectation =
     /** Every EXDATE line of before is kept (same text, same relative order); exactly these are added. */
     | { readonly kind: 'added'; readonly values: readonly ExpectedValue[] }
-    | { readonly kind: 'removed_all' };
+    | { readonly kind: 'removed_all' }
+    /** None of before's EXDATE lines is left; exactly these lines (one decoded property each, any order) are present. */
+    | { readonly kind: 'replaced'; readonly lines: readonly ExpectedValue[] };
 
 /** The master VEVENT, or the override whose unfolded RECURRENCE-ID logical line equals `recurrenceId` exactly. */
 export type TargetSelector = { readonly kind: 'master' } | { readonly kind: 'override'; readonly recurrenceId: string };
@@ -92,6 +94,11 @@ export interface TargetExpectation {
     readonly exdates?: ExdateExpectation | undefined;
     /** Omitted: compared like any other property. `null`: absent afterwards. Text: one RRULE decoding to the same rule. */
     readonly rrule?: string | null | undefined;
+    /**
+     * Override targets only: the decoded RECURRENCE-ID the component has afterwards (a series move shifts it). Omitted:
+     * unchanged. The target is found by its old RECURRENCE-ID text before and at the same position afterwards.
+     */
+    readonly recurrenceId?: ExpectedValue | undefined;
 }
 
 export interface AddedOverrideExpectation {
@@ -102,6 +109,12 @@ export interface AddedOverrideExpectation {
     readonly companionsRemoved?: readonly Companion[] | undefined;
     /** `copied`: exactly the master's VALARMs, line-identical. */
     readonly alarms: { readonly kind: 'copied' } | { readonly kind: 'replaced'; readonly alarms: readonly ExpectedAlarm[] } | { readonly kind: 'removed' };
+    /**
+     * The one narrow exception to "no new ATTENDEE/ORGANIZER" (set only when the grant includes calendar:invite): the new
+     * override holds byte-equal copies of the master's ATTENDEE and ORGANIZER lines, every one of them and nothing else, as
+     * an occurrence of a series with guests must (probe Run 8, I6). Without it a new override may hold none.
+     */
+    readonly schedulingCopied?: boolean | undefined;
 }
 
 /**
@@ -118,6 +131,8 @@ export interface EditExpectation {
     readonly targets?: readonly TargetExpectation[] | undefined;
     readonly addOverride?: AddedOverrideExpectation | undefined;
     readonly removeOverride?: { readonly recurrenceId: string } | undefined;
+    /** Several whole overrides removed (a split, a series move that drops its exceptions); combined with `removeOverride`. */
+    readonly removeOverrides?: readonly { readonly recurrenceId: string }[] | undefined;
 }
 
 /**
@@ -538,37 +553,53 @@ function isDisplayAlarm(doc: Doc, node: VNode): boolean {
     return actions.length === 1 && actions[0]?.name === 'ACTION' && actions[0].paramNames.length === 0 && actions[0].value.toUpperCase() === 'DISPLAY';
 }
 
-/** Every after item under a key must be in before under the same key (or under one of `extraSources` for that key). */
+/** Every after item under a key must be in before under the same key, or under its entry in `extraSources` when it has one. */
 function subset(after: Map<string, Map<string, number>>, before: Map<string, Map<string, number>>, reason: OutcomeFailure, label: string, extraSources: ReadonlyMap<string, string>): void {
     for (const [key, items] of after) {
-        const source = before.get(key) ?? (extraSources.has(key) ? before.get(extraSources.get(key) ?? '') : undefined);
+        const source = extraSources.has(key) ? before.get(extraSources.get(key) ?? '') : before.get(key);
         for (const [item, count] of items) {
             if ((source?.get(item) ?? 0) < count) { refuse(reason, label); }
         }
     }
 }
 
+interface CopySources {
+    /** An override VEVENT new in `after` may hold copies of the master's attachments and non-DISPLAY alarms. */
+    readonly masterCopies: boolean;
+    /** ... and of the master's scheduling lines (calendar:invite; AddedOverrideExpectation.schedulingCopied). */
+    readonly schedulingCopies: boolean;
+    /** Override tops renamed by a RECURRENCE-ID change: after top → before top (the same component, shifted). */
+    readonly renamed: ReadonlyMap<string, string>;
+}
+
+const NO_COPIES: CopySources = { masterCopies: false, schedulingCopies: false, renamed: new Map() };
+
 /**
- * `masterCopies`: an override VEVENT that is new in `after` may hold copies of the master's attachments and non-DISPLAY
- * alarms (the editor copies them into a new override); never its scheduling lines. Set only when an override is expected.
+ * Every scheduling line, attachment and non-DISPLAY alarm afterwards was already in the same component before. A renamed
+ * override is the same component; a new override may copy the master's as `sources` allows. Scheduling lines of a new
+ * override are allowed only with `schedulingCopies`; the added-override check then requires them to be exact copies.
  */
-function hardRules(before: Reading | null, after: Reading, masterCopies: boolean): void {
+function hardRules(before: Reading | null, after: Reading, sources: CopySources): void {
     const empty: Inventory = { scheduling: new Map(), attach: new Map(), alarms: new Map() };
     const old = before === null ? empty : inventory(before);
     const now = inventory(after);
-    const copies = new Map<string, string>();
-    if (masterCopies && before !== null) {
-        const known = new Set(before.events.map(event => (event.rid === null ? MASTER_KEY : overrideKey(event.rid))));
-        for (const map of [now.attach, now.alarms]) {
-            for (const key of map.keys()) {
-                const [top, path] = JSON.parse(key) as [string, string];
-                if (top.startsWith(OVERRIDE_PREFIX) && !known.has(top)) { copies.set(key, JSON.stringify([MASTER_KEY, path])); }
+    const known = new Set(before === null ? [] : before.events.map(event => (event.rid === null ? MASTER_KEY : overrideKey(event.rid))));
+    const sourcesFor = (map: Map<string, Map<string, number>>, fromMaster: boolean): Map<string, string> => {
+        const copies = new Map<string, string>();
+        for (const key of map.keys()) {
+            const [top, path] = JSON.parse(key) as [string, string];
+            const renamed = sources.renamed.get(top);
+            if (renamed !== undefined) {
+                copies.set(key, JSON.stringify([renamed, path]));
+            } else if (fromMaster && before !== null && top.startsWith(OVERRIDE_PREFIX) && !known.has(top)) {
+                copies.set(key, JSON.stringify([MASTER_KEY, path]));
             }
         }
-    }
-    subset(now.scheduling, old.scheduling, 'scheduling_added', 'ATTENDEE/ORGANIZER', new Map());
-    subset(now.attach, old.attach, 'attachment_added', 'ATTACH', copies);
-    subset(now.alarms, old.alarms, 'alarm_action_added', 'VALARM', copies);
+        return copies;
+    };
+    subset(now.scheduling, old.scheduling, 'scheduling_added', 'ATTENDEE/ORGANIZER', sourcesFor(now.scheduling, sources.schedulingCopies));
+    subset(now.attach, old.attach, 'attachment_added', 'ATTACH', sourcesFor(now.attach, sources.masterCopies));
+    subset(now.alarms, old.alarms, 'alarm_action_added', 'VALARM', sourcesFor(now.alarms, sources.masterCopies));
 }
 
 // ---- Expectation checks ----
@@ -704,6 +735,13 @@ function checkTarget(before: Reading, beforeView: EventView, after: Reading, aft
     checkExpected(after.doc, afterView, plan);
     const handled = new Set<string>([...plan.expected.keys(), ...plan.companions]);
 
+    if (target.recurrenceId !== undefined) {
+        handled.add('RECURRENCE-ID');
+        const lines = directWithName(after.doc, afterView.node, 'RECURRENCE-ID');
+        const rid = afterView.parsed.recurrenceId?.raw;
+        if (lines.length !== 1 || rid === undefined || rawKey(rid) !== expectedKey('RECURRENCE-ID', target.recurrenceId)) { refuse('override_mismatch', 'RECURRENCE-ID'); }
+    }
+
     if (target.rrule !== undefined) {
         handled.add('RRULE');
         const rules = afterView.parsed.properties.get('rrule') ?? [];
@@ -747,6 +785,20 @@ function checkExdates(before: Reading, beforeView: EventView, after: Reading, af
     if (typeof exdates !== 'object' || exdates === null) { refuse('expectation_invalid', 'EXDATE'); }
     if (exdates.kind === 'removed_all') {
         if (nowLines.length > 0 || nowParsed.length > 0) { refuse('exdate_mismatch', 'EXDATE'); }
+        return;
+    }
+    if (exdates.kind === 'replaced') {
+        if (!Array.isArray(exdates.lines) || nowLines.length !== exdates.lines.length || nowParsed.length !== exdates.lines.length) { refuse('exdate_mismatch', 'EXDATE'); }
+        const wanted = new Map<string, number>();
+        for (const value of exdates.lines) {
+            const key = expectedKey('EXDATE', value);
+            wanted.set(key, (wanted.get(key) ?? 0) + 1);
+        }
+        for (const property of nowParsed) {
+            const left = wanted.get(rawKey(property)) ?? 0;
+            if (left === 0) { refuse('exdate_mismatch', 'EXDATE'); }
+            wanted.set(rawKey(property), left - 1);
+        }
         return;
     }
     if (exdates.kind !== 'added' || !Array.isArray(exdates.values) || exdates.values.length === 0) { return refuse('expectation_invalid', 'EXDATE'); }
@@ -860,6 +912,10 @@ function validateEditExpectation(expectation: EditExpectation): void {
         if (keys.has(key)) { refuse('expectation_invalid', 'target'); }
         keys.add(key);
         propertyPlan(target.properties, target.companionsRemoved, TARGET_RESERVED);
+        if (target.recurrenceId !== undefined) {
+            if (target.component.kind !== 'override') { refuse('expectation_invalid', 'RECURRENCE-ID'); }
+            validValue(target.recurrenceId, 'RECURRENCE-ID');
+        }
         if (target.alarms !== undefined) { validAlarmExpectation(target.alarms, ['unchanged', 'replaced', 'removed']); }
         if (target.rrule !== undefined && target.rrule !== null) { decodeRrule(target.rrule); }
         const exdates = target.exdates;
@@ -868,6 +924,9 @@ function validateEditExpectation(expectation: EditExpectation): void {
             if (exdates.kind === 'added') {
                 if (!Array.isArray(exdates.values) || exdates.values.length === 0) { refuse('expectation_invalid', 'EXDATE'); }
                 for (const value of exdates.values) { validValue(value, 'EXDATE'); }
+            } else if (exdates.kind === 'replaced') {
+                if (!Array.isArray(exdates.lines) || exdates.lines.length === 0) { refuse('expectation_invalid', 'EXDATE'); }
+                for (const value of exdates.lines) { validValue(value, 'EXDATE'); }
             } else if (exdates.kind !== 'removed_all') {
                 refuse('expectation_invalid', 'EXDATE');
             }
@@ -882,7 +941,24 @@ function validateEditExpectation(expectation: EditExpectation): void {
     if (removeOverride !== undefined && (typeof removeOverride !== 'object' || removeOverride === null || typeof removeOverride.recurrenceId !== 'string' || removeOverride.recurrenceId === '')) {
         refuse('expectation_invalid', 'removeOverride');
     }
-    if (removeOverride !== undefined && keys.has(overrideKey(removeOverride.recurrenceId))) { refuse('expectation_invalid', 'target'); }
+    const removals = expectation.removeOverrides;
+    if (removals !== undefined && !Array.isArray(removals)) { refuse('expectation_invalid', 'removeOverride'); }
+    for (const removal of removals ?? []) {
+        if (typeof removal !== 'object' || removal === null || typeof removal.recurrenceId !== 'string' || removal.recurrenceId === '') { refuse('expectation_invalid', 'removeOverride'); }
+    }
+    const removed = removedRids(expectation);
+    if (removed.size !== (removeOverride === undefined ? 0 : 1) + (removals?.length ?? 0)) { refuse('expectation_invalid', 'removeOverride'); }
+    for (const rid of removed) {
+        if (keys.has(overrideKey(rid))) { refuse('expectation_invalid', 'target'); }
+    }
+}
+
+/** Every override RECURRENCE-ID text the expectation removes (`removeOverride` and `removeOverrides`). */
+function removedRids(expectation: EditExpectation): Set<string> {
+    const rids = new Set<string>();
+    if (expectation.removeOverride !== undefined) { rids.add(expectation.removeOverride.recurrenceId); }
+    for (const removal of expectation.removeOverrides ?? []) { rids.add(removal.recurrenceId); }
+    return rids;
 }
 
 function lineList(doc: Doc, node: VNode): string[] {
@@ -898,12 +974,30 @@ export function verifyEditOutcome(before: string, after: string, expectation: Ed
         validateEditExpectation(expectation);
         const old = read(before, 'before_unparseable', options);
         const now = read(after, 'after_unparseable', options);
-        hardRules(old, now, expectation.addOverride !== undefined);
         // Targets by component key: every lookup below is O(1), so checking every component of a series stays linear.
         const targets = new Map<string, TargetExpectation>();
         for (const target of targetList(expectation)) { targets.set(selectorKey(validSelector(target.component)), target); }
         const eventKey = (event: EventView | undefined): string | undefined => (event === undefined ? undefined : event.rid === null ? MASTER_KEY : overrideKey(event.rid));
         const masterTarget = targets.get(MASTER_KEY);
+        // A target whose RECURRENCE-ID is expected to change: the old key before, the same component afterwards.
+        const renamedKey = new Map<string, ExpectedValue>();
+        for (const [key, target] of targets) {
+            if (target.recurrenceId !== undefined) { renamedKey.set(key, target.recurrenceId); }
+        }
+        // The hard rules come first, so a forbidden line is reported as such. A renamed override's lines are judged against
+        // the same component before: the after override whose RECURRENCE-ID decodes to the expected value (pairing below
+        // then requires it at the target's position).
+        const afterByRid = new Map<string, string>();
+        for (const event of now.events) {
+            const raw = event.parsed.recurrenceId?.raw;
+            if (raw !== undefined && event.rid !== null) { afterByRid.set(rawKey(raw), event.rid); }
+        }
+        const renamedTops = new Map<string, string>();
+        for (const [key, value] of renamedKey) {
+            const rid = afterByRid.get(expectedKey('RECURRENCE-ID', value));
+            if (rid !== undefined) { renamedTops.set(overrideKey(rid), key); }
+        }
+        hardRules(old, now, { masterCopies: expectation.addOverride !== undefined, schedulingCopies: expectation.addOverride?.schedulingCopied === true, renamed: renamedTops });
 
         // Identity: one UID throughout, and the same kind. A single event becomes a series only by an expected RRULE, a
         // series a single event only by an expected RRULE removal on the master (and nothing else recurring left).
@@ -916,13 +1010,20 @@ export function verifyEditOutcome(before: string, after: string, expectation: Ed
         const oldCalendar = lineList(old.doc, old.doc.root);
         const nowCalendar = lineList(now.doc, now.doc.root);
         if (oldCalendar.length !== nowCalendar.length || oldCalendar.some((text, index) => text !== nowCalendar[index])) { refuse('calendar_changed'); }
-        const removedRid = expectation.removeOverride?.recurrenceId ?? null;
+        const removed = removedRids(expectation);
 
         // Pair the top-level components in order; the added override is the one after-component without a partner.
         const oldView = new Map(old.events.map(event => [event.node, event]));
         const nowView = new Map(now.events.map(event => [event.node, event]));
-        const oldTop = old.doc.root.children.filter(node => removedRid === null || oldView.get(node)?.rid !== removedRid);
-        if (removedRid !== null && old.events.filter(event => event.rid === removedRid).length !== 1) { refuse('override_mismatch', 'removeOverride'); }
+        const oldTop = old.doc.root.children.filter(node => {
+            const rid = oldView.get(node)?.rid;
+            return rid === undefined || rid === null || !removed.has(rid);
+        });
+        const ridCounts = new Map<string | null, number>();
+        for (const event of old.events) { ridCounts.set(event.rid, (ridCounts.get(event.rid) ?? 0) + 1); }
+        for (const rid of removed) {
+            if (ridCounts.get(rid) !== 1) { refuse('override_mismatch', 'removeOverride'); }
+        }
         // Each target names exactly one component of the original.
         const oldCounts = new Map<string, number>();
         for (const event of old.events) {
@@ -943,6 +1044,11 @@ export function verifyEditOutcome(before: string, after: string, expectation: Ed
             let partner = nowTop[cursor];
             const matches = (candidate: VNode | undefined): boolean => {
                 if (candidate === undefined) { return false; }
+                const renamed = key === undefined ? undefined : renamedKey.get(key);
+                if (isTarget && renamed !== undefined) {
+                    const rid = nowView.get(candidate)?.parsed.recurrenceId?.raw;
+                    return rid !== undefined && rawKey(rid) === expectedKey('RECURRENCE-ID', renamed);
+                }
                 if (isTarget) { return eventKey(nowView.get(candidate)) === key; }
                 return blockKey(blockOf(old.doc, node)) === blockKey(blockOf(now.doc, candidate));
             };
@@ -976,6 +1082,180 @@ export function verifyEditOutcome(before: string, after: string, expectation: Ed
     });
 }
 
+// ---- A new resource derived from a stored one (the future part of a split) ----
+
+/** Master lines the new master of a split never copies: identity, rules, times and stamps are expected, not copied. */
+export const DERIVED_NOT_COPIED: readonly string[] = ['UID', 'RECURRENCE-ID', 'RRULE', 'RDATE', 'EXRULE', 'EXDATE', 'DTSTART', 'DTEND', 'DURATION', 'DTSTAMP', 'CREATED', 'LAST-MODIFIED', 'SEQUENCE'];
+
+export interface DerivedMasterExpectation {
+    /** The written properties (DTSTART, DTEND, DTSTAMP, CREATED, LAST-MODIFIED, SEQUENCE and the changes), or absences. Never UID. */
+    readonly properties: readonly PropertyExpectation[];
+    readonly companionsRemoved?: readonly Companion[] | undefined;
+    /** Text: exactly one RRULE decoding to this rule. `copied`: the original master's one RRULE line, unchanged. */
+    readonly rrule: string | { readonly kind: 'copied' };
+    /** `copied`: exactly the original master's EXDATE lines, in order. `none`: no EXDATE. */
+    readonly exdates: 'copied' | 'none';
+    readonly alarms: { readonly kind: 'copied' } | { readonly kind: 'replaced'; readonly alarms: readonly ExpectedAlarm[] } | { readonly kind: 'removed' };
+}
+
+/** Derived by the caller from the request, the deterministic UID and the stored text (design 3.5). */
+export interface DerivedExpectation {
+    /** The new resource's UID (from operation_id); every VEVENT must carry it. */
+    readonly uid: string;
+    readonly master: DerivedMasterExpectation;
+    /** The original overrides copied whole (their UID line excepted), by RECURRENCE-ID text, in order. */
+    readonly overrides: readonly string[];
+    /**
+     * Set only when the grant includes calendar:invite. The ONE exception to "no new ATTENDEE/ORGANIZER": each VEVENT of
+     * the new resource then holds exactly the scheduling lines of the stored component it comes from (master from master,
+     * override from the same override), byte-equal, all of them and nothing else. Without it there may be none at all.
+     */
+    readonly schedulingCopied: boolean;
+}
+
+const UID_TEXT_RE = /^[A-Za-z0-9._~@+=-]{1,255}$/u;
+
+function validateDerived(expectation: DerivedExpectation): PropertyPlan {
+    if (typeof expectation !== 'object' || expectation === null || typeof expectation.uid !== 'string' || !UID_TEXT_RE.test(expectation.uid)) { return refuse('expectation_invalid', 'UID'); }
+    const master = expectation.master;
+    if (typeof master !== 'object' || master === null) { return refuse('expectation_invalid', 'master'); }
+    const plan = propertyPlan(master.properties, master.companionsRemoved, OVERRIDE_RESERVED);
+    const rule = master.rrule;
+    if (typeof rule === 'string') { decodeRrule(rule); } else if (typeof rule !== 'object' || rule === null || rule.kind !== 'copied') { refuse('expectation_invalid', 'RRULE'); }
+    if (master.exdates !== 'copied' && master.exdates !== 'none') { refuse('expectation_invalid', 'EXDATE'); }
+    validAlarmExpectation(master.alarms, ['copied', 'replaced', 'removed']);
+    if (!Array.isArray(expectation.overrides) || !expectation.overrides.every(rid => typeof rid === 'string' && rid !== '') || new Set(expectation.overrides).size !== expectation.overrides.length) {
+        refuse('expectation_invalid', 'overrides');
+    }
+    if (typeof expectation.schedulingCopied !== 'boolean') { refuse('expectation_invalid', 'schedulingCopied'); }
+    return plan;
+}
+
+/** Multiset equality of two line-text lists. */
+function sameLines(a: readonly string[], b: readonly string[]): boolean {
+    if (a.length !== b.length) { return false; }
+    const counts = new Map<string, number>();
+    for (const item of a) { counts.set(item, (counts.get(item) ?? 0) + 1); }
+    for (const item of b) {
+        const left = counts.get(item) ?? 0;
+        if (left === 0) { return false; }
+        counts.set(item, left - 1);
+    }
+    return true;
+}
+
+/** Scheduling lines of a whole component (nested components included), as unfolded texts. */
+function schedulingLinesOf(doc: Doc, node: VNode): string[] {
+    const lines: string[] = [];
+    for (let index = node.begin; index <= node.end; index++) {
+        const line = lineAt(doc, index);
+        if (isSchedulingName(line.name)) { lines.push(line.text); }
+    }
+    return lines;
+}
+
+/**
+ * Checks the new resource of a split against the request-derived expectation, with the stored resource it comes from.
+ * Holds only when: calendar level is exactly VERSION, PRODID and CALSCALE; the top-level components are the original's
+ * VTIMEZONEs (line-identical, in order), the new master, then exactly the expected overrides in order, nothing else; every
+ * VEVENT has the expected UID; the master holds the expected properties, the expected RRULE (or the original's line), the
+ * original's EXDATE lines (or none), the expected alarms, and otherwise exactly line-identical copies of every original
+ * master line not in {@link DERIVED_NOT_COPIED} and not expected; each copied override is line-identical to the original
+ * except its direct UID line, which is `UID:<uid>`; and the scheduling rule of {@link DerivedExpectation.schedulingCopied}.
+ * ATTACH and non-DISPLAY alarms can only be copies (by the copy rules above).
+ */
+export function verifyDerivedOutcome(before: string, after: string, expectation: DerivedExpectation, options: OutcomeOptions = {}): OutcomeVerdict {
+    return verdictOf(() => {
+        const plan = validateDerived(expectation);
+        const old = read(before, 'before_unparseable', options);
+        const now = read(after, 'after_unparseable', options);
+        const oldMaster = old.master ?? refuse('structure_mismatch', 'master');
+        const nowMaster = now.master ?? refuse('component_changed', 'VEVENT');
+        if (now.parsed.kind !== 'series') { refuse('identity_changed', 'kind'); }
+
+        // Calendar level: only the header this server writes.
+        const seen = new Set<string>();
+        for (const index of now.doc.root.direct) {
+            const line = lineAt(now.doc, index);
+            if (!['VERSION', 'PRODID', 'CALSCALE'].includes(line.name) || seen.has(line.name)) { refuse('calendar_changed'); }
+            seen.add(line.name);
+        }
+
+        // Top level: the original's VTIMEZONEs, then the master, then the expected overrides; nothing else.
+        const oldZones = old.doc.root.children.filter(child => child.name === 'VTIMEZONE').map(node => blockKey(blockOf(old.doc, node)));
+        const nowZones = now.doc.root.children.filter(child => child.name === 'VTIMEZONE').map(node => blockKey(blockOf(now.doc, node)));
+        if (oldZones.length !== nowZones.length || oldZones.some((key, index) => key !== nowZones[index])) { refuse('component_changed', 'VTIMEZONE'); }
+        if (now.doc.root.children.length !== nowZones.length + now.events.length) { refuse('component_changed'); }
+        const [first, ...rest] = now.events;
+        if (first !== nowMaster || rest.length !== expectation.overrides.length || rest.some((event, index) => event.rid !== expectation.overrides[index])) { refuse('override_mismatch', 'overrides'); }
+        for (const event of now.events) {
+            if (event.parsed.uid !== expectation.uid) { refuse('identity_changed', 'UID'); }
+        }
+
+        // Scheduling lines: none, or exactly the source component's (calendar:invite).
+        const oldByRid = new Map(old.events.map(event => [event.rid, event]));
+        for (const event of now.events) {
+            const source = oldByRid.get(event.rid);
+            const lines = schedulingLinesOf(now.doc, event.node);
+            if (!expectation.schedulingCopied) {
+                if (lines.length > 0) { refuse('scheduling_added', 'ATTENDEE/ORGANIZER'); }
+            } else if (source === undefined || !sameLines(lines, schedulingLinesOf(old.doc, source.node))) {
+                refuse('scheduling_added', 'ATTENDEE/ORGANIZER');
+            }
+        }
+
+        // The master.
+        checkExpected(now.doc, nowMaster, plan);
+        const handled = new Set<string>([...plan.expected.keys(), ...plan.companions, 'UID', 'RRULE', 'EXDATE']);
+        const rules = nowMaster.parsed.properties.get('rrule') ?? [];
+        const ruleLines = directWithName(now.doc, nowMaster.node, 'RRULE');
+        const rule = expectation.master.rrule;
+        if (typeof rule === 'string') {
+            if (rules.length !== 1 || ruleLines.length !== 1 || rules[0] === undefined || recurKey(rules[0]) !== decodeRrule(rule)) { refuse('rrule_mismatch', 'RRULE'); }
+        } else {
+            const oldRules = directWithName(old.doc, oldMaster.node, 'RRULE').map(line => line.text);
+            if (oldRules.length !== 1 || ruleLines.length !== 1 || ruleLines[0]?.text !== oldRules[0]) { refuse('rrule_mismatch', 'RRULE'); }
+        }
+        const nowExdates = directWithName(now.doc, nowMaster.node, 'EXDATE').map(line => line.text);
+        const oldExdates = expectation.master.exdates === 'copied' ? directWithName(old.doc, oldMaster.node, 'EXDATE').map(line => line.text) : [];
+        if (nowExdates.length !== oldExdates.length || nowExdates.some((text, index) => text !== oldExdates[index])) { refuse('exdate_mismatch', 'EXDATE'); }
+        const uids = directWithName(now.doc, nowMaster.node, 'UID');
+        if (uids.length !== 1 || uids[0]?.text !== `UID:${expectation.uid}`) { refuse('identity_changed', 'UID'); }
+        const notCopied = new Set<string>([...handled, ...DERIVED_NOT_COPIED]);
+        const wanted = oldMaster.node.direct.map(index => lineAt(old.doc, index)).filter(line => !notCopied.has(line.name)).map(line => line.text);
+        const copied = nowMaster.node.direct.map(index => lineAt(now.doc, index)).filter(line => !handled.has(line.name));
+        if (copied.some(line => notCopied.has(line.name)) || !sameLines(wanted, copied.map(line => line.text))) { refuse('override_mismatch', 'copy'); }
+        const own = nested(now.doc, nowMaster.node);
+        if (own.others.length > 0) { refuse('component_changed', 'VEVENT'); }
+        const alarms = expectation.master.alarms;
+        if (alarms.kind === 'copied') {
+            const source = nested(old.doc, oldMaster.node).alarms.map(node => blockKey(blockOf(old.doc, node)));
+            if (!sameLines(source, own.alarms.map(node => blockKey(blockOf(now.doc, node))))) { refuse('alarms_mismatch', 'VALARM'); }
+        } else if (alarms.kind === 'removed') {
+            if (own.alarms.length > 0) { refuse('alarms_mismatch', 'VALARM'); }
+        } else {
+            checkReplacedAlarms(now.doc, own.alarms, validAlarms(alarms.alarms));
+        }
+
+        // The copied overrides: line-identical but for the direct UID line. One index of the source events by RECURRENCE-ID.
+        const sourcesByRid = new Map<string | null, (typeof old.events)[number][]>();
+        for (const event of old.events) {
+            const list = sourcesByRid.get(event.rid);
+            if (list === undefined) { sourcesByRid.set(event.rid, [event]); } else { list.push(event); }
+        }
+        for (const [index, rid] of expectation.overrides.entries()) {
+            const source = sourcesByRid.get(rid) ?? [];
+            const target = rest[index];
+            if (source.length !== 1 || source[0] === undefined || target === undefined) { return refuse('override_mismatch', 'overrides'); }
+            const node = source[0].node;
+            const uidIndex = node.direct.find(line => lineAt(old.doc, line).name === 'UID');
+            const expected: string[] = [];
+            for (let line = node.begin; line <= node.end; line++) { expected.push(line === uidIndex ? `UID:${expectation.uid}` : lineAt(old.doc, line).text); }
+            if (blockKey(expected) !== blockKey(blockOf(now.doc, target.node))) { refuse('override_mismatch', 'copy'); }
+        }
+    });
+}
+
 /**
  * Checks a resource about to be created: one VEVENT holding exactly the expected properties (plus the expected RRULE), only
  * the expected DISPLAY alarms, no ATTENDEE, ORGANIZER or ATTACH anywhere, no other component than `vtimezoneCount`
@@ -995,7 +1275,7 @@ export function verifyCreateOutcome(text: string, expectation: CreateExpectation
         const alarms = validAlarms(expectation.alarms);
 
         const now = read(text, 'after_unparseable', options);
-        hardRules(null, now, false);
+        hardRules(null, now, NO_COPIES);
         const events = now.doc.root.children.filter(child => child.name === 'VEVENT');
         const zones = now.doc.root.children.filter(child => child.name === 'VTIMEZONE');
         if (events.length !== 1 || now.events.length !== 1 || now.master === null || now.parsed.overrides.length > 0) { refuse('component_changed', 'VEVENT'); }

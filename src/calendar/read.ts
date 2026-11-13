@@ -15,7 +15,7 @@ import type {
 } from './event-schemas';
 import { parseExpandedResource, parseOriginalResource } from './ical';
 import {
-    CALENDAR_CONCURRENCY, DISPLAY_NAME_MAX, ETAG_MAX, ETAG_MIN, MAX_DISCOVERED_CALENDARS, MAX_MEMBERSHIP_BYTES, MAX_REPORT_BYTES, MAX_RESOURCES_PER_REPORT, MAX_UNREADABLE,
+    CALENDAR_CONCURRENCY, DISPLAY_NAME_MAX, ETAG_MAX, ETAG_MIN, MAX_DISCOVERED_CALENDARS, MAX_MEMBERSHIP_BYTES, MAX_MULTIGET_HREFS, MAX_REPORT_BYTES, MAX_RESOURCES_PER_REPORT, MAX_UNREADABLE,
 } from './limits';
 import { BudgetError, IcalError, isCanonicalPath, type EventComponent, type EventTime, type Interval, type OriginalResource } from './model';
 import { normalizeFullEvent, normalizeSlimEvent, sanitizeDisplayText } from './normalize';
@@ -415,7 +415,7 @@ function nullTokenComponent(resource: OriginalResource): { component: EventCompo
  * RECURRENCE-ID has the same token, with no zone conversion. Too wide is result_too_large; a DATE series `occ1_` token off
  * midnight, or a token on a non-recurring event, is not_found.
  */
-function occurrenceWindow(resource: OriginalResource, token: NonNullable<ReturnType<typeof parseOccurrenceId>>): { startUtc: string; endUtc: string } {
+export function occurrenceWindow(resource: OriginalResource, token: NonNullable<ReturnType<typeof parseOccurrenceId>>): { startUtc: string; endUtc: string } {
     if (resource.kind === 'single') { throw new ReadError('not_found'); }
     let related: EventComponent[];
     if (token.kind === 'stored') {
@@ -472,16 +472,79 @@ export async function readCalendarMembership(deps: ReadDeps): Promise<{ members:
  * Null when iCloud reports the href absent. Throws ReadError.
  */
 export async function readStoredResource(deps: ReadDeps, reporter: UnauthorizedReporter, calendarId: string, href: string): Promise<CalendarResource | null> {
-    const lookups = await detailRequest(reporter, () => deps.backend.multigetEvents(deps.auth, deps.discovery, { calendarId, hrefs: [href] }, callOptions(deps.budget, MAX_REPORT_BYTES)));
-    const [lookup, ...extra] = lookups;
-    if (lookup === undefined || extra.length > 0) { throw new ReadError('upstream_error'); }
-    if (lookup.kind === 'not_found') {
-        if (lookup.href !== href) { throw new ReadError('upstream_error'); }
-        return null;
+    const [found] = await readStoredResources(deps, reporter, calendarId, [href]);
+    return found ?? null;
+}
+
+/**
+ * ONE calendar-multiget of several originals of one calendar (distinct hrefs, at most MAX_MULTIGET_HREFS), validated like
+ * get_event's: exactly one answer per href, in any order, the same href back, a strong ETag and text data. Returns the
+ * resources in the order asked, null where iCloud reports one absent. Throws ReadError.
+ */
+export async function readStoredResources(deps: ReadDeps, reporter: UnauthorizedReporter, calendarId: string, hrefs: readonly string[]): Promise<(CalendarResource | null)[]> {
+    if (hrefs.length === 0 || hrefs.length > MAX_MULTIGET_HREFS || new Set(hrefs).size !== hrefs.length) { throw new ReadError('invalid_input'); }
+    const lookups = await detailRequest(reporter, () => deps.backend.multigetEvents(deps.auth, deps.discovery, { calendarId, hrefs }, callOptions(deps.budget, MAX_REPORT_BYTES)));
+    if (lookups.length !== hrefs.length) { throw new ReadError('upstream_error'); }
+    const answers = new Map<string, CalendarResource | null>();
+    for (const lookup of lookups) {
+        const href = lookup.kind === 'not_found' ? lookup.href : lookup.resource.href;
+        if (!hrefs.includes(href) || answers.has(href)) { throw new ReadError('upstream_error'); }
+        if (lookup.kind === 'found' && (!validEtag(lookup.resource.etag) || typeof lookup.resource.calendarData !== 'string')) { throw new ReadError('upstream_error'); }
+        answers.set(href, lookup.kind === 'found' ? lookup.resource : null);
     }
-    const found = lookup.resource;
-    if (found.href !== href || !validEtag(found.etag) || typeof found.calendarData !== 'string') { throw new ReadError('upstream_error'); }
-    return found;
+    return hrefs.map(href => answers.get(href) ?? null);
+}
+
+/** The expanded instances of one resource in a window, or `absent` when iCloud returned no instance of it there. */
+export type ExpandedLookup = { kind: 'absent' } | { kind: 'found'; components: readonly EventComponent[] };
+
+/**
+ * One expanded REPORT over `window`, reduced to the one resource at `href`. The instances must come from the same stored
+ * version that was read (`etag`) and carry its UID (`uid`), else ReadError('calendar_changed'): an expansion of another
+ * version is never used. Charges the invocation's work caps. Throws ReadError.
+ */
+export async function expandStoredResource(
+    deps: ReadDeps, reporter: UnauthorizedReporter, query: { calendarId: string; href: string; etag: string; uid: string; window: { startUtc: string; endUtc: string } },
+): Promise<ExpandedLookup> {
+    const { budget } = deps;
+    const resources = await detailRequest(reporter, () => deps.backend.queryEvents(deps.auth, deps.discovery, { calendarId: query.calendarId, range: query.window }, callOptions(budget, MAX_REPORT_BYTES)));
+    try { validateReport(query.calendarId, resources); } catch (error) { throw new ReadError(toolCodeFor(error)); }
+    const target = resources.find(resource => resource.href === query.href);
+    if (target === undefined) { return { kind: 'absent' }; }
+    if (target.etag !== query.etag) { throw new ReadError('calendar_changed'); }
+    let components: readonly EventComponent[];
+    try {
+        components = parseExpandedResource(target.calendarData, { work: budget.newResourceWork() }).components;
+        budget.newCalendarWork().chargeComponents(components.length);
+    } catch (error) {
+        throw detailDataError(error);
+    }
+    if (components.some(component => component.uid !== query.uid)) { throw new ReadError('calendar_changed'); }
+    return { kind: 'found', components };
+}
+
+/** The UID of a parsed original: the master's, else the first override's. */
+export function resourceUid(resource: OriginalResource): string {
+    return originalUid(resource);
+}
+
+/**
+ * The get_event occurrence view of one stored resource for a token: one expanded REPORT over the token's window, matched
+ * to the same version and UID. Throws ReadError (`calendar_changed` when the resource is missing from the expansion or
+ * changed, `not_found` when no instance has the token).
+ */
+export async function occurrenceView(
+    deps: ReadDeps, reporter: UnauthorizedReporter, calendarId: string, resource: CalendarResource, original: OriginalResource, tokenText: string,
+): Promise<FullEvent> {
+    const token = parseOccurrenceId(tokenText);
+    if (token === null) { throw new ReadError('invalid_input'); }
+    const window = occurrenceWindow(original, token);
+    const expanded = await expandStoredResource(deps, reporter, { calendarId, href: resource.href, etag: resource.etag, uid: originalUid(original), window });
+    // The resource vanished or changed between the two reads: never substitute a neighbouring occurrence.
+    if (expanded.kind === 'absent') { throw new ReadError('calendar_changed'); }
+    const occurrence = expanded.components.find(component => component.recurrenceId?.token === tokenText);
+    if (occurrence === undefined) { throw new ReadError('not_found'); }
+    return fullEvent(occurrence, { calendar: 0, resourceHref: resource.href, etag: resource.etag, recurring: true, calendarId, view: 'occurrence' });
 }
 
 /**
@@ -520,7 +583,6 @@ export async function readOriginal(deps: ReadDeps, calendarId: string, href: str
 }
 
 export async function getEvent(deps: ReadDeps, input: GetEventArgs): Promise<DetailReadResult> {
-    const { budget } = deps;
     const calendarId = input.calendar_id;
     const href = input.resource_href;
     const tokenText = input.recurrence_id ?? null;
@@ -535,23 +597,7 @@ export async function getEvent(deps: ReadDeps, input: GetEventArgs): Promise<Det
         const selected = nullTokenComponent(original);
         event = fullEvent(selected.component, { calendar: 0, resourceHref: href, etag: found.etag, recurring: selected.recurring, calendarId, view: selected.view });
     } else {
-        const window = occurrenceWindow(original, token);
-        const resources = await detailRequest(reporter, () => deps.backend.queryEvents(deps.auth, deps.discovery, { calendarId, range: window }, callOptions(budget, MAX_REPORT_BYTES)));
-        try { validateReport(calendarId, resources); } catch (error) { throw new ReadError(toolCodeFor(error)); }
-        const target = resources.find(resource => resource.href === href);
-        // The resource vanished or changed between the two reads: never substitute a neighbouring occurrence.
-        if (target === undefined || target.etag !== found.etag) { throw new ReadError('calendar_changed'); }
-        let components: readonly EventComponent[];
-        try {
-            components = parseExpandedResource(target.calendarData, { work: budget.newResourceWork() }).components;
-            budget.newCalendarWork().chargeComponents(components.length);
-        } catch (error) {
-            throw detailDataError(error);
-        }
-        if (components.some(component => component.uid !== originalUid(original))) { throw new ReadError('calendar_changed'); }
-        const occurrence = components.find(component => component.recurrenceId?.token === tokenText);
-        if (occurrence === undefined) { throw new ReadError('not_found'); }
-        event = fullEvent(occurrence, { calendar: 0, resourceHref: href, etag: found.etag, recurring: true, calendarId, view: 'occurrence' });
+        event = await occurrenceView(deps, reporter, calendarId, found, original, token.id);
     }
 
     return {

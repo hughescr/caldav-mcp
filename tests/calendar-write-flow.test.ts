@@ -145,6 +145,34 @@ describe('create_event', () => {
         expect(h.fake.hrefs(WORK)).toHaveLength(1);
     });
 
+    test('iCloud reorders RRULE parts (measured): the rule reads back as requested and a retry is desired_state_present', async () => {
+        const h = harness();
+        const ruled = { ...BASE_CREATE, recurrence: { rrule: 'FREQ=WEEKLY;INTERVAL=2;COUNT=3' } };
+        const first = await create(h, ruled);
+        // Written in our order, stored in iCloud's.
+        expect(unfoldText(h.fake.calls.find(call => call.method === 'putEvent')?.body ?? '')).toContain('RRULE:FREQ=WEEKLY;INTERVAL=2;COUNT=3');
+        expect(unfoldText(h.fake.get(WORK, first.resource_href)?.text ?? '')).toContain('RRULE:FREQ=WEEKLY;COUNT=3;INTERVAL=2');
+        expect<unknown>([first.write_outcome, first.stored_differs_from_request]).toEqual(['applied', []]);
+        const second = await create(h, ruled);
+        expect<unknown>([second.write_outcome, second.resource_href, h.fake.hrefs(WORK)]).toEqual(['desired_state_present', first.resource_href, [first.resource_href]]);
+    });
+
+    test('a stored rule whose part values differ is still a difference, whatever the part order', async () => {
+        const h = harness();
+        const ruled = { ...BASE_CREATE, recurrence: { rrule: 'FREQ=WEEKLY;INTERVAL=2;COUNT=3' } };
+        const first = await create(h, ruled);
+        h.fake.externalEdit(WORK, first.resource_href, text => text.replace('RRULE:FREQ=WEEKLY;COUNT=3;INTERVAL=2', 'RRULE:INTERVAL=2;FREQ=WEEKLY;COUNT=4'));
+        expect(await failure(() => create(h, ruled))).toEqual({ code: 'calendar_changed', reason: 'existing_resource_differs', differs: ['recurrence'] });
+        // A part name in another case is the same part; a part given twice is never as requested.
+        h.fake.externalEdit(WORK, first.resource_href, text => text.replace('RRULE:INTERVAL=2;FREQ=WEEKLY;COUNT=4', 'RRULE:count=3;Freq=WEEKLY;interval=2'));
+        expect((await create(h, ruled)).write_outcome).toBe('desired_state_present');
+        h.fake.externalEdit(WORK, first.resource_href, text => text.replace('RRULE:count=3;Freq=WEEKLY;interval=2', 'RRULE:FREQ=WEEKLY;COUNT=3;INTERVAL=2;COUNT=3'));
+        expect(await failure(() => create(h, ruled))).toEqual({ code: 'calendar_changed', reason: 'existing_resource_differs', differs: ['recurrence'] });
+        // A value in another case is a different value (no normalisation of values).
+        h.fake.externalEdit(WORK, first.resource_href, text => text.replace('RRULE:FREQ=WEEKLY;COUNT=3;INTERVAL=2;COUNT=3', 'RRULE:FREQ=weekly;COUNT=3;INTERVAL=2'));
+        expect(await failure(() => create(h, ruled))).toEqual({ code: 'calendar_changed', reason: 'existing_resource_differs', differs: ['recurrence'] });
+    });
+
     test('the same operation_id with a different body: calendar_changed, existing_resource_differs, nothing overwritten', async () => {
         const h = harness();
         const first = await create(h, BASE_CREATE);
@@ -510,14 +538,17 @@ describe('update_event', () => {
         expect(h.fake.count('putEvent')).toBe(0);
     });
 
-    test('series target rules: a scope is required; time and rule changes are not supported yet; occurrence-only resources are refused', async () => {
+    test('series target rules: a scope is required; a move or rule change of a series with exceptions needs a choice; occurrence-only resources are refused', async () => {
         const h = harness();
         const etag = h.fake.seed(WORK, SERIES_HREF, SERIES);
         const base = { calendar_id: WORK, resource_href: SERIES_HREF, expected_version: etag };
+        const counts = { exceptions: { changed_occurrences: 1, deleted_occurrences: 1 } };
         expect(await failure(() => update(h, { ...base, changes: { title: 'x' } }))).toEqual({ code: 'invalid_input', reason: 'edit_scope_required', field: 'edit_scope' });
-        expect(await failure(() => update(h, { ...base, edit_scope: 'all', changes: { start: '2026-12-01T15:00:00Z', end: '2026-12-01T16:00:00Z' } }))).toEqual({ code: 'edit_not_supported', reason: 'series_time_change_not_supported' });
-        expect(await failure(() => update(h, { ...base, edit_scope: 'all', changes: { recurrence: { rrule: 'FREQ=DAILY' } } }))).toEqual({ code: 'edit_not_supported', reason: 'series_rule_change_not_supported' });
-        expect(await failure(() => update(h, { ...base, edit_scope: 'all', changes: { recurrence: null } }))).toEqual({ code: 'edit_not_supported', reason: 'series_rule_change_not_supported' });
+        expect(await failure(() => update(h, { ...base, edit_scope: 'all', changes: { start: '2026-12-01T15:00:00Z', end: '2026-12-01T16:00:00Z' } }))).toEqual({ code: 'edit_not_supported', reason: 'exceptions_choice_required', ...counts });
+        expect(await failure(() => update(h, { ...base, edit_scope: 'all', changes: { recurrence: { rrule: 'FREQ=DAILY' } } }))).toEqual({ code: 'edit_not_supported', reason: 'exceptions_choice_required', ...counts });
+        expect(await failure(() => update(h, { ...base, edit_scope: 'all', changes: { recurrence: null } }))).toEqual({ code: 'edit_not_supported', reason: 'exceptions_choice_required', ...counts });
+        expect(await failure(() => update(h, { ...base, edit_scope: 'all', exceptions: 'shift', changes: { start: '2026-12-01T15:00:00Z', end: '2026-12-01T16:00:00Z' } }))).toEqual({ code: 'edit_not_supported', reason: 'exceptions_shift_not_utc' });
+        expect(await failure(() => update(h, { ...base, edit_scope: 'all', exceptions: 'shift', changes: { recurrence: { rrule: 'FREQ=DAILY' } } }))).toEqual({ code: 'edit_not_supported', reason: 'exceptions_shift_with_rule_change' });
         const detached = SERIES.replace(/BEGIN:VEVENT\r\nUID:SERIES-1\r\nDTSTAMP:20261101T120000Z[\s\S]*?END:VEVENT\r\n/u, '');
         const detachedEtag = h.fake.seed(WORK, `${WORK}detached.ics`, detached);
         expect(await failure(() => update(h, { calendar_id: WORK, resource_href: `${WORK}detached.ics`, expected_version: detachedEtag, edit_scope: 'all', changes: { title: 'x' } }))).toEqual({ code: 'edit_not_supported', reason: 'occurrence_only_resource' });
