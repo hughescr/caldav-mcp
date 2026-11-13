@@ -18,6 +18,8 @@ import { buildExpandedQuery, buildMultiget, extractEventReport } from './reports
 import type { CalDavReadBackend, CalendarResource, DavCallOptions, ResourceLookup } from './read-contracts';
 import { CalDavError, type CalDavAuth, type CalDavBackend, type CalDavErrorCode, type CalendarSummary, type Discovery } from './contracts';
 import { ICLOUD_CALDAV_ROOT, assertAllowedCalDavUrl, createGuardedFetch, isAllowedCalDavUrl, type FetchLike } from './hosts';
+import { createWriteBackend } from './write';
+import type { CalDavWriteBackend } from './write-contracts';
 import {
     APPLE_ICAL_NS,
     CALDAV_NS,
@@ -189,9 +191,11 @@ function childPath(href: string, finalUrl: URL, home: URL, homePath: string): st
     return path;
 }
 
-/** Creates the phase-1 backend plus the batched event-read capability; injected fetch remains probe-compatible. */
-export function createICloudBackend(options: ICloudBackendOptions = {}): CalDavBackend & CalDavReadBackend {
+/** Creates the phase-1 backend plus the batched event-read and conditional-write capabilities; injected fetch remains probe-compatible. */
+export function createICloudBackend(options: ICloudBackendOptions = {}): CalDavBackend & CalDavReadBackend & CalDavWriteBackend {
     const guardedFetch = createGuardedFetch(options.fetch);
+    // PUT and DELETE live only in write.ts; this backend just carries them with the same transport and authorization.
+    const writer = createWriteBackend({ authorization: basicAuthorization, ...(options.fetch === undefined ? {} : { fetch: options.fetch }) });
 
     function send(url: URL, depth: '0' | '1', body: string, authorization: string): Promise<Response> {
         return guardedFetch(url.href, {
@@ -263,6 +267,9 @@ export function createICloudBackend(options: ICloudBackendOptions = {}): CalDavB
     }
 
     return {
+        putEvent: writer.putEvent,
+        deleteEvent: writer.deleteEvent,
+
         async queryEvents(auth, discovery, query, call): Promise<readonly CalendarResource[]> {
             return eventReport(auth, discovery, query.calendarId, buildExpandedQuery(query.range), call);
         },

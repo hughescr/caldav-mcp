@@ -7,7 +7,7 @@ import type { ReadCharge } from '../caldav/read-contracts';
 import { remainingRequestTimeMs } from '../request-budget';
 import {
     CLEANUP_ABORT_MS, DAV_LAMBDA_RESERVE_MS, DAV_REQUEST_MS, DOWNLOAD_CALL_MS, MAX_AGGREGATE_BYTES, MAX_EXPANDED_VEVENTS_PER_CALENDAR, MAX_EXPANDED_VEVENTS_PER_TOOL,
-    MAX_LINES_PER_RESOURCE, MAX_LINES_PER_TOOL, MAX_PROPERTIES_PER_RESOURCE, MAX_PROPERTIES_PER_TOOL, MIN_CALENDAR_START_MS, READ_CALL_MS, READ_LAMBDA_RESERVE_MS, YIELD_EVERY_COMPONENTS,
+    MAX_LINES_PER_RESOURCE, MAX_LINES_PER_TOOL, MAX_PROPERTIES_PER_RESOURCE, MAX_PROPERTIES_PER_TOOL, MIN_CALENDAR_START_MS, READ_CALL_MS, READ_LAMBDA_RESERVE_MS, WRITE_CALL_MS, YIELD_EVERY_COMPONENTS,
 } from './limits';
 import { BudgetError } from './model';
 
@@ -171,4 +171,9 @@ export function createReadBudget(options: BudgetOptions = {}): ReadBudget {
 /** Budget for download: 30 s for the whole call, which begins before membership. */
 export function createDownloadBudget(options: BudgetOptions = {}): ReadBudget {
     return createBudget({ callMs: DOWNLOAD_CALL_MS, lambdaReserveMs: READ_LAMBDA_RESERVE_MS }, options);
+}
+
+/** Budget for create/update/delete: 40 s for the whole call, which begins before membership. */
+export function createWriteBudget(options: BudgetOptions = {}): ReadBudget {
+    return createBudget({ callMs: WRITE_CALL_MS, lambdaReserveMs: READ_LAMBDA_RESERVE_MS }, options);
 }

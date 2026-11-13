@@ -48,6 +48,7 @@ export type IcsWriteErrorReason =
     | 'enum_invalid'
     | 'sequence_invalid'
     | 'trigger_invalid'
+    | 'travel_invalid'
     | 'too_many_alarms'
     | 'rrule_too_long'
     | 'rrule_syntax'
@@ -348,6 +349,34 @@ export function parseAlarmOffset(text: string, field: string | null = 'TRIGGER')
     return text;
 }
 
+// ---- Travel time (phase 3 addendum 1) ----
+
+/** Longest travel time accepted, in seconds (12 hours). */
+export const MAX_TRAVEL_SECONDS = 12 * 3600;
+
+/**
+ * The `travel_time` grammar: the alarm-offset grammar above (unsigned, case-sensitive, 1–4 digit numbers), and a total of
+ * 1 second to 12 hours. Returns the text unchanged. Weeks and whole days can never be within the bound except `P0D…`.
+ */
+export function parseTravelDuration(text: string, field: string | null = 'X-APPLE-TRAVEL-DURATION'): string {
+    if (typeof text !== 'string') { throw new IcsWriteError('travel_invalid', field); }
+    const match = wholeMatch(ALARM_OFFSET_RE, text);
+    const afterT = text.indexOf('T');
+    if (match === null || (afterT !== -1 && !/\d/u.test(text.slice(afterT + 1)))) { throw new IcsWriteError('travel_invalid', field); }
+    const number = (index: number): number => Number(match[index] ?? '0');
+    const seconds = number(1) * 604_800 + number(2) * 86_400 + (number(3) + number(6)) * 3600 + (number(4) + number(7)) * 60 + number(5) + number(8);
+    if (seconds < 1 || seconds > MAX_TRAVEL_SECONDS) { throw new IcsWriteError('travel_invalid', field); }
+    return text;
+}
+
+/**
+ * `X-APPLE-TRAVEL-DURATION;VALUE=DURATION:<value>`, the line Apple Calendar reads as travel time (measured on the owner's
+ * data). Nothing else is written: no X-APPLE-TRAVEL-START, no routing, no geocoding.
+ */
+export function travelDurationProperty(value: string, field: string | null = 'X-APPLE-TRAVEL-DURATION'): WrittenProperty {
+    return property('X-APPLE-TRAVEL-DURATION', `X-APPLE-TRAVEL-DURATION;VALUE=DURATION:${parseTravelDuration(value, field)}`);
+}
+
 /** A display alarm `before_start` before the event start: ACTION:DISPLAY, DESCRIPTION:Reminder, TRIGGER:-<offset>. */
 export function displayAlarm(beforeStart: string, field: string | null = 'TRIGGER'): WrittenComponent {
     const offset = parseAlarmOffset(beforeStart, field);
@@ -507,13 +536,16 @@ export interface CreateEventInput {
     alarms?: readonly { before_start: string }[] | undefined;
     /** Client RRULE text; written only after the strict grammar. */
     rrule?: string | undefined;
+    /** Client `travel_time`; written as X-APPLE-TRAVEL-DURATION only after {@link parseTravelDuration}. */
+    travelDuration?: string | undefined;
 }
 
 const CREATE_STATUSES: ReadonlySet<string> = new Set(['CONFIRMED', 'TENTATIVE']);
 
 /**
  * The complete VCALENDAR for `create_event`, CRLF line endings, folded. Property order is fixed: UID, DTSTAMP, CREATED,
- * LAST-MODIFIED, SEQUENCE:0, DTSTART, DTEND, RRULE, SUMMARY, LOCATION, DESCRIPTION, STATUS, TRANSP, then one VALARM per alarm.
+ * LAST-MODIFIED, SEQUENCE:0, DTSTART, DTEND, RRULE, SUMMARY, LOCATION, DESCRIPTION, STATUS, TRANSP, X-APPLE-TRAVEL-DURATION, then
+ * one VALARM per alarm.
  * No VTIMEZONE: a TZID is sent without one and iCloud adds it (ORCH S2). Every value is validated before any text is joined.
  */
 export function buildCreateResource(input: CreateEventInput): string {
@@ -541,6 +573,7 @@ export function buildCreateResource(input: CreateEventInput): string {
         lines.push(statusProperty(input.status, 'status'));
     }
     if (input.transparency !== undefined) { lines.push(transparencyProperty(input.transparency, 'transparency')); }
+    if (input.travelDuration !== undefined) { lines.push(travelDurationProperty(input.travelDuration, 'travel_time')); }
     const alarms = input.alarms ?? [];
     if (!Array.isArray(alarms)) { throw new IcsWriteError('trigger_invalid', 'alarms'); }
     if (alarms.length > MAX_ALARMS) { throw new IcsWriteError('too_many_alarms', 'alarms'); }

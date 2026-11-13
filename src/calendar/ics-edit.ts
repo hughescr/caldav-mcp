@@ -5,9 +5,10 @@
  * The editor reads the ORIGINAL resource as physical lines (CRLF or LF, any legal folding with SPACE or TAB continuations,
  * iCloud's 91-octet lines included), groups them into logical lines with their physical spans, and builds a component tree
  * that must agree with `parseOriginalResource` (same VEVENTs in order, same UID and RECURRENCE-ID, same alarm and VTIMEZONE
- * counts). Edits address one component (the master VEVENT, or the override whose RECURRENCE-ID line has exactly a given
- * text) and touch only its direct logical properties, or whole nested VALARMs when alarms are replaced; resource-level edits
- * add a VEVENT before `END:VCALENDAR` or remove an override VEVENT.
+ * counts). Component edits address one or several distinct components (the master VEVENT, or the override whose
+ * RECURRENCE-ID line has exactly a given text), all in one pass, and touch only their direct logical properties, or whole
+ * nested VALARMs when alarms are replaced; resource-level edits add a VEVENT before `END:VCALENDAR` or remove an override
+ * VEVENT.
  *
  * Output guarantee: line contents preserved, line endings normalised. Every logical line outside the edited spans is
  * emitted with exactly its original physical lines (same content, same folding); every physical line of the output ends
@@ -24,6 +25,7 @@
  * byte for byte when untouched; a RECURRENCE-ID whose TZID holds a backslash fails the agreement check (`tree_mismatch`).
  */
 import { parseContentLine } from './attachments';
+import type { ResourceWork } from './budget';
 import { foldLine, isWrittenComponent, isWrittenProperty, MAX_LINE_OCTETS, type WrittenComponent, type WrittenProperty } from './ics-write';
 import { parseOriginalResource } from './ical';
 import { MAX_ICS_NESTING } from './limits';
@@ -102,10 +104,31 @@ export type ResourceEdit =
     /** Remove one whole override VEVENT. The master is never removed (a whole-resource delete is a DELETE request). */
     | { op: 'remove_component'; target: { kind: 'override'; recurrenceId: string } };
 
+/** The edits of one component. */
+export interface ComponentPlan {
+    readonly target: ComponentSelector;
+    readonly edits: readonly ComponentEdit[];
+}
+
+/**
+ * One pass over the resource. Component edits name one component (`target` with `edits`) or several (`targets`, each a
+ * distinct component; for `edit_scope: "all"`), never both forms; all of them, and the resource edits, are planned on one
+ * reading of the original and emitted in one pass.
+ */
 export interface EditPlan {
     target?: ComponentSelector | undefined;
     edits?: readonly ComponentEdit[] | undefined;
+    targets?: readonly ComponentPlan[] | undefined;
     resource?: readonly ResourceEdit[] | undefined;
+}
+
+/**
+ * `work`: makes the work charge for each parse. When given, a BudgetError it throws (the invocation's shared caps or its
+ * deadline) propagates unchanged for the caller to map; without it each parse has its own default budget, and a budget
+ * failure is reported as an edit error like any unreadable text.
+ */
+export interface EditOptions {
+    readonly work?: (() => ResourceWork) | undefined;
 }
 
 // ---- Report ----
@@ -130,8 +153,8 @@ export interface EditReport {
     written: readonly number[];
     /** Written output lines that are byte-for-byte copies of an original line. */
     copied: readonly { output: number; original: number }[];
-    /** The edited component's BEGIN and END in the original, or null when the plan had no component edits. */
-    target: { begin: number; end: number } | null;
+    /** The edited components' BEGIN and END in the original, ascending by BEGIN; empty when the plan had no component edits. */
+    targets: readonly { begin: number; end: number }[];
     /** Whole VEVENTs removed, as original BEGIN/END indices. */
     removedComponents: readonly { begin: number; end: number }[];
     changes: readonly EditChange[];
@@ -177,6 +200,9 @@ interface Tree {
     root: ComponentNode;
     events: ComponentNode[];
     parsed: OriginalResource;
+    /** VEVENTs without a RECURRENCE-ID, and VEVENTs by the exact text of each of their RECURRENCE-ID lines: built once. */
+    masters: ComponentNode[];
+    byRecurrenceId: Map<string, ComponentNode[]>;
 }
 
 function splitPhysical(text: string): string[] {
@@ -272,23 +298,40 @@ function sameEvent(lines: readonly Line[], node: ComponentNode, component: Event
     return names(rid.parameters) === names(parsedRid.raw.params) && JSON.stringify(rid.parameters.get('tzid') ?? null) === JSON.stringify(parsedRid.raw.params.get('tzid') ?? null);
 }
 
+/** Parse options for one parse: the caller's work, or the parser's own default budget. */
+function parseOptions(options: EditOptions): { work?: ResourceWork } {
+    return options.work === undefined ? {} : { work: options.work() };
+}
+
 /** Parses with the read path, builds the span tree and requires both to agree. */
-function readTree(original: string): Tree {
+function readTree(original: string, options: EditOptions): Tree {
     if (typeof original !== 'string') { throw new IcsEditError('malformed'); }
     // Lone CR is a line break to the read path's pre-scan but data to ICAL.parse; refuse before either sees it.
     if (/\r(?!\n)/u.test(original)) { throw new IcsEditError('lone_cr'); }
     let parsed: OriginalResource;
     try {
-        parsed = parseOriginalResource(original, {});
-    } catch {
+        parsed = parseOriginalResource(original, parseOptions(options));
+    } catch (error) {
+        // The caller's budget is the caller's to report.
+        if (error instanceof BudgetError && options.work !== undefined) { throw error; }
         // IcalError (malformed, too large) or BudgetError (line/property work caps): either way not editable.
         throw new IcsEditError('original_unparseable');
     }
     const lines = buildLines(original);
     const root = buildTree(lines);
     const events = root.children.filter(child => child.name === 'vevent');
-    const masters = events.filter(event => directLines({ lines }, event, 'recurrence-id').length === 0);
-    const overrides = events.filter(event => directLines({ lines }, event, 'recurrence-id').length > 0);
+    const masters: ComponentNode[] = [];
+    const overrides: ComponentNode[] = [];
+    const byRecurrenceId = new Map<string, ComponentNode[]>();
+    for (const event of events) {
+        const rids = directLines({ lines }, event, 'recurrence-id');
+        (rids.length === 0 ? masters : overrides).push(event);
+        for (const index of rids) {
+            const text = lineAt(lines, index).text;
+            const list = byRecurrenceId.get(text);
+            if (list === undefined) { byRecurrenceId.set(text, [event]); } else if (!list.includes(event)) { list.push(event); }
+        }
+    }
     const vtimezones = root.children.filter(child => child.name === 'vtimezone').length;
     if (masters.length !== (parsed.master === null ? 0 : 1) || overrides.length !== parsed.overrides.length || vtimezones !== parsed.vtimezoneCount) {
         throw new IcsEditError('tree_mismatch');
@@ -299,16 +342,17 @@ function readTree(original: string): Tree {
         const component = parsed.overrides[index];
         if (component === undefined || !sameEvent(lines, node, component)) { throw new IcsEditError('tree_mismatch'); }
     });
-    return { lines, root, events, parsed };
+    return { lines, root, events, parsed, masters, byRecurrenceId };
 }
 
+/** O(1) per selector through the tree's index, so selecting every component of a series stays linear. */
 function selectEvent(tree: Tree, selector: ComponentSelector): ComponentNode {
     if (typeof selector !== 'object' || selector === null) { throw new IcsEditError('target_not_found'); }
-    let matches: ComponentNode[];
+    let matches: readonly ComponentNode[];
     if (selector.kind === 'master') {
-        matches = tree.events.filter(event => directLines(tree, event, 'recurrence-id').length === 0);
+        matches = tree.masters;
     } else if (selector.kind === 'override' && typeof selector.recurrenceId === 'string') {
-        matches = tree.events.filter(event => directLines(tree, event, 'recurrence-id').some(index => tree.lines[index]?.text === selector.recurrenceId));
+        matches = tree.byRecurrenceId.get(selector.recurrenceId) ?? [];
     } else {
         throw new IcsEditError('target_not_found');
     }
@@ -322,8 +366,8 @@ function selectEvent(tree: Tree, selector: ComponentSelector): ComponentNode {
  * The top-level VEVENTs of a resource with logical line indices, for building plans (selectors and copy references).
  * Applies the same parsing and agreement checks as {@link editResource}.
  */
-export function describeEvents(original: string): EventOutline[] {
-    const tree = readTree(original);
+export function describeEvents(original: string, options: EditOptions = {}): EventOutline[] {
+    const tree = readTree(original, options);
     return tree.events.map(event => {
         const rid = directLines(tree, event, 'recurrence-id')[0];
         return {
@@ -603,7 +647,7 @@ function emit(planner: Planner): EditResult {
             removed,
             written,
             copied,
-            target: null,
+            targets: [],
             removedComponents: [...planner.removedComponents].sort((a, b) => a.begin - b.begin),
             changes: planner.changes,
         },
@@ -611,35 +655,55 @@ function emit(planner: Planner): EditResult {
 }
 
 /**
- * Applies a plan to the original stored text. Throws {@link IcsEditError}; never returns partially edited text. The output
- * is checked with {@link verifyUntouched} and re-parsed with `parseOriginalResource` (VTIMEZONE count unchanged, VEVENT
- * count as planned) before it is returned. Those checks prove preservation, not intent: the caller must still run
- * `verifyEditOutcome` (`ics-verify.ts`) with an expectation derived from the request before sending the text.
+ * Applies a plan to the original stored text in one pass: one reading of the original, every component's edits planned on
+ * it, one emit, one {@link verifyUntouched} and one re-parse of the output (VTIMEZONE count unchanged, VEVENT count as
+ * planned), so editing every component of a series is linear in the resource, not quadratic. Throws {@link IcsEditError}
+ * (or the caller's BudgetError, see {@link EditOptions}); never returns partially edited text. Those checks prove
+ * preservation, not intent: the caller must still run `verifyEditOutcome` (`ics-verify.ts`) with an expectation derived
+ * from the request before sending the text.
  */
-export function editResource(original: string, plan: EditPlan): EditResult {
-    if (typeof plan !== 'object' || plan === null) { throw new IcsEditError('edit_not_allowed'); }
-    const tree = readTree(original);
-    const planner = new Planner(tree);
+/** The plan's component edits as one list; the two forms are exclusive. */
+function componentPlans(plan: EditPlan): readonly ComponentPlan[] {
     const edits = plan.edits ?? [];
+    if (!Array.isArray(edits)) { throw new IcsEditError('edit_not_allowed'); }
+    if (plan.targets !== undefined) {
+        if (!Array.isArray(plan.targets) || plan.target !== undefined || plan.edits !== undefined) { throw new IcsEditError('edit_not_allowed'); }
+        return plan.targets;
+    }
+    if (plan.target !== undefined) { return [{ target: plan.target, edits }]; }
+    if (edits.length > 0) { throw new IcsEditError('target_not_found'); }
+    return [];
+}
+
+export function editResource(original: string, plan: EditPlan, options: EditOptions = {}): EditResult {
+    if (typeof plan !== 'object' || plan === null) { throw new IcsEditError('edit_not_allowed'); }
+    const plans = componentPlans(plan);
     const resourceEdits = plan.resource ?? [];
-    if (!Array.isArray(edits) || !Array.isArray(resourceEdits)) { throw new IcsEditError('edit_not_allowed'); }
-    let target: ComponentNode | null = null;
-    if (plan.target !== undefined) {
-        target = selectEvent(tree, plan.target);
-        applyComponentEdits(planner, target, edits);
-    } else if (edits.length > 0) {
-        throw new IcsEditError('target_not_found');
+    if (!Array.isArray(resourceEdits)) { throw new IcsEditError('edit_not_allowed'); }
+    const tree = readTree(original, options);
+    const planner = new Planner(tree);
+    const targets: ComponentNode[] = [];
+    const selected = new Set<ComponentNode>();
+    for (const item of plans) {
+        if (typeof item !== 'object' || item === null || !Array.isArray(item.edits)) { throw new IcsEditError('edit_not_allowed'); }
+        const target = selectEvent(tree, item.target);
+        // Two plans for one component would be two independent edits of the same lines.
+        if (selected.has(target)) { throw new IcsEditError('conflicting_edits'); }
+        selected.add(target);
+        targets.push(target);
+        applyComponentEdits(planner, target, item.edits);
     }
     applyResourceEdits(planner, resourceEdits);
     const result = emit(planner);
-    const report: EditReport = { ...result.report, target: target === null ? null : { begin: target.begin, end: target.end } };
+    const report: EditReport = { ...result.report, targets: targets.map(node => ({ begin: node.begin, end: node.end })).sort((a, b) => a.begin - b.begin) };
 
     const verdict = verifyUntouched(original, result.text, report);
     if (!verdict.ok) { throw new IcsEditError('output_invalid'); }
     let parsed: OriginalResource;
     try {
-        parsed = parseOriginalResource(result.text, {});
+        parsed = parseOriginalResource(result.text, parseOptions(options));
     } catch (error) {
+        if (error instanceof BudgetError && options.work !== undefined) { throw error; }
         // Over 2 MiB (IcalError) or over the per-resource line or property cap (BudgetError): too large for the read path.
         const tooLarge = (error instanceof IcalError && error.reason === 'resource_too_large') || error instanceof BudgetError;
         throw new IcsEditError(tooLarge ? 'output_too_large' : 'output_invalid');
@@ -673,7 +737,8 @@ export interface VerifyOptions { meter?: VerifyMeter | undefined }
  * A PRESERVATION check only. Proves, without the editor's tree or planner, that every original logical line the report
  * does not list as removed is in the output, in order, with identical physical lines; that the output uses CRLF only; that
  * every written line is folded at 75 octets on code-point boundaries (copies must equal their source exactly); and that
- * removals and writes stay inside the edited component, whole removed VEVENTs or whole added VEVENTs.
+ * removals and writes stay inside the edited components (each a distinct top-level VEVENT kept in the output), whole
+ * removed VEVENTs or whole added VEVENTs.
  *
  * It trusts the report for WHAT changed: a written line is accepted whatever it says, so an emit that wrote
  * `ATTENDEE:mailto:…` where `SUMMARY:new` was planned passes here. Intent is checked by `verifyEditOutcome`
@@ -765,9 +830,19 @@ export function verifyUntouched(before: string, after: string, report: EditRepor
         meter.steps++;
         return begin >= 0 && end >= begin && end + 1 < counts.length && (counts[end + 1] ?? 0) - (counts[begin] ?? 0) === end - begin + 1;
     };
-    const target = report.target;
-    if (target !== null && (typeof target !== 'object' || !oldShape.isTopLevelEvent(target.begin) || oldShape.endOf.get(target.begin) !== target.end)) {
-        return fail('scope_violation');
+    // The edited components: distinct top-level VEVENTs of the original, each kept (BEGIN and END) in the output.
+    if (!Array.isArray(report.targets)) { return fail('report_invalid'); }
+    const targetBegins = new Set<number>();
+    const keptTargetBegins = new Set<number>();
+    for (const target of report.targets as readonly unknown[]) {
+        meter.steps++;
+        if (typeof target !== 'object' || target === null) { return fail('scope_violation'); }
+        const { begin, end } = target as { begin: unknown; end: unknown };
+        if (typeof begin !== 'number' || typeof end !== 'number' || targetBegins.has(begin) || !oldShape.isTopLevelEvent(begin) || oldShape.endOf.get(begin) !== end) { return fail('scope_violation'); }
+        targetBegins.add(begin);
+        const keptBegin = keptMap.get(begin);
+        if (keptBegin === undefined || newShape.endOf.get(keptBegin) !== keptMap.get(end)) { return fail('scope_violation'); }
+        keptTargetBegins.add(keptBegin);
     }
     // Per original line, whether it lies inside a whole removed VEVENT: marked once per span, never searched per line.
     const inRemovedComponent = new Uint8Array(oldLines.length);
@@ -781,20 +856,19 @@ export function verifyUntouched(before: string, after: string, report: EditRepor
     for (const index of report.removed) {
         meter.steps++;
         if (inRemovedComponent[index] === 1) { continue; }
-        // Inside the target: a direct property, or a line of a nested VALARM that is removed whole.
-        if (target === null || oldShape.top[index] !== target.begin || index === target.begin || index === target.end) { return fail('scope_violation', index); }
+        // Inside a target: a direct property, or a line of a nested VALARM that is removed whole. Its BEGIN and END stay.
+        const top = oldShape.top[index] ?? -1;
+        if (!targetBegins.has(top) || index === top || index === oldShape.endOf.get(top)) { return fail('scope_violation', index); }
         const nested = oldShape.nested[index] ?? -1;
         if (nested === -1) { continue; }
         const nestedEnd = oldShape.endOf.get(nested);
         if (oldShape.nameOf.get(nested) !== 'VALARM' || nestedEnd === undefined || !allIn(removedBefore, nested, nestedEnd)) { return fail('scope_violation', index); }
     }
-    const targetBegin = target === null ? undefined : keptMap.get(target.begin);
-    if (target !== null && (targetBegin === undefined || newShape.endOf.get(targetBegin) !== keptMap.get(target.end))) { return fail('scope_violation'); }
     for (const index of report.written) {
         meter.steps++;
         const top = newShape.top[index] ?? -1;
-        // Inside the target's span; its own BEGIN and END are kept lines, never written.
-        if (targetBegin !== undefined && top === targetBegin) { continue; }
+        // Inside a target's span; its own BEGIN and END are kept lines, never written.
+        if (keptTargetBegins.has(top)) { continue; }
         // Elsewhere only as part of a whole top-level VEVENT the editor wrote.
         const end = newShape.endOf.get(top);
         if (top === -1 || !newShape.isTopLevelEvent(top) || end === undefined || !allIn(writtenBefore, top, end)) { return fail('scope_violation', index); }

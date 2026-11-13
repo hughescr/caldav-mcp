@@ -167,11 +167,22 @@ export function normalizeSlimEvent(component: EventComponent, context: Normalize
     return baseFields(component, context, { title: SLIM_TITLE_MAX, location: SLIM_LOCATION_MAX, description: SLIM_DESCRIPTION_MAX });
 }
 
+/** A stored travel duration passed through only as one short ISO 8601 duration token; anything else is not carried. */
+const TRAVEL_TIME_RE = /^[+-]?P[0-9WDTHMS]{1,62}$/u;
+
+/** Apple's travel time (`X-APPLE-TRAVEL-DURATION`, phase 3 addendum 1): the stored text of exactly one line, or undefined. */
+function travelTime(component: EventComponent): string | undefined {
+    const lines = component.properties.get('x-apple-travel-duration') ?? [];
+    const value = lines.length === 1 ? lines[0]?.values[0] : undefined;
+    return typeof value === 'string' && TRAVEL_TIME_RE.test(value) ? value : undefined;
+}
+
 export function normalizeFullEvent(component: EventComponent, context: FullNormalizeContext): FullEvent {
     // A UID is an identifier, never truncated or altered, so one the output cannot carry makes the component unreadable.
     if (component.uid.length > UID_MAX) { throw new IcalError('malformed'); }
     const attendees = component.properties.get('attendee') ?? [];
     const organizer = firstProperty(component, 'organizer');
+    const travel = travelTime(component);
     return {
         ...baseFields(component, context, { title: FULL_TITLE_MAX, location: FULL_LOCATION_MAX, description: FULL_DESCRIPTION_MAX }),
         calendar_id: context.calendarId,
@@ -182,5 +193,6 @@ export function normalizeFullEvent(component: EventComponent, context: FullNorma
         attendees: attendees.slice(0, MAX_ATTENDEES).map(toAttendee),
         ...(attendees.length > MAX_ATTENDEES ? { attendees_truncated: true as const } : {}),
         omitted: { alarms: component.alarmCount, extension_properties: component.extensionPropertyCount },
+        ...(travel === undefined ? {} : { travel_time: travel }),
     };
 }

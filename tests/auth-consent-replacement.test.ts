@@ -329,6 +329,9 @@ describe('every tool refuses a token without the scope it needs, in both protoco
         search_events: { range, query: 'x' },
         get_event: { calendar_id: '/1/calendars/home/', resource_href: '/1/calendars/home/e.ics' },
         get_event_attachment_download: { calendar_id: '/1/calendars/home/', resource_href: '/1/calendars/home/e.ics', attachment_ref: `a1_${'A'.repeat(43)}` },
+        create_event: { calendar_id: '/1/calendars/home/', operation_id: 'op-scope-0001', title: 't', start: '2027-01-01T10:00:00Z', end: '2027-01-01T11:00:00Z' },
+        update_event: { calendar_id: '/1/calendars/home/', resource_href: '/1/calendars/home/e.ics', expected_version: '"v1"', changes: { title: 't' } },
+        delete_event: { calendar_id: '/1/calendars/home/', resource_href: '/1/calendars/home/e.ics', expected_version: '"v1"' },
     };
     const ERAS = ['2025-11-25', '2026-07-28'] as const;
 

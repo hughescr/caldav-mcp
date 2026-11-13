@@ -47,6 +47,33 @@ export interface GuardedFetchOptions {
     validateUrl?: (url: URL, rawUrl: string) => void;
     /** Refuse method-rewriting redirects, and assert the final operation method. REPORT always enables this. */
     preserveMethod?: boolean;
+    /**
+     * Writes (`false`): a 3xx answer is returned bodiless and unfollowed, so a PUT or DELETE is never re-sent anywhere.
+     * Default true.
+     */
+    followRedirects?: boolean;
+    /**
+     * Writes: keep at most `maxResponseBytes` of the body and stop reading, instead of failing, so the status of an answer
+     * with a huge error body is still known. {@link isTruncatedResponse} reports the cut.
+     */
+    truncateBody?: boolean;
+    /**
+     * Writes: for a final status where this returns true, the body is cancelled unread and the Response has none. The status
+     * and headers are the answer; the body can then neither stall nor fail it.
+     */
+    skipBody?: (status: number) => boolean;
+    /**
+     * Writes: once a final status has arrived, a body that fails or stalls past the timeout yields that status with an empty
+     * body, marked by {@link isTruncatedResponse}, instead of an error. A shared charge's BudgetError still propagates.
+     */
+    keepStatusOnBodyFailure?: boolean;
+}
+
+const truncatedResponses = new WeakSet<Response>();
+
+/** True when a guarded fetch with `truncateBody` cut this response's body, or `keepStatusOnBodyFailure` dropped it. */
+export function isTruncatedResponse(response: Response): boolean {
+    return truncatedResponses.has(response);
 }
 
 function parseUrl(url: unknown): URL | undefined {
@@ -161,20 +188,21 @@ function discard(response: Response): void {
     response.body?.cancel().catch(() => undefined);
 }
 
-async function readCapped(response: Response, signal: AbortSignal, options: GuardedFetchOptions): Promise<Uint8Array<ArrayBuffer>> {
+async function readCapped(response: Response, signal: AbortSignal, options: GuardedFetchOptions): Promise<{ bytes: Uint8Array<ArrayBuffer>; truncated: boolean }> {
     const cap = options.maxResponseBytes ?? MAX_RESPONSE_BYTES;
     const declared = response.headers.get('content-length');
-    if (declared !== null && Number(declared) > cap) {
+    if (declared !== null && Number(declared) > cap && options.truncateBody !== true) {
         discard(response);
         throw new CalDavError(options.overflowCode ?? 'protocol');
     }
     if (!response.body) {
-        return new Uint8Array(0);
+        return { bytes: new Uint8Array(0), truncated: false };
     }
     const reader = response.body.getReader();
     const chunks: Uint8Array[] = [];
     let total = 0;
     let emptyChunks = 0;
+    let truncated = false;
     try {
         for (;;) {
             const { done, value } = await abortable(reader.read(), signal);
@@ -187,6 +215,13 @@ async function readCapped(response: Response, signal: AbortSignal, options: Guar
             }
             // Never refund failed reads, including the chunk crossing the per-response cap.
             options.charge?.chargeBytes(value.byteLength);
+            if (total + value.byteLength > cap && options.truncateBody === true) {
+                chunks.push(value.subarray(0, cap - total));
+                total = cap;
+                truncated = true;
+                reader.cancel().catch(() => undefined);
+                break;
+            }
             total += value.byteLength;
             if (total > cap) {
                 throw new CalDavError(options.overflowCode ?? 'protocol');
@@ -205,7 +240,7 @@ async function readCapped(response: Response, signal: AbortSignal, options: Guar
         bytes.set(chunk, offset);
         offset += chunk.byteLength;
     }
-    return bytes;
+    return { bytes, truncated };
 }
 
 function nextHop(request: PreparedRequest, status: number, location: string, options: GuardedFetchOptions): PreparedRequest {
@@ -289,6 +324,12 @@ export function createGuardedFetch(baseFetch?: FetchLike, options: GuardedFetchO
                     discard(response);
                     throw new CalDavError('protocol');
                 }
+                if (options.followRedirects === false && status >= 300 && status < 400) {
+                    discard(response);
+                    const unfollowed = new Response(null, { status });
+                    Object.defineProperty(unfollowed, 'url', { value: request.url.href });
+                    return unfollowed;
+                }
                 const location = REDIRECT_STATUSES.has(status) ? response.headers.get('location') : null;
                 if (location !== null) {
                     discard(response);
@@ -306,13 +347,28 @@ export function createGuardedFetch(baseFetch?: FetchLike, options: GuardedFetchO
                     discard(response);
                     throw new CalDavError('protocol');
                 }
-                const bytes = await readCapped(response, signal, options);
+                if (options.skipBody?.(status) === true) {
+                    discard(response);
+                    const bodiless = new Response(null, { status, statusText: response.statusText, headers: response.headers });
+                    Object.defineProperty(bodiless, 'url', { value: request.url.href });
+                    return bodiless;
+                }
+                let read: { bytes: Uint8Array<ArrayBuffer>; truncated: boolean };
+                try {
+                    read = await readCapped(response, signal, options);
+                } catch (error) {
+                    if (options.keepStatusOnBodyFailure !== true || error instanceof BudgetError) { throw error; }
+                    // The status is known; only the body is lost (readCapped has cancelled it).
+                    read = { bytes: new Uint8Array(0), truncated: true };
+                }
+                const { bytes, truncated } = read;
                 const buffered = new Response(NULL_BODY_STATUSES.has(status) ? null : bytes, {
                     status,
                     statusText: response.statusText,
                     headers: response.headers,
                 });
                 Object.defineProperty(buffered, 'url', { value: request.url.href });
+                if (truncated) { truncatedResponses.add(buffered); }
                 return buffered;
             }
         } catch (error) {

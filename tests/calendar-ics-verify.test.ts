@@ -2,9 +2,10 @@ import { describe, expect, test } from 'bun:test';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { describeEvents, editResource, verifyUntouched, type ComponentEdit, type EditPlan, type EventOutline, type NewComponentItem } from '../src/calendar/ics-edit';
-import { verifyCreateOutcome, verifyEditOutcome, type CreateExpectation, type EditExpectation, type ExpectedProperty, type OutcomeVerdict } from '../src/calendar/ics-verify';
+import { hasSchedulingLine, isSchedulingName, verifyCreateOutcome, verifyEditOutcome, type CreateExpectation, type EditExpectation, type ExpectedProperty, type OutcomeVerdict } from '../src/calendar/ics-verify';
+import { BudgetError } from '../src/calendar/model';
 import {
-    buildCreateResource, displayAlarm, rruleProperty, sequenceProperty, statusProperty, textProperty, timeProperty, transparencyProperty, type CreateEventInput,
+    buildCreateResource, displayAlarm, rruleProperty, sequenceProperty, statusProperty, textProperty, timeProperty, transparencyProperty, travelDurationProperty, type CreateEventInput,
 } from '../src/calendar/ics-write';
 
 // Expectations are written by hand from the request, the way the write path must derive them; the editor's report is never
@@ -485,6 +486,58 @@ describe('verifyCreateOutcome', () => {
         const zone = insertAfter(created, 'CALSCALE:GREGORIAN', 'BEGIN:VTIMEZONE', 'TZID:America/New_York', 'END:VTIMEZONE');
         expect<unknown>(verifyCreateOutcome(zone, { ...EXPECTED, vtimezoneCount: 1 })).toEqual({ ok: true });
     });
+
+    test('travel time (addendum 1): the expected X-APPLE-TRAVEL-DURATION is a duration value; any other value or line is refused', () => {
+        const travel: ExpectedProperty = { name: 'X-APPLE-TRAVEL-DURATION', type: 'duration', values: ['PT25M'] };
+        const withTravel = buildCreateResource({ ...INPUT, travelDuration: 'PT25M' });
+        const expected: CreateExpectation = { ...EXPECTED, properties: [...EXPECTED.properties, travel] };
+        expect<unknown>(verifyCreateOutcome(withTravel, expected)).toEqual({ ok: true });
+        const line = 'X-APPLE-TRAVEL-DURATION;VALUE=DURATION:PT25M';
+        const table: [string, CreateExpectation, string][] = [
+            [swapLine(withTravel, line, 'X-APPLE-TRAVEL-DURATION;VALUE=DURATION:PT26M'), expected, 'property_mismatch'],
+            [swapLine(withTravel, line, 'X-APPLE-TRAVEL-DURATION:PT25M'), expected, 'property_mismatch'],
+            [swapLine(withTravel, line, line, 'X-APPLE-TRAVEL-START;ROUTING=CAR;VALUE=URI:geo:1,2'), expected, 'unexpected_property'],
+            [swapLine(withTravel, line, line, line), expected, 'property_mismatch'],
+            [withTravel, EXPECTED, 'unexpected_property'],
+            [created, expected, 'property_mismatch'],
+        ];
+        for (const [resource, expectation, reason] of table) { expect<unknown>(failure(verifyCreateOutcome(resource, expectation))).toBe(reason); }
+    });
+});
+
+describe('verifyEditOutcome with travel time (addendum 1)', () => {
+    const BEFORE = crlf([
+        'BEGIN:VCALENDAR', 'VERSION:2.0', 'PRODID:-//Apple Inc.//macOS 15.1//EN', 'BEGIN:VEVENT', 'UID:travel-1', 'DTSTAMP:20261101T120000Z', 'SEQUENCE:2',
+        'DTSTART:20270111T150000Z', 'DTEND:20270111T160000Z', 'SUMMARY:Dentist', 'LOCATION:Main St 1',
+        'X-APPLE-STRUCTURED-LOCATION;VALUE=URI;X-TITLE="Main St 1":geo:52.5,13.4',
+        'X-APPLE-TRAVEL-START;ROUTING=CAR;VALUE=URI;X-ADDRESS=Home:geo:52.4,13.3',
+        'X-APPLE-TRAVEL-ADVISORY-BEHAVIOR:AUTOMATIC',
+        'X-APPLE-TRAVEL-DURATION;VALUE=DURATION:PT17M',
+        'END:VEVENT', 'END:VCALENDAR',
+    ]);
+    const stamps = [stamp('DTSTAMP'), stamp('LAST-MODIFIED'), integer('SEQUENCE', 3)];
+    const edits: ComponentEdit[] = [
+        { op: 'set', property: travelDurationProperty('PT40M') },
+        { op: 'set', property: timeProperty('DTSTAMP', NOW) }, { op: 'set', property: timeProperty('LAST-MODIFIED', NOW) }, { op: 'set', property: sequenceProperty(3) },
+    ];
+    const expectation: EditExpectation = { target: { component: { kind: 'master' }, properties: [{ name: 'X-APPLE-TRAVEL-DURATION', type: 'duration', values: ['PT40M'] }, ...stamps] } };
+
+    test('a replaced duration passes; a changed travel start or a wrong duration is refused', () => {
+        const after = editResource(BEFORE, { target: { kind: 'master' }, edits }).text;
+        expect<unknown>(verifyEditOutcome(BEFORE, after, expectation)).toEqual({ ok: true });
+        expect(failure(verifyEditOutcome(BEFORE, swapLine(after, 'X-APPLE-TRAVEL-DURATION;VALUE=DURATION:PT40M', 'X-APPLE-TRAVEL-DURATION;VALUE=DURATION:PT41M'), expectation))).toBe('property_mismatch');
+        expect(failure(verifyEditOutcome(BEFORE, swapLine(after, 'X-APPLE-TRAVEL-START;ROUTING=CAR;VALUE=URI;X-ADDRESS=Home:geo:52.4,13.3'), expectation))).toBe('property_changed');
+        expect(failure(verifyEditOutcome(BEFORE, swapLine(after, 'X-APPLE-TRAVEL-ADVISORY-BEHAVIOR:AUTOMATIC', 'X-APPLE-TRAVEL-ADVISORY-BEHAVIOR:DISABLED'), expectation))).toBe('property_changed');
+    });
+
+    test('a removed duration passes as an absence; a removal that also took the travel start is refused', () => {
+        const removal: ComponentEdit[] = [{ op: 'remove', name: 'X-APPLE-TRAVEL-DURATION' }, ...edits.slice(1)];
+        const absent: EditExpectation = { target: { component: { kind: 'master' }, properties: [{ name: 'X-APPLE-TRAVEL-DURATION', absent: true }, ...stamps] } };
+        const after = editResource(BEFORE, { target: { kind: 'master' }, edits: removal }).text;
+        expect<unknown>(verifyEditOutcome(BEFORE, after, absent)).toEqual({ ok: true });
+        expect(failure(verifyEditOutcome(BEFORE, swapLine(after, 'X-APPLE-TRAVEL-START;ROUTING=CAR;VALUE=URI;X-ADDRESS=Home:geo:52.4,13.3'), absent))).toBe('property_changed');
+        expect(failure(verifyEditOutcome(BEFORE, after, expectation))).toBe('property_mismatch');
+    });
 });
 
 // ---- Independence and cost ----
@@ -507,5 +560,76 @@ describe('independence and cost', () => {
         started = performance.now();
         expect<unknown>(verifyEditOutcome(before, removed, { target: { component: { kind: 'master' }, alarms: { kind: 'removed' } } })).toEqual({ ok: true });
         expect<unknown>(performance.now() - started).toBeLessThan(2000);
+    });
+});
+
+describe('verifyEditOutcome over several components in one pass (security review finding 5)', () => {
+    const selectors = [{ kind: 'master' }, { kind: 'override', recurrenceId: RID_DEC08 }, { kind: 'override', recurrenceId: RID_DEC22 }] as const;
+    const edits = (sequence: number): ComponentEdit[] => [
+        { op: 'set', property: textProperty('SUMMARY', 'Renamed') },
+        { op: 'set', property: timeProperty('DTSTAMP', NOW) },
+        { op: 'set', property: timeProperty('LAST-MODIFIED', NOW) },
+        { op: 'set', property: sequenceProperty(sequence) },
+    ];
+    // Hand-written from the request: the same title and stamps everywhere, each component its own SEQUENCE.
+    const expectations = selectors.map((component, index) => ({ component, properties: [text('SUMMARY', 'Renamed'), ...STAMPS(index + 7)] }));
+    const ALL = editResource(FIXTURE, { targets: selectors.map((target, index) => ({ target, edits: edits(index + 7) })) });
+
+    test('the one-pass output of every component passes one verification; each component is held to its own expectation', () => {
+        expect<unknown>(verifyEditOutcome(FIXTURE, ALL.text, { targets: expectations })).toEqual({ ok: true });
+        // One override's SEQUENCE as another's: that component fails, whichever it is.
+        const swapped = expectations.map((item, index) => (index === 2 ? { ...item, properties: [text('SUMMARY', 'Renamed'), ...STAMPS(8)] } : item));
+        expect(failure(verifyEditOutcome(FIXTURE, ALL.text, { targets: swapped }))).toBe('property_mismatch');
+        // A component edited but not expected, or expected but not edited, is a change elsewhere or a mismatch.
+        expect(failure(verifyEditOutcome(FIXTURE, ALL.text, { targets: expectations.slice(0, 2) }))).toBe('component_changed');
+        const masterOnly = editResource(FIXTURE, { target: { kind: 'master' }, edits: edits(7) }).text;
+        expect(failure(verifyEditOutcome(FIXTURE, masterOnly, { targets: expectations }))).toBe('property_mismatch');
+    });
+
+    test('the hard rules hold in every component: an ATTENDEE slipped into one override among many is refused', () => {
+        const injected = insertAfter(ALL.text, RID_DEC22, 'ATTENDEE:mailto:x@example.test');
+        expect(failure(verifyEditOutcome(FIXTURE, injected, { targets: expectations }))).toBe('scheduling_added');
+        const grouped = insertAfter(ALL.text, RID_DEC08, 'item9.ORGANIZER:mailto:x@example.test');
+        expect(failure(verifyEditOutcome(FIXTURE, grouped, { targets: expectations }))).toBe('scheduling_added');
+    });
+
+    test('a component named twice, both forms at once, or a component that does not exist is refused', () => {
+        expect(failure(verifyEditOutcome(FIXTURE, ALL.text, { targets: [...expectations, expectations[0] as (typeof expectations)[number]] }))).toBe('expectation_invalid');
+        expect(failure(verifyEditOutcome(FIXTURE, ALL.text, { target: expectations[0], targets: expectations.slice(1) }))).toBe('expectation_invalid');
+        expect(failure(verifyEditOutcome(FIXTURE, ALL.text, { targets: [...expectations, { component: { kind: 'override', recurrenceId: `${RID_DEC08}0` }, properties: [] }] }))).toBe('target_not_found');
+        expect(failure(verifyEditOutcome(FIXTURE, ALL.text, { targets: expectations, removeOverride: { recurrenceId: RID_DEC22 } }))).toBe('expectation_invalid');
+    });
+
+    test('with the caller\'s work charge, every parse charges it and a budget failure propagates instead of becoming a verdict', () => {
+        let parses = 0;
+        expect<unknown>(verifyEditOutcome(FIXTURE, ALL.text, { targets: expectations }, { work: () => { parses++; return { chargeLines: () => undefined, chargeProperties: () => undefined }; } })).toEqual({ ok: true });
+        expect(parses).toBe(2);
+        let thrown: unknown = null;
+        try { verifyEditOutcome(FIXTURE, ALL.text, { targets: expectations }, { work: () => ({ chargeLines: () => { throw new BudgetError('deadline'); }, chargeProperties: () => undefined }) }); } catch (error) { thrown = error; }
+        expect<unknown>(thrown instanceof BudgetError && thrown.kind).toBe('deadline');
+        thrown = null;
+        try { verifyCreateOutcome(FIXTURE, { properties: [], alarms: [] }, { work: () => ({ chargeLines: () => { throw new BudgetError('work'); }, chargeProperties: () => undefined }) }); } catch (error) { thrown = error; }
+        expect<unknown>(thrown instanceof BudgetError && thrown.kind).toBe('work');
+    });
+});
+
+describe('the scheduling-name policy shared with the attendee gate (security review finding 6)', () => {
+    test('names: ATTENDEE and ORGANIZER after an optional group prefix, any case; X- names are not scheduling names', () => {
+        for (const name of ['ATTENDEE', 'organizer', 'item1.ATTENDEE', 'A.Organizer']) { expect<unknown>([name, isSchedulingName(name)]).toEqual([name, true]); }
+        for (const name of ['X-ATTENDEE', 'X-ORGANIZER', 'ATTENDEES', 'SUMMARY', 'item1.X-ATTENDEE']) { expect<unknown>([name, isSchedulingName(name)]).toEqual([name, false]); }
+    });
+
+    test('the scan sees every line of the text: nested or unknown components, folded names, any line break', () => {
+        const wrap = (lines: readonly string[]): string => crlf(['BEGIN:VCALENDAR', 'VERSION:2.0', ...lines, 'END:VCALENDAR']);
+        for (const text of [
+            wrap(['BEGIN:X-WRAPPER', 'BEGIN:VEVENT', 'ATTENDEE:mailto:a@example.test', 'END:VEVENT', 'END:X-WRAPPER']),
+            wrap(['BEGIN:VEVENT', 'item1.attendee;CN=a:mailto:a@example.test', 'END:VEVENT']),
+            wrap(['BEGIN:VEVENT', 'ATTEN', ' DEE:mailto:a@example.test', 'END:VEVENT']),
+            wrap(['BEGIN:VEVENT', 'SUMMARY:x\rORGANIZER:mailto:o@example.test', 'END:VEVENT']),
+            'ORGANIZER:mailto:o@example.test',
+        ]) {
+            expect<unknown>([text, hasSchedulingLine(text)]).toEqual([text, true]);
+        }
+        expect(hasSchedulingLine(wrap(['BEGIN:VEVENT', 'X-ATTENDEE:mailto:a@example.test', 'DESCRIPTION:ATTENDEE:mailto:a@example.test', 'SUMMARY:x', ' ATTENDEE:folded text', 'END:VEVENT']))).toBe(false);
     });
 });

@@ -1,10 +1,12 @@
 import { z } from 'zod';
 import { readToolErrorCodeSchema } from './event-schemas';
+import { writeToolErrorCodeSchema } from './write-schemas';
 
 /** list_calendars returns at most this many collections; more are reported with truncated: true. */
 export const MAX_CALENDARS = 200;
 
-export const toolErrorCodeSchema = readToolErrorCodeSchema;
+/** Every tool error code: the read tools' codes and the codes only the write tools produce. */
+export const toolErrorCodeSchema = z.enum([...readToolErrorCodeSchema.options, ...writeToolErrorCodeSchema.options]);
 export type ToolErrorCode = z.infer<typeof toolErrorCodeSchema>;
 
 export const listCalendarsInputSchema = z.strictObject({});

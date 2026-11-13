@@ -6,16 +6,25 @@ import { createManagedAttachmentFetcher, type ManagedAttachmentFetcher } from '.
 import type { FetchLike } from '../caldav/hosts';
 import { MANAGED_ATTACHMENT_POLICY, type ManagedAttachmentPolicy } from '../caldav/managed-attachment-policy';
 import { getAttachmentDownload } from './attachment-read';
-import { createDownloadBudget, createReadBudget, type ReadBudget } from './budget';
+import type { CalDavWriteBackend } from '../caldav/write-contracts';
+import { createDownloadBudget, createReadBudget, createWriteBudget, type ReadBudget } from './budget';
 import type { DownloadStore } from './downloads';
 import type { DownloadArgs, DownloadOutput, GetEventArgs, ListEventsArgs, SearchEventsArgs } from './event-schemas';
 import { BudgetError } from './model';
 import { getEvent, listEvents, ReadError, searchEvents, type DetailReadResult, type ErrorDetail, type EventsReadResult, type ReadDeps } from './read';
+import { createEvent, deleteEvent, updateEvent, WriteError, type WriteDeps, type WriteErrorExtra } from './write';
+import type { CreateEventArgs, DeleteEventArgs, DeleteEventResult, UpdateEventArgs, WriteEventResult } from './write-schemas';
 
-/** A fixed, sanitized tool failure. It never carries upstream text. */
+/**
+ * A fixed, sanitized tool failure. It carries fixed enums and, for write tools, the sanitised upstream summary (whose
+ * detail is untrusted text), never raw upstream text.
+ */
 export class CalendarError extends Error {
-    constructor(public readonly code: ToolErrorCode, public readonly detail?: ErrorDetail) { super(code); }
+    constructor(public readonly code: ToolErrorCode, public readonly detail?: ErrorDetail, public readonly extra: WriteErrorExtra = {}) { super(code); }
 }
+
+/** What the write tools need to know about the caller's grant: `calendar:invite` opens the attendee gate. */
+export interface WriteGrant { scopes: readonly string[] }
 
 export interface BoundCalendarService {
     list_calendars(input: Record<string, never>): Promise<ListCalendarsOutput>;
@@ -23,6 +32,9 @@ export interface BoundCalendarService {
     search_events(input: SearchEventsArgs): Promise<EventsReadResult>;
     get_event(input: GetEventArgs): Promise<DetailReadResult>;
     get_event_attachment_download(input: DownloadArgs): Promise<DownloadOutput>;
+    create_event(input: CreateEventArgs, grant: WriteGrant): Promise<WriteEventResult>;
+    update_event(input: UpdateEventArgs, grant: WriteGrant): Promise<WriteEventResult>;
+    delete_event(input: DeleteEventArgs, grant: WriteGrant): Promise<DeleteEventResult>;
 }
 
 export interface DownloadBinding {
@@ -36,8 +48,10 @@ export interface DownloadBinding {
 }
 
 export interface CalendarBinding {
-    /** Production has all read methods; phase-1-only injected backends fail closed for event reads. */
-    caldav: Pick<CalDavBackend, 'listCalendars'> & Partial<Omit<CalDavReadBackend, 'listCalendars'>>;
+    /** Production has all read and write methods; injected backends without them fail closed for those tools. */
+    caldav: Pick<CalDavBackend, 'listCalendars'> & Partial<Omit<CalDavReadBackend, 'listCalendars'>> & Partial<CalDavWriteBackend>;
+    /** Server clock in epoch milliseconds for written stamps. Defaults to Date.now. */
+    now?: () => number;
     connectionStatus: ConnectionStatus;
     /**
      * Decrypts and re-validates the stored credentials. Called only when a tool needs iCloud and
@@ -82,6 +96,7 @@ export function bindCalendarService(binding: CalendarBinding): BoundCalendarServ
         try {
             return await call(credentials, unauthorized);
         } catch (error) {
+            if (read && error instanceof WriteError) { throw new CalendarError(error.code, undefined, error.extra); }
             if (read && (error instanceof ReadError || error instanceof CalendarError)) { throw new CalendarError(error.code, error.detail); }
             if (read && error instanceof BudgetError) { throw new CalendarError(error.kind === 'deadline' ? 'temporarily_unavailable' : 'result_too_large'); }
             if (!(error instanceof CalDavError)) { throw new CalendarError('temporarily_unavailable'); }
@@ -115,7 +130,35 @@ export function bindCalendarService(binding: CalendarBinding): BoundCalendarServ
             });
         }, true);
     };
+    const write = <T>(call: (deps: WriteDeps) => Promise<T>, grant: WriteGrant): Promise<T> => {
+        // The 40 s write budget begins here, before credentials and membership.
+        const budget = createWriteBudget();
+        return upstream(async (credentials, onUnauthorized) => {
+            const backend = binding.caldav;
+            const { queryEvents, multigetEvents, putEvent, deleteEvent } = backend;
+            if (queryEvents === undefined || multigetEvents === undefined || putEvent === undefined || deleteEvent === undefined) { throw new CalendarError('temporarily_unavailable'); }
+            return call({
+                backend: {
+                    listCalendars: backend.listCalendars.bind(backend),
+                    queryEvents: queryEvents.bind(backend),
+                    multigetEvents: multigetEvents.bind(backend),
+                    putEvent: putEvent.bind(backend),
+                    deleteEvent: deleteEvent.bind(backend),
+                },
+                auth: { appleId: credentials.appleId, appPassword: credentials.appPassword },
+                discovery: { principalUrl: credentials.principalUrl, calendarHomeUrl: credentials.calendarHomeUrl },
+                accountId: credentials.accountId,
+                budget,
+                onUnauthorized,
+                now: binding.now ?? Date.now,
+                scopes: [...grant.scopes],
+            });
+        }, true);
+    };
     return {
+        create_event: (input, grant) => write(deps => createEvent(deps, input), grant),
+        update_event: (input, grant) => write(deps => updateEvent(deps, input), grant),
+        delete_event: (input, grant) => write(deps => deleteEvent(deps, input), grant),
         list_events: input => read(deps => listEvents(deps, input)),
         search_events: input => read(deps => searchEvents(deps, input)),
         get_event: input => read(deps => getEvent(deps, input)),
