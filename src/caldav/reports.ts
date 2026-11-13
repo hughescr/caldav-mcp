@@ -1,9 +1,9 @@
 /** REPORT request builders and strict, namespace-aware event response extraction. */
 import { MAX_MULTIGET_HREFS, MAX_MULTIGET_XML_BYTES, MAX_REPORT_BYTES, MAX_RESOURCES_PER_REPORT } from '../calendar/limits';
-import { isCanonicalPath } from '../calendar/model';
+import { isResourceHref } from '../calendar/model';
 import { CalDavError } from './contracts';
-import { canonicalizeCalendarPath, canonicalizeServerHref, isDirectChildResource } from './identifiers';
-import type { CalendarResource, ReadCharge } from './read-contracts';
+import { canonicalizeCalendarPath, canonicalizeServerHref, isDirectChildResource, resolveServerResourceHref } from './identifiers';
+import type { CalendarResource, QueriedResource, ReadCharge } from './read-contracts';
 import { CALDAV_NS, DAV_NS, assertCompleteMultistatus, childrenNamed, isElement, parseXml, type XmlElement } from './xml';
 
 export interface ReportContext {
@@ -46,10 +46,10 @@ export function buildExpandedQuery(range: { startUtc: string; endUtc: string }):
         + `<c:filter><c:comp-filter name="VCALENDAR"><c:comp-filter name="VEVENT"><c:time-range ${bounds}/></c:comp-filter></c:comp-filter></c:filter></c:calendar-query>`;
 }
 
-/** Builds one unexpanded multiget, rejecting empty, duplicate, noncanonical or oversized input batches. */
+/** Builds one unexpanded multiget, rejecting empty, duplicate, invalid or oversized input batches. Hrefs are XML-escaped only. */
 export function buildMultiget(hrefs: readonly string[]): string {
     if (hrefs.length === 0 || hrefs.length > MAX_MULTIGET_HREFS || new Set(hrefs).size !== hrefs.length
-        || hrefs.some((href) => !isCanonicalPath(href) || href.endsWith('/'))) { return protocol(); }
+        || hrefs.some((href) => !isResourceHref(href))) { return protocol(); }
     const xml = `${DECLARATION}<c:calendar-multiget ${NAMESPACES}><d:prop><d:getetag/><c:calendar-data/></d:prop>`
         + hrefs.map((href) => `<d:href>${escapeXml(href)}</d:href>`).join('') + '</c:calendar-multiget>';
     if (Buffer.byteLength(xml, 'utf8') > MAX_MULTIGET_XML_BYTES) { return protocol(); }
@@ -120,11 +120,13 @@ function successfulResource(response: XmlElement, href: string): CalendarResourc
 }
 
 /**
- * Extracts a complete event REPORT. Every reply (even a failure) must be a unique direct child of the selected
- * collection at the authenticated home origin. Explicit 404s have no resource; multiget still requires their replies.
+ * Extracts a complete event REPORT. Every reply (even a failure) must name the selected collection at the authenticated
+ * home origin, by an href kept byte for byte, and be unique. Explicit 404s have no resource; multiget still requires
+ * their replies, each exactly a requested href. In an expanded query, a well-formed reply whose href is a refused name of
+ * this calendar (resolveServerResourceHref `unsupported_name`) becomes one UnaddressableResource entry, in order.
  * @throws {CalDavError} For malformed, incomplete, out-of-scope, partial or over-limit responses.
  */
-export function extractEventReport(xml: string, context: ReportContext): CalendarResource[] {
+export function extractEventReport(xml: string, context: ReportContext): QueriedResource[] {
     if (Buffer.byteLength(xml, 'utf8') > MAX_REPORT_BYTES) { return tooLarge(); }
     const calendar = canonicalizeCalendarPath(context.calendarId);
     if (calendar !== context.calendarId) { return protocol(); }
@@ -147,10 +149,22 @@ export function extractEventReport(xml: string, context: ReportContext): Calenda
     const responses = childrenNamed(root, DAV_NS, 'response');
     if (responses.length > MAX_RESOURCES_PER_REPORT) { return tooLarge(); }
     const seen = new Set<string>();
-    const resources: CalendarResource[] = [];
+    const seenUnaddressable = new Set<string>();
+    const resources: QueriedResource[] = [];
     for (const response of responses) {
-        const href = canonicalizeServerHref(text(single(response, DAV_NS, 'href')).trim(), context.requestUrl);
-        if (!isDirectChildResource(calendar, href) || seen.has(href) || (requested && !requested.has(href))) { return protocol(); }
+        const raw = text(single(response, DAV_NS, 'href')).trim();
+        const resolved = resolveServerResourceHref(raw, context.requestUrl, calendar);
+        if (resolved.kind === 'unsupported_name') {
+            // Only an expanded query can do without one resource; the same raw href twice cannot be told apart.
+            if (requested || seenUnaddressable.has(raw)) { return protocol(); }
+            seenUnaddressable.add(raw);
+            // The reply must still be well formed and successful: its own failures stay the whole answer's.
+            if (successfulResource(response, '') === null) { return failStatus(404); }
+            resources.push({ unaddressable: true });
+            continue;
+        }
+        const { href } = resolved;
+        if (seen.has(href) || (requested && !requested.has(href))) { return protocol(); }
         seen.add(href);
         const resource = successfulResource(response, href);
         if (resource) { resources.push(resource); }

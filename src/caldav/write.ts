@@ -1,7 +1,8 @@
 /**
  * The only PUT and DELETE senders (phase 3 design v2 sections 5.1 and 6.5), on the guarded fetch:
- * - fixed host rule, and a scope guard: the request URL is on the authenticated home's origin and its canonical path is the
- *   target href, a direct child of a calendar collection directly under the home;
+ * - fixed host rule, and a scope guard: the request URL is on the authenticated home's origin and its path is the target
+ *   href byte for byte (an opaque name, never decoded or re-encoded), a direct child of a calendar collection directly
+ *   under the home;
  * - `If-None-Match: *` for a create, the exact strong ETag in `If-Match` for an update or delete; nothing else is buildable;
  * - no redirect is followed (a 3xx is reported, the write is never re-sent), no retry of any kind;
  * - a 401 is decided from the status alone; a definitive 2xx (not 202) is decided from its status and headers, its body
@@ -15,7 +16,7 @@ import { MAX_RESOURCE_BYTES } from '../calendar/limits';
 import { isCanonicalPath } from '../calendar/model';
 import { CalDavError, type CalDavAuth, type Discovery } from './contracts';
 import { assertAllowedCalDavUrl, createGuardedFetch, isTruncatedResponse, type FetchLike } from './hosts';
-import { canonicalizeServerHref, isDirectChildResource } from './identifiers';
+import { canonicalizeServerHref, exactResourceUrl, isDirectChildResource } from './identifiers';
 import { KNOWN_PRECONDITIONS, strongEtag, type CalDavWriteBackend, type UpstreamDetail, type WriteCallOptions, type WriteResponse } from './write-contracts';
 import { DAV_NS, parseXml, type XmlElement } from './xml';
 
@@ -149,8 +150,9 @@ function writeTarget(discovery: Discovery, calendarId: string, href: string): Ta
     if (typeof calendarId !== 'string' || typeof href !== 'string' || !isCanonicalPath(calendarId) || !calendarId.endsWith('/') || !calendarId.startsWith(homePath)) { return fail('protocol'); }
     const child = calendarId.slice(homePath.length, -1);
     if (child === '' || child.includes('/') || !isDirectChildResource(calendarId, href)) { return fail('protocol'); }
-    const url = new URL(href, home);
-    if (url.origin !== home.origin || canonicalizeServerHref(url.href, home.href) !== href) { return fail('protocol'); }
+    // The href is opaque: the URL must carry it byte for byte, never decoded, re-encoded or case-normalised.
+    const url = exactResourceUrl(home, href);
+    if (url === null) { return fail('protocol'); }
     return { home, url, href };
 }
 
@@ -200,8 +202,9 @@ export function createWriteBackend(options: WriteBackendOptions): CalDavWriteBac
             keepStatusOnBodyFailure: true,
             followRedirects: false,
             preserveMethod: true,
+            // Exactly the target URL, as built and checked by writeTarget, and nothing else (no redirect is ever followed).
             validateUrl: (url, raw) => {
-                if (url.origin !== target.home.origin || canonicalizeServerHref(raw, url.href) !== target.href || canonicalizeServerHref(url.href, target.home.href) !== target.href) { fail('protocol'); }
+                if (raw !== target.url.href || url.href !== target.url.href || exactResourceUrl(target.home, target.href)?.href !== url.href) { fail('protocol'); }
             },
         });
         let response: Response;

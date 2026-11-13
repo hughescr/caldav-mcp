@@ -1,5 +1,8 @@
-/** Canonical URL paths shared by discovery and the event-read transport. */
-import { isCanonicalPath } from '../calendar/model';
+/**
+ * URL paths shared by discovery, the event-read transport and the writer. Collection paths (the home and calendar ids)
+ * are canonicalized; a resource href is an opaque string issued by iCloud, kept and sent byte for byte.
+ */
+import { isCanonicalPath, isResourceHref } from '../calendar/model';
 import { CalDavError } from './contracts';
 
 function protocol(): never { throw new CalDavError('protocol'); }
@@ -44,10 +47,68 @@ export function canonicalizeCalendarPath(path: string): string {
     return canonicalizeServerHref(path, 'https://caldav.icloud.com/');
 }
 
-/** True only for an already-canonical, direct child resource of an already-canonical collection. */
+/**
+ * True only for a resource href that is exactly this canonical collection path followed by one opaque resource name
+ * ({@link isResourceHref}). Compares bytes: nothing is decoded, so a differently escaped spelling is a different href.
+ */
 export function isDirectChildResource(collectionPath: string, resourcePath: string): boolean {
-    if (!isCanonicalPath(collectionPath) || !collectionPath.endsWith('/') || !isCanonicalPath(resourcePath)
-        || !resourcePath.startsWith(collectionPath)) { return false; }
-    const child = resourcePath.slice(collectionPath.length);
-    return child !== '' && !child.includes('/');
+    if (typeof collectionPath !== 'string' || typeof resourcePath !== 'string' || !isCanonicalPath(collectionPath) || !collectionPath.endsWith('/')) { return false; }
+    return isResourceHref(resourcePath) && resourcePath.lastIndexOf('/') === collectionPath.length - 1 && resourcePath.startsWith(collectionPath);
+}
+
+export type ServerResourceHref = { kind: 'resource'; href: string } | { kind: 'unsupported_name' };
+
+const SCHEME_AUTHORITY = /^([A-Za-z][A-Za-z0-9+.-]*:\/\/)([^/]*)(.*)$/su;
+const decodeOnce = (text: string): string => text.replace(/%([0-9A-Fa-f]{2})/gu, (_, hex: string) => String.fromCharCode(Number.parseInt(hex, 16)));
+
+/**
+ * The exact resource href that one server href of a REPORT names, without decoding, re-encoding or case-normalising any
+ * of it. An absolute URL must be on the base's origin with no userinfo (only the origin is parsed; the path is the raw
+ * text after it); an absolute path is taken as is; a relative reference is appended to the base path's directory.
+ *
+ * - `resource`: a direct child of `calendarId` under {@link isResourceHref}; WHATWG URL parses it back to the same bytes.
+ * - `unsupported_name`: the href names something in this calendar (the calendar path, then one segment with no `/` or `\`
+ *   that is not a dot segment) whose name the rule refuses. Attributable to its own response; carries nothing from it.
+ * @throws {CalDavError} protocol when the href is outside the calendar: another origin, userinfo, a network-path or
+ *   backslash reference, another collection or account, the collection itself, a nested path or a dot segment.
+ */
+export function resolveServerResourceHref(href: string, baseUrl: string, calendarId: string): ServerResourceHref {
+    let base: URL;
+    try { base = new URL(baseUrl); } catch { return protocol(); }
+    let path: string;
+    const absolute = SCHEME_AUTHORITY.exec(href);
+    if (absolute) {
+        const [, scheme = '', authority = '', rest = ''] = absolute;
+        if (authority === '' || /[@\\?#\s]/u.test(authority)) { return protocol(); }
+        let origin: URL;
+        try { origin = new URL(`${scheme}${authority}/`); } catch { return protocol(); }
+        if (origin.origin !== base.origin || origin.username !== '' || origin.password !== '' || !rest.startsWith('/')) { return protocol(); }
+        path = rest;
+    } else if (/^[A-Za-z][A-Za-z0-9+.-]*:/u.test(href) || href.startsWith('//') || href.startsWith('\\')) {
+        return protocol();
+    } else if (href.startsWith('/')) {
+        path = href;
+    } else {
+        path = `${base.pathname.slice(0, base.pathname.lastIndexOf('/') + 1)}${href}`;
+    }
+    if (!path.startsWith(calendarId)) { return protocol(); }
+    const name = path.slice(calendarId.length);
+    const segment = name.split(/[?#]/u)[0] ?? '';
+    const dot = decodeOnce(segment);
+    if (name === '' || /[/\\]/u.test(name) || dot === '.' || dot === '..') { return protocol(); }
+    if (!isDirectChildResource(calendarId, path)) { return { kind: 'unsupported_name' }; }
+    // The rule's character set is chosen so this holds; checked anyway, so an accepted href is one URL leaves untouched.
+    const parsed = new URL(path, base.origin);
+    if (parsed.pathname !== path || parsed.search !== '' || parsed.hash !== '') { return { kind: 'unsupported_name' }; }
+    return { kind: 'resource', href: path };
+}
+
+/**
+ * The request URL for a resource href on the home's origin, proven to carry the href byte for byte: WHATWG URL must
+ * parse it back to exactly that path, with no query or fragment. Null otherwise.
+ */
+export function exactResourceUrl(home: URL, href: string): URL | null {
+    let url: URL;
+    try { url = new URL(href, home.origin); } catch { return null; }
+    return url.origin === home.origin && url.username === '' && url.password === '' && url.pathname === href && url.search === '' && url.hash === '' ? url : null;
 }

@@ -33,9 +33,9 @@ describe('P1 exact REPORT request contracts', () => {
     ]) {
         test(`rejects invalid REPORT bound ${range.startUtc}`, () => protocol(() => buildExpandedQuery(range)));
     }
-    test('multiget rejects duplicate, empty, noncanonical and over-50 href lists', () => {
+    test('multiget rejects duplicate, empty, invalid and over-50 href lists', () => {
         // T0-DECISION: reject empty multiget input as internal protocol misuse; a caller should issue no request instead.
-        for (const hrefs of [[], [`${calendarId}a.ics`, `${calendarId}a.ics`], [`${calendarId}%61.ics`], Array.from({ length: 51 }, (_, i) => `${calendarId}${i}.ics`)]) {
+        for (const hrefs of [[], [`${calendarId}a.ics`, `${calendarId}a.ics`], [`${calendarId}%2E%2E`], [`${calendarId}a%zz.ics`], Array.from({ length: 51 }, (_, i) => `${calendarId}${i}.ics`)]) {
             protocol(() => buildMultiget(hrefs));
         }
     });
@@ -48,7 +48,8 @@ describe('P1 exact REPORT request contracts', () => {
     });
 });
 
-describe('P1 canonical href contract agrees with public Path', () => {
+// canonicalizeServerHref is for collection paths (home, calendar ids, request URLs); resource hrefs are opaque (tests/caldav-opaque-href.test.ts).
+describe('P1 canonical collection path contract agrees with public Path', () => {
     for (const [source, path] of [
         [`${base}%65vent%20%7b1%7d.ics`, `${calendarId}event%20%7B1%7D.ics`],
         ['event%5e1.ics', `${calendarId}event%5E1.ics`],
@@ -82,7 +83,7 @@ describe('P1 canonical href contract agrees with public Path', () => {
 });
 
 describe('P1 strict namespace-aware REPORT extraction', () => {
-    test('extracts exact ETag and LF decoded calendar-data with canonical href', () => {
+    test('extracts exact ETag and LF decoded calendar-data with the href exactly as sent', () => {
         expect(extractEventReport(xml, context)).toEqual([expected.resource]);
         expect(extractEventReport(xml.replaceAll('\n', '\r\n'), context)).toEqual([expected.resource]);
     });

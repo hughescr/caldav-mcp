@@ -15,7 +15,7 @@ import { MAX_MEMBERSHIP_BYTES, MAX_REPORT_BYTES } from '../calendar/limits';
 import { isCanonicalPath } from '../calendar/model';
 import { canonicalizeCalendarPath, canonicalizeServerHref, isDirectChildResource } from './identifiers';
 import { buildExpandedQuery, buildMultiget, extractEventReport } from './reports';
-import type { CalDavReadBackend, CalendarResource, DavCallOptions, ResourceLookup } from './read-contracts';
+import { isAddressedResource, type CalDavReadBackend, type DavCallOptions, type QueriedResource, type ResourceLookup } from './read-contracts';
 import { CalDavError, type CalDavAuth, type CalDavBackend, type CalDavErrorCode, type CalendarSummary, type Discovery } from './contracts';
 import { ICLOUD_CALDAV_ROOT, assertAllowedCalDavUrl, createGuardedFetch, isAllowedCalDavUrl, type FetchLike } from './hosts';
 import { createWriteBackend } from './write';
@@ -255,7 +255,7 @@ export function createICloudBackend(options: ICloudBackendOptions = {}): CalDavB
         return { home, target: new URL(calendarId, home) };
     }
 
-    async function eventReport(auth: CalDavAuth, discovery: Discovery, calendarId: string, body: string, call?: DavCallOptions, hrefs?: readonly string[]): Promise<CalendarResource[]> {
+    async function eventReport(auth: CalDavAuth, discovery: Discovery, calendarId: string, body: string, call?: DavCallOptions, hrefs?: readonly string[]): Promise<QueriedResource[]> {
         const { home, target } = readTarget(discovery, calendarId);
         if (hrefs?.some((href) => !isDirectChildResource(calendarId, href))) { return fail('protocol'); }
         const response = await readDav(target, home, 'REPORT', body, auth, call);
@@ -270,12 +270,15 @@ export function createICloudBackend(options: ICloudBackendOptions = {}): CalDavB
         putEvent: writer.putEvent,
         deleteEvent: writer.deleteEvent,
 
-        async queryEvents(auth, discovery, query, call): Promise<readonly CalendarResource[]> {
+        async queryEvents(auth, discovery, query, call): Promise<readonly QueriedResource[]> {
             return eventReport(auth, discovery, query.calendarId, buildExpandedQuery(query.range), call);
         },
 
         async multigetEvents(auth, discovery, query, call): Promise<readonly ResourceLookup[]> {
-            const resources = await eventReport(auth, discovery, query.calendarId, buildMultiget(query.hrefs), call, query.hrefs);
+            // A multiget answer is only ever exactly the requested hrefs (extractEventReport refuses anything else).
+            const entries = await eventReport(auth, discovery, query.calendarId, buildMultiget(query.hrefs), call, query.hrefs);
+            const resources = entries.filter(isAddressedResource);
+            if (resources.length !== entries.length) { return fail('protocol'); }
             const byHref = new Map(resources.map((resource) => [resource.href, resource]));
             return query.hrefs.map((href) => {
                 const resource = byHref.get(href);

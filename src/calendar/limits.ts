@@ -115,8 +115,6 @@ export const RESOURCE_ENVELOPE_MARKUP: readonly string[] = [
 ];
 export const MIN_RESOURCE_ENVELOPE_BYTES = RESOURCE_ENVELOPE_MARKUP.reduce((sum, markup) => sum + markup.length, 0);
 
-/** Required tool-description sentence for list_events and search_events. */
-export const EDGE_INCLUSION_SENTENCE = 'All-day and floating events up to 24 hours outside the range edges may be included because their stored values are compared as if they were UTC; these events are passed through, not converted to a timezone.';
 /** Fixed resume hint texts. A hint, never a cursor. */
 export const RESUME_INSTRUCTION = 'Re-query from this civil start with an explicit offset or Z, de-duplicate by calendar_id/resource_href/recurrence_id, and narrow the range or select fewer calendars if the same prefix repeats. This is a hint, not a cursor or completeness guarantee.';
 export const RESUME_INSTRUCTION_NO_ROW = 'No event fit in the result. Narrow the range or select fewer calendars. This is a hint, not a cursor or completeness guarantee.';
