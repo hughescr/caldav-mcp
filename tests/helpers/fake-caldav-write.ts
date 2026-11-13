@@ -24,6 +24,10 @@ import { FAKE_DISCOVERY } from './fake-caldav';
  *   body here is synthetic.
  * - Stored lines are re-folded at up to 91 octets, never inside a UTF-8 sequence, with CRLF (Run 7: write-text-roundtrip);
  *   a multiget returns LF line endings (REPORT calendar-data differs from GET only in line endings, earlier runs).
+ * - RRULE parts are stored in iCloud's own order, values unchanged (measured 2026-11-12: written
+ *   FREQ=WEEKLY;INTERVAL=2;COUNT=3, stored FREQ=WEEKLY;COUNT=3;INTERVAL=2; FREQ=WEEKLY;COUNT=3 and FREQ=WEEKLY;UNTIL=...Z
+ *   came back unchanged). Modelled: FREQ first, then COUNT before INTERVAL (measured). GUESS: every other part follows them
+ *   in its written order.
  * - `rewrite` (switchable): replaces the local digits of DTSTART/DTEND with one TZID, standing in for the measured
  *   Australia/Lord_Howe rewrite (Run 7: write-iana-zones, stored 20261215T233000). The real rule is unknown.
  * - Faults (`failNextWrite`, `failNextRead`, `failNextQuery`) inject the adversarial cases: a lost answer after applying, a
@@ -295,6 +299,19 @@ const tzidOf = (line: string): string | null => {
     return raw.startsWith('"') ? raw.slice(1, -1) : raw;
 };
 
+/** iCloud's order of RRULE parts (see the header): FREQ, COUNT, INTERVAL measured; the rest in written order is a GUESS. */
+const RULE_PART_RANK = ['FREQ', 'COUNT', 'INTERVAL'];
+function icloudRuleOrder(line: string): string {
+    const value = valueOf(line);
+    const rank = (part: string): number => {
+        const found = RULE_PART_RANK.indexOf((part.split('=')[0] ?? '').toUpperCase());
+        return found === -1 ? RULE_PART_RANK.length : found;
+    };
+    // Array sort is stable, so parts of equal rank keep their written order.
+    const parts = value.split(';').sort((a, b) => rank(a) - rank(b));
+    return `${line.slice(0, line.length - value.length)}${parts.join(';')}`;
+}
+
 interface Vevent { lines: string[] }
 
 function vevents(lines: readonly string[]): Vevent[] {
@@ -416,7 +433,10 @@ export class FakeICloud implements CalDavReadBackend, CalDavWriteBackend {
         return null;
     }
 
-    /** The text as iCloud keeps it: VTIMEZONEs regenerated for the TZIDs used, the rewrite applied, re-folded at 91 octets, CRLF. */
+    /**
+     * The text as iCloud keeps it: VTIMEZONEs regenerated for the TZIDs used, RRULE parts in iCloud's order, the rewrite
+     * applied, re-folded at 91 octets, CRLF.
+     */
     private stored(text: string): string {
         const lines = unfold(text);
         const kept: string[] = [];
@@ -435,7 +455,7 @@ export class FakeICloud implements CalDavReadBackend, CalDavWriteBackend {
                 kept.push(`${line.slice(0, line.length - value.length)}${rewrite.to(value)}`);
                 continue;
             }
-            kept.push(line);
+            kept.push(name === 'RRULE' ? icloudRuleOrder(line) : line);
         }
         const zones = new Set<string>();
         for (const event of vevents(kept)) {

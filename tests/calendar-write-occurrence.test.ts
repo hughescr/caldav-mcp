@@ -579,6 +579,23 @@ describe('update_event, edit_scope this_and_future (split)', () => {
         const created = unfold(puts(h.fake)[0]?.body ?? '');
         expect<unknown>([result.write_outcome, created.filter(line => /^(RRULE|EXDATE|RECURRENCE-ID)/u.test(line)), result.stored_differs_from_request]).toEqual(['applied', ['RRULE:FREQ=WEEKLY;INTERVAL=2;COUNT=3'], []]);
         expect((await instances(h.fake, NEW_HREF)).map(line => line.slice(0, 16))).toEqual(['20270126T150000Z', '20270209T150000Z', '20270223T150000Z']);
+        // iCloud stored the parts in its own order (measured); the read-back above still found the rule as requested.
+        expect(unfold(h.fake.get(WORK, NEW_HREF)?.text ?? '')).toContain('RRULE:FREQ=WEEKLY;COUNT=3;INTERVAL=2');
+        // The same call on the old version is provable by text (the exceptions were dropped).
+        const again = await update(h, splitRequest(etag, { ...ruled, exceptions: 'drop' }));
+        expect<unknown>([again.write_outcome, again.created_series?.write_outcome, h.fake.count('putEvent')]).toEqual(['desired_state_present', 'desired_state_present', 2]);
+    });
+
+    test('a split whose second write failed finishes on the same call although iCloud reordered the new rule\'s parts', async () => {
+        const h = harness();
+        const etag = h.fake.seed(WORK, UTC_HREF, UTC_SERIES);
+        const request = splitRequest(etag, { changes: { recurrence: { rrule: 'FREQ=WEEKLY;INTERVAL=2;COUNT=3' } } });
+        h.fake.failNextWrite({ kind: 'none' }, { kind: 'status', status: 403, apply: false });
+        expect((await failure(() => update(h, request))).code).toBe('split_incomplete');
+        expect(unfold(h.fake.get(WORK, NEW_HREF)?.text ?? '')).toContain('RRULE:FREQ=WEEKLY;COUNT=3;INTERVAL=2');
+        const finished = await update(h, request);
+        expect<unknown>([finished.write_outcome, finished.created_series?.write_outcome, finished.stored_differs_from_request, h.fake.count('putEvent')]).toEqual(['applied', 'desired_state_present', [], 4]);
+        expect((await instances(h.fake, UTC_HREF)).length).toBe(3);
     });
 
     test('a split that drops lists what it dropped (EXDATE values, not lines), in the result and in split_incomplete and outcome_unknown', async () => {
@@ -759,6 +776,27 @@ describe('update_event, edit_scope all: moving a series', () => {
         const result = await update(h, { calendar_id: WORK, resource_href: SHIFT_HREF, expected_version: etag, edit_scope: 'all', exceptions: 'drop', changes: { start: '2027-02-08T17:00:00Z', end: '2027-02-08T18:00:00Z' } });
         expect<unknown>([result.exceptions_dropped?.changed_occurrences, result.exceptions_dropped?.changed.length, result.exceptions_dropped?.truncated, result.exceptions_dropped?.changed[0]?.title?.length]).toEqual([60, 50, true, 256]);
         expect(writeEventResultSchema.safeParse(result).success).toBe(true);
+    });
+
+    test('a rule change iCloud stores with its parts reordered (measured) reads back as requested; a retry is desired_state_present', async () => {
+        const rule = { recurrence: { rrule: 'FREQ=WEEKLY;INTERVAL=2;COUNT=3' } };
+        // Without exceptions: the rule alone.
+        const plain = harness();
+        const plainEtag = plain.fake.seed(WORK, UTC_HREF, UTC_SERIES);
+        const plainRequest = { calendar_id: WORK, resource_href: UTC_HREF, expected_version: plainEtag, edit_scope: 'all', changes: rule };
+        const ruled = await update(plain, plainRequest);
+        expect(unfold(plain.fake.get(WORK, UTC_HREF)?.text ?? '')).toContain('RRULE:FREQ=WEEKLY;COUNT=3;INTERVAL=2');
+        expect<unknown>([ruled.write_outcome, ruled.stored_differs_from_request]).toEqual(['applied', []]);
+        expect<unknown>([(await update(plain, plainRequest)).write_outcome, plain.fake.count('putEvent')]).toEqual(['desired_state_present', 1]);
+        // With exceptions dropped, and a time change.
+        const h = harness();
+        const etag = h.fake.seed(WORK, SHIFT_HREF, SHIFT_SERIES);
+        const request = { calendar_id: WORK, resource_href: SHIFT_HREF, expected_version: etag, edit_scope: 'all', exceptions: 'drop', changes: { ...rule, start: '2027-02-08T17:00:00Z', end: '2027-02-08T18:00:00Z' } };
+        const moved = await update(h, request);
+        expect(unfold(puts(h.fake)[0]?.body ?? '')).toContain('RRULE:FREQ=WEEKLY;INTERVAL=2;COUNT=3');
+        expect(unfold(h.fake.get(WORK, SHIFT_HREF)?.text ?? '')).toContain('RRULE:FREQ=WEEKLY;COUNT=3;INTERVAL=2');
+        expect<unknown>([moved.write_outcome, moved.stored_differs_from_request]).toEqual(['applied', []]);
+        expect<unknown>([(await update(h, request)).write_outcome, h.fake.count('putEvent')]).toEqual(['desired_state_present', 1]);
     });
 
     test('shift only for a rule that provably moves with its start: FREQ up to WEEKLY with INTERVAL, COUNT, WKST; anything else refused, nothing sent', async () => {

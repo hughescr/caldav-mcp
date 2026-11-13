@@ -2,7 +2,8 @@
  * Comparison of requested values with the RAW stored resource (ORCH S3; design 4.5 and 5.4), not with the presentation
  * shape. A requested property is "as requested" when the stored component has exactly one logical line of that name and
  * its text equals the line this server wrote, after unfolding and line-ending normalisation (property and parameter text
- * compared exactly, the name case-insensitively); a requested removal when no line of that name is left. Alarms compare
+ * compared exactly, the name case-insensitively), except that an RRULE value compares as an unordered set of parts, which
+ * iCloud reorders (see `sameRuleLine`); a requested removal when no line of that name is left. Alarms compare
  * the multiset of TRIGGER lines of the component's VALARMs only, nothing else of an alarm.
  *
  * A component that must be a copy (a split's carried override) compares all its lines but the scheduling ones; a property
@@ -182,6 +183,33 @@ function holdsValue(line: string, wanted: string): boolean {
     return cut > 0 && line.startsWith(prefix) && line.slice(prefix.length).split(',').includes(wanted.slice(cut + 1));
 }
 
+/** The parts of an RRULE value by upper-cased name, values as stored; null for a part without a name or a name given twice. */
+function ruleParts(value: string): Map<string, string> | null {
+    const parts = new Map<string, string>();
+    for (const part of value.split(';')) {
+        const cut = part.indexOf('=');
+        const name = part.slice(0, cut).toUpperCase();
+        if (cut < 1 || parts.has(name)) { return null; }
+        parts.set(name, part.slice(cut + 1));
+    }
+    return parts;
+}
+
+/**
+ * A stored RRULE line holds the requested rule when the text before the value is the same and the values have the same
+ * `NAME=value` parts in any order: iCloud stores the parts in its own order (measured 2026-11-12: written
+ * FREQ=WEEKLY;INTERVAL=2;COUNT=3, stored FREQ=WEEKLY;COUNT=3;INTERVAL=2). Part names compare case-insensitively, values
+ * exactly as text; nothing is interpreted. Values here never contain a colon.
+ */
+function sameRuleLine(stored: string, wanted: string): boolean {
+    const storedCut = stored.lastIndexOf(':');
+    const wantedCut = wanted.lastIndexOf(':');
+    if (storedCut < 1 || wantedCut < 1 || stored.slice(0, storedCut) !== wanted.slice(0, wantedCut)) { return false; }
+    const left = ruleParts(stored.slice(storedCut + 1));
+    const right = ruleParts(wanted.slice(wantedCut + 1));
+    return left !== null && right !== null && left.size === right.size && [...left].every(([name, value]) => right.get(name) === value);
+}
+
 /** The requested fields of one component that the stored component does not hold as requested, in request order. */
 export function differingFields(stored: StoredEvent | undefined, request: ComponentRequest): StoredField[] {
     const differs: StoredField[] = [];
@@ -197,7 +225,9 @@ export function differingFields(stored: StoredEvent | undefined, request: Compon
         } else if (field.includes !== undefined) {
             ok = field.includes.every(wanted => lines.some(line => holdsValue(line, wanted)));
         } else {
-            ok = field.line === null ? lines.length === 0 : lines.length === 1 && lines[0] === field.line;
+            const wanted = field.line;
+            const [only] = lines;
+            ok = wanted === null ? lines.length === 0 : lines.length === 1 && only !== undefined && (field.name === 'RRULE' ? sameRuleLine(only, wanted) : only === wanted);
         }
         if (!ok && !differs.includes(field.field)) { differs.push(field.field); }
     }

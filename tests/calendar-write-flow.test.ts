@@ -145,6 +145,34 @@ describe('create_event', () => {
         expect(h.fake.hrefs(WORK)).toHaveLength(1);
     });
 
+    test('iCloud reorders RRULE parts (measured): the rule reads back as requested and a retry is desired_state_present', async () => {
+        const h = harness();
+        const ruled = { ...BASE_CREATE, recurrence: { rrule: 'FREQ=WEEKLY;INTERVAL=2;COUNT=3' } };
+        const first = await create(h, ruled);
+        // Written in our order, stored in iCloud's.
+        expect(unfoldText(h.fake.calls.find(call => call.method === 'putEvent')?.body ?? '')).toContain('RRULE:FREQ=WEEKLY;INTERVAL=2;COUNT=3');
+        expect(unfoldText(h.fake.get(WORK, first.resource_href)?.text ?? '')).toContain('RRULE:FREQ=WEEKLY;COUNT=3;INTERVAL=2');
+        expect<unknown>([first.write_outcome, first.stored_differs_from_request]).toEqual(['applied', []]);
+        const second = await create(h, ruled);
+        expect<unknown>([second.write_outcome, second.resource_href, h.fake.hrefs(WORK)]).toEqual(['desired_state_present', first.resource_href, [first.resource_href]]);
+    });
+
+    test('a stored rule whose part values differ is still a difference, whatever the part order', async () => {
+        const h = harness();
+        const ruled = { ...BASE_CREATE, recurrence: { rrule: 'FREQ=WEEKLY;INTERVAL=2;COUNT=3' } };
+        const first = await create(h, ruled);
+        h.fake.externalEdit(WORK, first.resource_href, text => text.replace('RRULE:FREQ=WEEKLY;COUNT=3;INTERVAL=2', 'RRULE:INTERVAL=2;FREQ=WEEKLY;COUNT=4'));
+        expect(await failure(() => create(h, ruled))).toEqual({ code: 'calendar_changed', reason: 'existing_resource_differs', differs: ['recurrence'] });
+        // A part name in another case is the same part; a part given twice is never as requested.
+        h.fake.externalEdit(WORK, first.resource_href, text => text.replace('RRULE:INTERVAL=2;FREQ=WEEKLY;COUNT=4', 'RRULE:count=3;Freq=WEEKLY;interval=2'));
+        expect((await create(h, ruled)).write_outcome).toBe('desired_state_present');
+        h.fake.externalEdit(WORK, first.resource_href, text => text.replace('RRULE:count=3;Freq=WEEKLY;interval=2', 'RRULE:FREQ=WEEKLY;COUNT=3;INTERVAL=2;COUNT=3'));
+        expect(await failure(() => create(h, ruled))).toEqual({ code: 'calendar_changed', reason: 'existing_resource_differs', differs: ['recurrence'] });
+        // A value in another case is a different value (no normalisation of values).
+        h.fake.externalEdit(WORK, first.resource_href, text => text.replace('RRULE:FREQ=WEEKLY;COUNT=3;INTERVAL=2;COUNT=3', 'RRULE:FREQ=weekly;COUNT=3;INTERVAL=2'));
+        expect(await failure(() => create(h, ruled))).toEqual({ code: 'calendar_changed', reason: 'existing_resource_differs', differs: ['recurrence'] });
+    });
+
     test('the same operation_id with a different body: calendar_changed, existing_resource_differs, nothing overwritten', async () => {
         const h = harness();
         const first = await create(h, BASE_CREATE);
