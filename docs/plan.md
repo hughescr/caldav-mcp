@@ -280,10 +280,16 @@ Additional controls:
   real Function URL. The bootstrap stack is then updated with that origin, and the deployment
   verification runs. The README gives the steps. They were carried out on 2026-11-11.
 - After a deploy, existing connections keep working with the scopes they have. The occurrence
-  and series edits of 1.0.0 need no new scope: a connection that holds `calendar:write` or
-  `calendar:delete` uses them without reconnecting. A connection made before the write scopes
-  existed reconnects the connector and ticks the permissions to use the write tools. Rolling
-  the code back does not undo changes already made to calendars.
+  and series edits of 1.0.0 need no new scope: a connection that holds `calendar:write` has the
+  scope `update_event` needs for them, and one that holds `calendar:delete` has the scope
+  `delete_event` needs. A connection made before the write scopes existed reconnects the
+  connector and ticks the permissions to use the write tools. A release that changes a tool's
+  inputs or description is not picked up by clients automatically, because clients cache the
+  tool list. In claude.ai, use "refresh tools list" in the connector's settings. In Claude Code,
+  run `/mcp` and reconnect the connector. The server accepts the new inputs at once; only the
+  cached tool definitions are stale, and a conversation that already loaded the old definitions
+  keeps showing them until a new conversation starts. Rolling the code back does not undo
+  changes already made to calendars.
 - The DynamoDB table stays at 1 RCU and 1 WCU.
 - The keyring stays under the AWS-managed `aws/ssm` key.
 - CI is the same as wildduck-mcp: actions are pinned by tag and the deploy job has no approval
