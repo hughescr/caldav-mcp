@@ -582,6 +582,19 @@ describe('update_event, edit_scope all: moving a series', () => {
         expect<unknown>([made.event?.view, made.event?.recurring, unfold(puts(single.fake)[0]?.body ?? '').some(line => line.startsWith('RRULE'))]).toEqual(['single', false, false]);
     });
 
+    test('drop lists at most 50 exceptions by value, with complete counts and truncated; the list survives the 96 KiB shaping', async () => {
+        const h = harness();
+        const overrides = Array.from({ length: 60 }, (_, index) => {
+            const day = new Date(Date.UTC(2027, 1, 8 + 7 * (index + 1), 15)).toISOString().replaceAll(/[-:]/gu, '').replace('.000', '');
+            return crlf(['BEGIN:VEVENT', 'UID:SHIFT-1', `RECURRENCE-ID:${day}`, `DTSTART:${day}`, `DTEND:${day.replace('T15', 'T16')}`, `SUMMARY:${'Override '.repeat(40)}${String(index)}`, 'END:VEVENT']);
+        }).join('');
+        const text = SHIFT_SERIES.replace(/BEGIN:VEVENT\r\nUID:SHIFT-1\r\nRECURRENCE-ID[\s\S]*END:VEVENT\r\n/u, '').replace('RRULE:FREQ=WEEKLY;COUNT=6', 'RRULE:FREQ=WEEKLY;COUNT=70').replace('END:VCALENDAR\r\n', `${overrides}END:VCALENDAR\r\n`);
+        const etag = h.fake.seed(WORK, SHIFT_HREF, text);
+        const result = await update(h, { calendar_id: WORK, resource_href: SHIFT_HREF, expected_version: etag, edit_scope: 'all', exceptions: 'drop', changes: { start: '2027-02-08T17:00:00Z', end: '2027-02-08T18:00:00Z' } });
+        expect<unknown>([result.exceptions_dropped?.changed_occurrences, result.exceptions_dropped?.changed.length, result.exceptions_dropped?.truncated, result.exceptions_dropped?.changed[0]?.title?.length]).toEqual([60, 50, true, 256]);
+        expect(writeEventResultSchema.safeParse(result).success).toBe(true);
+    });
+
     test('a rule change: the new RRULE, exceptions must be dropped', async () => {
         const h = harness();
         const etag = h.fake.seed(WORK, SHIFT_HREF, SHIFT_SERIES);

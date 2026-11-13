@@ -1,6 +1,6 @@
 # caldav-mcp: assessment and development plan
 
-Status: version 0.4.0 is released (https://caldav-mcp.rungie.com). It has the five read tools (`list_calendars`, `list_events`, `search_events`, `get_event`, `get_event_attachment_download`) and the three write tools (`create_event`, `update_event`, `delete_event`), with the scopes `calendar:read`, `calendar:write`, `calendar:delete` and `calendar:invite`, and a sign-in page where the user ticks the permissions to grant. The phase 0 probe (version 0.6.0) is written. The owner has run its read-only mode and its `--write` mode against their own iCloud account, locally, on 2026-11-11 (several times as the probe grew) and 2026-11-12, and its invite steps once on 2026-11-12, owner-authorised. The Lambda run is outstanding. The phase 1 skeleton was first deployed on 2026-11-11 (version 0.1.1). The owner connected it from a Claude client and reports that it worked; this was not checked from server logs. The download tool was verified locally on 2026-11-12 against one real iCloud account with an in-memory store in place of S3: 6 managed attachments (PNG, JPEG and PDF, 35 KB to 19.2 MB) were fetched anonymously from Apple's attachment host and each staged copy began with the correct file signature, and 3 external-link attachments were returned as links without being fetched. The real S3 upload and presigned link were verified on 2026-11-12 on the live 0.3.0 service through a Claude client: a 43,935-byte managed PNG was staged, the presigned link returned exactly those bytes as a forced download with server-side encryption, and the unsigned object URL was refused with 403. A real inline attachment is still unverified; none exists in the owner's data. The download result carries the link once in `structuredContent` and once in its text mirror, with no `resource_link` block, and the notice for an external link does not repeat the URL. An overridden instance of a zoned series, whose expanded `RECURRENCE-ID` iCloud sends in the stored `TZID` form, is read with an `occ2_` occurrence token instead of making its whole resource unreadable (see "Read behaviour that shapes the design"). Phase 3 is built: `create_event` (single and repeating), `update_event` (every field of a non-repeating event, and the non-time fields of a whole series) and `delete_event` (a whole event or series), with travel time and the invitation gate (see "Write safety"). They are tested against a fake that models the measured iCloud behaviour. They were verified on 2026-11-12 against a real iCloud account, in a temporary calendar with no guests: 33 steps (create in each time form, ten single-field updates, a whole-series update, stale-version refusals, retries that reported `desired_state_present`, deletes) all behaved as designed, and for `Australia/Lord_Howe` and a time in a daylight-saving gap iCloud rewrote the stored time and the tool reported it in `stored_differs_from_request`. A read check the same day over about seven years of real data listed 2,229 events, round-tripped all 30 `occ2_` tokens through `get_event`, and left 2 events unreadable (`unsupported_recurrence_data`). The write tools have not been checked in Calendar.app, and behaviour on events with guests was measured by the probe, not by the write tools. Not in 0.4.0, and next: changing or deleting one occurrence, "this and future", and moving a whole series. No tool can add or change guests. The auth and credential-storage code and the probe each had one independent review by a second Claude agent (same model family; no cross-family reviewer was available). The findings were fixed, except the items listed under "Accepted limitations". The download tool had one independent security review by a different model family: no blockers, its findings were fixed, and the fixes were not re-reviewed. The sign-in page change had a separate independent security review, which found nothing beyond presentation.
+Status: version 0.4.0 is released (https://caldav-mcp.rungie.com). It has the five read tools (`list_calendars`, `list_events`, `search_events`, `get_event`, `get_event_attachment_download`) and the three write tools (`create_event`, `update_event`, `delete_event`), with the scopes `calendar:read`, `calendar:write`, `calendar:delete` and `calendar:invite`, and a sign-in page where the user ticks the permissions to grant. The phase 0 probe (version 0.6.0) is written. The owner has run its read-only mode and its `--write` mode against their own iCloud account, locally, on 2026-11-11 (several times as the probe grew) and 2026-11-12, and its invite steps once on 2026-11-12, owner-authorised. The Lambda run is outstanding. The phase 1 skeleton was first deployed on 2026-11-11 (version 0.1.1). The owner connected it from a Claude client and reports that it worked; this was not checked from server logs. The download tool was verified locally on 2026-11-12 against one real iCloud account with an in-memory store in place of S3: 6 managed attachments (PNG, JPEG and PDF, 35 KB to 19.2 MB) were fetched anonymously from Apple's attachment host and each staged copy began with the correct file signature, and 3 external-link attachments were returned as links without being fetched. The real S3 upload and presigned link were verified on 2026-11-12 on the live 0.3.0 service through a Claude client: a 43,935-byte managed PNG was staged, the presigned link returned exactly those bytes as a forced download with server-side encryption, and the unsigned object URL was refused with 403. A real inline attachment is still unverified; none exists in the owner's data. The download result carries the link once in `structuredContent` and once in its text mirror, with no `resource_link` block, and the notice for an external link does not repeat the URL. An overridden instance of a zoned series, whose expanded `RECURRENCE-ID` iCloud sends in the stored `TZID` form, is read with an `occ2_` occurrence token instead of making its whole resource unreadable (see "Read behaviour that shapes the design"). Phase 3 is built: `create_event` (single and repeating), `update_event` (every field of a non-repeating event, and the non-time fields of a whole series) and `delete_event` (a whole event or series), with travel time and the invitation gate (see "Write safety"). They are tested against a fake that models the measured iCloud behaviour. They were verified on 2026-11-12 against a real iCloud account, in a temporary calendar with no guests: 33 steps (create in each time form, ten single-field updates, a whole-series update, stale-version refusals, retries that reported `desired_state_present`, deletes) all behaved as designed, and for `Australia/Lord_Howe` and a time in a daylight-saving gap iCloud rewrote the stored time and the tool reported it in `stored_differs_from_request`. A read check the same day over about seven years of real data listed 2,229 events, round-tripped all 30 `occ2_` tokens through `get_event`, and left 2 events unreadable (`unsupported_recurrence_data`). The write tools have not been checked in Calendar.app, and behaviour on events with guests was measured by the probe, not by the write tools. Built on `develop`, not released (not in 0.4.0, and not yet run against iCloud): changing or deleting one occurrence (`this`), "this and future" (`this_and_future`, a split into two series), and moving a whole series or changing its rule (`all` with new times or `recurrence`); they are tested against the fake, which now also models iCloud's measured expansion. No tool can add or change guests. The auth and credential-storage code and the probe each had one independent review by a second Claude agent (same model family; no cross-family reviewer was available). The findings were fixed, except the items listed under "Accepted limitations". The download tool had one independent security review by a different model family: no blockers, its findings were fixed, and the fixes were not re-reviewed. The sign-in page change had a separate independent security review, which found nothing beyond presentation.
 
 ## Goal
 
@@ -293,7 +293,8 @@ The five read tools need the scope `calendar:read`. The three write tools
 organizer also needs `calendar:invite`. In 0.4.0 the write tools create single and repeating
 events, update any field of a non-repeating event, update the non-time fields of a whole series
 (`edit_scope: "all"`) and delete a whole event or series. Changing or deleting one occurrence,
-"this and future" and moving a whole series are next. No tool can add or change guests.
+"this and future" and moving a whole series are built on `develop`, not released (datetime
+rule 10). No tool can add or change guests.
 
 - Date ranges are required and capped at 366 days, within the years 1900 to 2100. Each
   boundary must carry an explicit offset or `Z`. The range is half-open: the start is
@@ -379,8 +380,8 @@ A new event with a `TZID` is sent without a `VTIMEZONE` block. See datetime rule
 
 ## Datetime rules
 
-Rules 1 to 6 apply to reads. Rules 7 to 11 apply to writes (single-occurrence scopes and series
-moves are the next build).
+Rules 1 to 6 apply to reads. Rules 7 to 11 apply to writes (the single-occurrence scopes and
+series moves are built on `develop`, not released).
 
 1. Every time that a client sends must carry its timezone: an RFC 3339 timestamp with an
    explicit UTC offset or `Z`. A time without one is rejected with `invalid_input`, whose
@@ -434,12 +435,27 @@ moves are the next build).
    trip.
 10. Editing a recurring event requires an explicit scope: `this`, `this_and_future`, or
     `all`. There is no default. Reading with iCloud's expansion does not change this: writes
-    still edit the master event and its overrides. Built: `all` without a change of the
-    series' times or rule (the master and every override get the same change). Not in 0.4.0, and
-    next: `this`, `this_and_future` and series moves.
-    - `this`: a `RECURRENCE-ID` override in the same resource.
-    - `this_and_future`: set `UNTIL` on the original series and create a new series.
-      `RANGE=THISANDFUTURE` is not emitted, because iCloud ignores it when it expands.
+    still edit the master event and its overrides. Released in 0.4.0: `all` without a change of
+    the series' times or rule (the master and every override get the same change). Built on
+    `develop`, not released: `this`, `this_and_future` and series moves. None of them expands a
+    rule or converts between zones; the only arithmetic is zone-free, on UTC instants or on the
+    digits of all-day and floating values (ORCH-R).
+    - `this`: a `RECURRENCE-ID` override in the same resource. An existing override is edited
+      in place, its `RECURRENCE-ID` line kept. A new one gets the occurrence's slot in the
+      master's form, copied from iCloud's expansion of the same version (href, UID and ETag
+      must match; probe P3B-1, P3B-4: this replaces exactly that instance, in a repeated or
+      skipped hour too), and the master's lines copied. Identity that the text cannot prove
+      fails closed (`occurrence_identity_unprovable`). Deleting one occurrence adds one `EXDATE`
+      in the master's form and removes its override (P3B-5).
+    - `this_and_future`: set `UNTIL` on the original series (the occurrence's UTC instant from
+      iCloud's expansion minus one second; a `COUNT` is replaced, P3C-1, P3C-2) and create a new
+      series whose UID and href derive from (account, `operation_id`), written first with
+      `If-None-Match: *`; overrides from the split on move to it (P3C-3). A `COUNT` for the new
+      series comes from iCloud's expansion when the text proves it, else the agent gives the
+      rule. `RANGE=THISANDFUTURE` is not emitted, because iCloud ignores it when it expands. No
+      `RELATED-TO` is written (how Apple Calendar links split series is not measured).
+    - series move (`all` with new times or rule): exceptions are dropped, or shifted by one UTC
+      delta when every value is UTC (P3D-1 to P3D-3); a zoned or all-day series cannot shift.
 11. Every edited component gets `SEQUENCE` plus one (1 when absent) and new `DTSTAMP` and
     `LAST-MODIFIED`. iCloud changes none of them, so this server must.
 12. Leap seconds need no handling.
@@ -484,7 +500,17 @@ moves are the next build).
   attendee or organizer input. Changing or deleting an event that has any `ATTENDEE` or
   `ORGANIZER` line anywhere in its stored text (any component, group prefix or not; `X-`
   names do not count) needs `calendar:invite` (else `attendees_present`), keeps those lines exactly as
-  stored, and the result says `guests_may_be_emailed`.
+  stored, and the result says `guests_may_be_emailed`. On `develop`, a new override of one
+  occurrence and the new series of a split carry the series' stored `ATTENDEE`/`ORGANIZER`
+  lines: the one exception to "no new scheduling line", allowed by the intent gate only with
+  `calendar:invite` and only as byte-equal copies of the same stored component's lines (all of
+  them, nothing added or altered). Measured (probe Run 8): a changed occurrence sends an update,
+  an `EXDATE` sends no mail, a split sends an update and a new invitation, a delete a
+  cancellation.
+- A split (`this_and_future`) is two writes: the new series first (`If-None-Match: *`), then the
+  original (`If-Match`), sent only with time left for both and a re-read. A failure between them
+  leaves the later occurrences shown twice (nothing lost); the result is then `split_incomplete`
+  with `created_series`, never "nothing saved", and the same call finishes the split.
 
 ## Phases
 
@@ -495,7 +521,7 @@ moves are the next build).
 | 2 | Read path: time model, parsing, occurrences from iCloud's expansion, `list_events`, `search_events`, `get_event`. | The read path passes a corpus of awkward events under Node and Bun. Occurrences come from iCloud's expansion and are passed through as it returns them. | Released in version 0.2.1 (2026-11-12). |
 | 2b | Attachment download: `get_event_attachment_download` for inline and managed attachments, with short-lived staged copies. | An agent can download every attachment that iCloud holds for an event, including managed ones. The server keeps no calendar data except attachment copies staged for about one day. | Released in version 0.3.0 (2026-11-12). Verified locally against one real iCloud account with an in-memory store in place of S3: 6 managed attachments fetched and staged with correct file signatures, 3 external links returned without being fetched. The real S3 upload and presigned link were then verified on 2026-11-12 on the live service through a Claude client (a 43,935-byte managed PNG staged, downloaded byte-exact as a forced download with server-side encryption, the unsigned object URL refused with 403). A real inline download is not verified; none exists in the owner's data. |
 | 3 | Writes for single events: create, update, delete, all-day, alarms. | Conflict and retry tests pass; verified in Calendar.app. | Released in version 0.4.0: `create_event` (single and repeating), `update_event`, `delete_event`, with travel time. Conflict and retry tests pass against a fake of the measured iCloud behaviour. Run against a real iCloud account on 2026-11-12 (33 steps in a temporary calendar with no guests, all as designed); not verified in Calendar.app. |
-| 4 | Recurring writes with the three edit scopes. | Verified in Calendar.app across a daylight-saving change. | Partly released in version 0.4.0: create of a series, `all` without a time or rule change, delete of a whole series. `this`, `this_and_future` and series moves are not in 0.4.0; they are next. |
+| 4 | Recurring writes with the three edit scopes. | Verified in Calendar.app across a daylight-saving change. | Partly released in version 0.4.0: create of a series, `all` without a time or rule change, delete of a whole series. `this`, `this_and_future` and series moves are built on `develop` and tested against the fake (which models the measured expansion); not released, not yet run against iCloud, not verified in Calendar.app. |
 | 5 | Optional: attendees and invitations, a free-time finder. | Depends on phase 0 results. | Not started. |
 
 Development is test-first. The corpus in phase 2 should include real exported events with
@@ -544,3 +570,12 @@ No decisions are open.
   they are written; S3 does not promise the exact time.
 - An external attachment link is returned as stored on the event and was not checked. It
   can point anywhere the event's author chose.
+- Occurrence edits (built on `develop`, not released): the server refuses what the stored
+  text and iCloud's expansion cannot prove rather than compute it. Refused: a split at a
+  changed occurrence of a zoned series, a `COUNT` split whose remaining count the expansion
+  cannot prove unless the agent gives the rule, shifting exceptions of a zoned, all-day or
+  floating series, and series with `RDATE` or `EXRULE` for splits and moves. A repeated
+  `this` call on a zoned series after its first success is `calendar_changed`, not
+  `desired_state_present`: the occurrence's id changed (`occ1_` to `occ2_`) and the old id
+  can no longer be mapped by text. A split that fails between its two writes shows the later
+  occurrences twice until the same call is repeated or the new series is deleted.
