@@ -506,6 +506,31 @@ describe('update_event, edit_scope this_and_future (split)', () => {
         expect(unfold(puts(h.fake)[1]?.body ?? '').some(line => line.startsWith('RECURRENCE-ID'))).toBe(false);
     });
 
+    test('a rule change for the new series is a move: exceptions from the split on need "drop"; earlier ones do not count', async () => {
+        const h = harness();
+        const text = withOverride(UTC_SERIES.replace('RRULE:FREQ=WEEKLY;COUNT=8', 'RRULE:FREQ=WEEKLY;COUNT=8\r\nEXDATE:20270112T150000Z,20270216T150000Z'),
+            ['UID:WEEKLY-UTC', 'RECURRENCE-ID:20270202T150000Z', 'DTSTART:20270202T160000Z', 'DTEND:20270202T163000Z', 'SUMMARY:Late']);
+        const etag = h.fake.seed(WORK, UTC_HREF, text);
+        // Every other week from Jan 26: Feb 2 and Feb 16 are no longer occurrences, so carrying them would orphan them.
+        const ruled = { changes: { recurrence: { rrule: 'FREQ=WEEKLY;INTERVAL=2;COUNT=3' } } };
+        expect(await failure(() => update(h, splitRequest(etag, ruled)))).toEqual({ code: 'edit_not_supported', reason: 'exceptions_choice_required', exceptions: { changed_occurrences: 1, deleted_occurrences: 1 } });
+        expect(h.fake.count('putEvent')).toBe(0);
+        const result = await update(h, splitRequest(etag, { ...ruled, exceptions: 'drop' }));
+        const created = unfold(puts(h.fake)[0]?.body ?? '');
+        expect<unknown>([result.write_outcome, created.filter(line => /^(RRULE|EXDATE|RECURRENCE-ID)/u.test(line)), result.stored_differs_from_request]).toEqual(['applied', ['RRULE:FREQ=WEEKLY;INTERVAL=2;COUNT=3'], []]);
+        expect((await instances(h.fake, NEW_HREF)).map(line => line.slice(0, 16))).toEqual(['20270126T150000Z', '20270209T150000Z', '20270223T150000Z']);
+    });
+
+    test('shift is refused for every split, also without a time change; nothing is sent', async () => {
+        const h = harness();
+        const etag = h.fake.seed(WORK, UTC_HREF, withOverride(UTC_SERIES, ['UID:WEEKLY-UTC', 'RECURRENCE-ID:20270202T150000Z', 'DTSTART:20270203T150000Z', 'DTEND:20270203T153000Z', 'SUMMARY:Late']));
+        expect(await failure(() => update(h, splitRequest(etag, { exceptions: 'shift' })))).toEqual({ code: 'edit_not_supported', reason: 'exceptions_shift_not_supported_for_split' });
+        const plain = harness();
+        const plainEtag = plain.fake.seed(WORK, UTC_HREF, UTC_SERIES);
+        expect(await failure(() => update(plain, splitRequest(plainEtag, { exceptions: 'shift' })))).toEqual({ code: 'edit_not_supported', reason: 'exceptions_shift_not_supported_for_split' });
+        expect<unknown>([h.fake.count('putEvent'), plain.fake.count('putEvent')]).toEqual([0, 0]);
+    });
+
     test('guests: the new series keeps the stored ATTENDEE/ORGANIZER lines, copied unchanged (invite only)', async () => {
         const denied = harness();
         const etag = denied.fake.seed(WORK, UTC_HREF, UTC_SERIES.replace('SUMMARY:Standup\r\n', `SUMMARY:Standup\r\n${crlf(GUESTS)}`));

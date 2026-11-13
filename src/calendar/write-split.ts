@@ -8,7 +8,10 @@
  * original line for line, a new master (the original master's lines copied, except identity, rule, times and stamps; the
  * requested changes; DTSTART/DTEND the agent's, else the split occurrence's slot and its expanded end from iCloud; the rule
  * the agent's, else the stored rule copied, or with COUNT the remaining count taken from iCloud's expansion; the EXDATE lines
- * copied) and the overrides from the split on copied whole but for their UID line (P3C-3). No RELATED-TO is written: how
+ * copied) and the overrides from the split on copied whole but for their UID line (P3C-3). The exceptions are carried only
+ * when neither the time nor the rule changes: otherwise an override or EXDATE from the split on could match no occurrence
+ * of the new series, so `exceptions: "drop"` is required (`exceptions_choice_required`) and `shift` is always refused
+ * (`exceptions_shift_not_supported_for_split`). No RELATED-TO is written: how
  * Apple Calendar links split series (P3C-5) is not measured.
  *
  * Two writes, in this order (design 3.5): (1) PUT the new series, `If-None-Match: *`; (2) PUT the original, exact
@@ -40,7 +43,7 @@ import { DERIVED_NOT_COPIED, verifyDerivedOutcome, type DerivedExpectation, type
 import { parseRrule, rruleProperty, sequenceProperty, timeProperty, uidProperty, type IcsTime, type RrulePart, type StartForm, type WrittenProperty } from './ics-write';
 import { DAV_LAMBDA_RESERVE_MS, DAV_REQUEST_MS } from './limits';
 import type { EventComponent, Interval } from './model';
-import { occurrencesBefore, sameSlot, slotOf } from './occurrence-target';
+import { exdateValues, occurrencesBefore, sameSlot, sideOf, slotOf } from './occurrence-target';
 import { calendarStatus, originalEventView, readStoredResources } from './read';
 import { eventSpan, padTransportWindow } from './time-core';
 import { normaliseLine, storedEvents, type ComponentRequest, type FieldLine, type StoredExpectation } from './write-compare';
@@ -135,14 +138,18 @@ export async function updateFollowing(deps: WriteDeps, input: UpdateEventArgs, p
     }
     const newForm: StartForm = start.time.kind;
 
-    // The exceptions from the split on: carried over, or dropped when the new series moves.
+    // The exceptions from the split on: carried over unchanged only when neither the time nor the rule changes (a carried
+    // override or EXDATE could then match no occurrence of the new series); else they must be dropped. Never shifted.
+    if (input.exceptions === 'shift') { throw notSupported('exceptions_shift_not_supported_for_split'); }
     const exdateLines = masterOutline.properties.filter(line => line.name === 'exdate');
-    let carry = true;
-    if (moved && (trunc.removed.length > 0 || exdateLines.length > 0)) {
-        if (input.exceptions === undefined) { throw notSupported('exceptions_choice_required', { exceptions: { changed_occurrences: trunc.removed.length, deleted_occurrences: exdateLines.length } }); }
-        if (input.exceptions === 'shift') { throw notSupported('exceptions_shift_not_supported_for_split'); }
+    const stored = exdateValues(master);
+    if (stored === null) { throw unsupported('stored_data_not_editable'); }
+    // An EXDATE whose side of the split the text cannot prove counts as after it (it may be carried).
+    const exdatesAfter = stored.filter(value => sideOf(value, master.start, point, slot) !== 'before');
+    if ((moved || plan.recurrence !== undefined) && (trunc.removed.length > 0 || exdatesAfter.length > 0) && input.exceptions !== 'drop') {
+        throw notSupported('exceptions_choice_required', { exceptions: { changed_occurrences: trunc.removed.length, deleted_occurrences: exdatesAfter.length } });
     }
-    if (input.exceptions === 'drop') { carry = false; }
+    const carry = input.exceptions !== 'drop';
 
     // The new series' rule: the agent's; else the stored one copied; with COUNT, the count left after the split, from iCloud.
     let rule: { written: WrittenProperty; text: string } | null = null;

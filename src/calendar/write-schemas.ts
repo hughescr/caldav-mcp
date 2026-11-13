@@ -91,7 +91,7 @@ export const updateChangesSchema = z.strictObject({
     alarms: alarmsSchema.nullable().optional().describe('Replaces every alarm of the event; null or [] removes them all.'),
     start: writeTimeSchema.optional().describe('Only together with end; the server never computes an end. On a repeating event with edit_scope all it moves the whole series (see exceptions); with this it moves one occurrence; with this_and_future it sets the start of the new series.'),
     end: writeTimeSchema.optional().describe('Only together with start.'),
-    recurrence: recurrenceInputSchema.nullable().optional().describe('A non-repeating event: makes it repeat. edit_scope all: replaces the series\' rule (null makes it a single event; exceptions must then be "drop"). edit_scope this_and_future: the rule of the new series (needed for a COUNT rule when the count cannot be taken from iCloud). Not allowed with this.'),
+    recurrence: recurrenceInputSchema.nullable().optional().describe('A non-repeating event: makes it repeat. edit_scope all: replaces the series\' rule (null makes it a single event; exceptions must then be "drop"). edit_scope this_and_future: the rule of the new series (needed for a COUNT rule when the count cannot be taken from iCloud; changed or deleted occurrences from the split on then need exceptions "drop"). Not allowed with this.'),
     travel_time: travelTimeSchema.nullable().optional().describe('New travel time, or null to remove it.'),
 }, FIXED).describe('Only the fields to change: an absent field is unchanged, a value replaces it, null removes it.');
 
@@ -106,7 +106,7 @@ export const updateEventInputSchema = z.strictObject({
     edit_scope: editScopeSchema.optional().describe('Required for a repeating event. all: the series and every changed occurrence. this: one occurrence (recurrence_id). this_and_future: that occurrence and every later one, by ending the series before it and creating a new series from it (recurrence_id and operation_id).'),
     recurrence_id: recurrenceIdInputSchema.optional(),
     operation_id: splitOperationIdSchema.optional(),
-    exceptions: z.enum(['drop', 'shift'], FIXED).optional().describe('Needed when a change moves a series that has changed or deleted occurrences (edit_scope all with new start/end or recurrence; this_and_future with new start/end and such occurrences after the split). drop: remove them all. shift: move them by the same UTC difference; only for a series stored in UTC (no zone name), only for a time change, not a rule change, and only when the stored rule is FREQ=SECONDLY to WEEKLY with no part but INTERVAL, COUNT and WKST (no BY* part, no UNTIL); otherwise use drop and re-apply the listed exceptions.'),
+    exceptions: z.enum(['drop', 'shift'], FIXED).optional().describe('Needed when a change moves a series that has changed or deleted occurrences (edit_scope all with new start/end or recurrence; this_and_future with new start/end or recurrence and such occurrences from the split on). drop: remove them all (listed in exceptions_dropped). For this_and_future only drop is possible: shift is always refused. shift: move them by the same UTC difference; only for a series stored in UTC (no zone name), only for a time change, not a rule change, and only when the stored rule is FREQ=SECONDLY to WEEKLY with no part but INTERVAL, COUNT and WKST (no BY* part, no UNTIL); otherwise use drop and re-apply the listed exceptions.'),
     changes: updateChangesSchema,
 }, FIXED);
 

@@ -450,7 +450,10 @@ series moves are built on `develop`, not released).
     - `this_and_future`: set `UNTIL` on the original series (the occurrence's UTC instant from
       iCloud's expansion minus one second; a `COUNT` is replaced, P3C-1, P3C-2) and create a new
       series whose UID and href derive from (account, `operation_id`), written first with
-      `If-None-Match: *`; overrides from the split on move to it (P3C-3). A `COUNT` for the new
+      `If-None-Match: *`; overrides from the split on move to it (P3C-3), and so do the
+      `EXDATE` lines, unchanged, only when neither the time nor the rule changes; otherwise
+      the overrides and `EXDATE` values from the split on must be dropped (`exceptions: "drop"`),
+      because unchanged they could match no occurrence. They are never shifted. A `COUNT` for the new
       series comes from iCloud's expansion when the text proves it, else the agent gives the
       rule. `RANGE=THISANDFUTURE` is not emitted, because iCloud ignores it when it expands. No
       `RELATED-TO` is written (how Apple Calendar links split series is not measured).
