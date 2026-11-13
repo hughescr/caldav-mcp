@@ -242,6 +242,14 @@ function resolveZoned(local: string, tzid: string): ResolvedZone | null | undefi
 }
 
 /**
+ * True when the runtime's Temporal recognises `tzid` as a zone name: a name lookup on a fixed time, no conversion of any
+ * value of the caller. Occurrence edits of a zoned series fail closed on an unrecognised zone (design 3.2 step 6).
+ */
+export function isRecognizedZone(tzid: string): boolean {
+    return resolveZoned('1970-01-01T00:00:00', tzid) !== null;
+}
+
+/**
  * Pass-through public time for a stored time. Adds `utc` and `offset` for recognized zones with Temporal's
  * default 'compatible' disambiguation, and a fixed `timezone_warning` where the instant is unknown or uncertain.
  */
