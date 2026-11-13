@@ -1,6 +1,6 @@
 /**
  * Transport-neutral model types shared by the phase 2 read modules. Type-only apart from the two
- * error classes, the canonical-path predicate and the not-implemented marker used by stubs. No
+ * error classes, the path and resource-href predicates and the not-implemented marker used by stubs. No
  * ical.js types: jCal is described structurally so this file stays free of the parser.
  */
 import { PATH_MAX } from './limits';
@@ -68,6 +68,39 @@ export function isCanonicalPath(value: string): boolean {
     }
     // A percent escape of a percent sign that itself introduces an escape decodes recursively.
     return !/%25[0-9A-Fa-f]{2}/u.test(value);
+}
+
+/**
+ * The last segment of a resource href: an opaque name issued by iCloud, never decoded, re-encoded or case-normalised.
+ * Raw characters are RFC 3986 pchar (unreserved, sub-delims, ':' and '@'); every '%' starts an escape of two hex digits in
+ * either case. An encoded slash (`%2F`, `%2f`), a double-encoded one (`%252F`) and `%3A` are ordinary characters of the name.
+ * Refused: an empty name; `.` and `..`, also as a single case-insensitive decode (WHATWG URL resolves `%2e` and `%2E%2E` as
+ * dot segments); escaped C0 controls and DEL; and raw characters outside pchar, which WHATWG URL would percent-encode
+ * (space, `"`, `<`, `>`, `` ` ``, `{`, `}`, `^`) or which are not valid in a URI path (`|`, `[`, `]`, `\`, non-ASCII), so
+ * the bytes sent could differ from the bytes issued.
+ */
+export function isResourceName(name: string): boolean {
+    if (name.length === 0 || !/^(?:[A-Za-z0-9\-._~!$&'()*+,;=:@]|%[0-9A-Fa-f]{2})+$/u.test(name)) { return false; }
+    const decoded = name.replace(/%([0-9A-Fa-f]{2})/gu, (_, hex: string) => String.fromCharCode(Number.parseInt(hex, 16)));
+    if (decoded === '.' || decoded === '..') { return false; }
+    for (const match of name.matchAll(/%([0-9A-Fa-f]{2})/gu)) {
+        const code = Number.parseInt(match[1] ?? '', 16);
+        if (code < 0x20 || code === 0x7F) { return false; }
+    }
+    return true;
+}
+
+/**
+ * The lexical rule behind the public resource href: a canonical calendar collection path (see {@link isCanonicalPath},
+ * unchanged) followed by exactly one {@link isResourceName} segment, at most PATH_MAX characters in all. The client passes
+ * it back byte for byte; it is sent to iCloud byte for byte.
+ */
+export function isResourceHref(value: string): boolean {
+    if (value.length > PATH_MAX) { return false; }
+    const slash = value.lastIndexOf('/');
+    if (slash < 1) { return false; }
+    const collection = value.slice(0, slash + 1);
+    return isCanonicalPath(collection) && isResourceName(value.slice(slash + 1));
 }
 
 // ---- jCal and parsed model (filled in by calendar/ical, owned by P2) ----

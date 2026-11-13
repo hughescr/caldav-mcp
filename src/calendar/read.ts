@@ -6,7 +6,7 @@
  */
 import { CalDavError, type CalDavAuth, type CalendarSummary, type Discovery } from '../caldav/contracts';
 import { isDirectChildResource } from '../caldav/identifiers';
-import type { CalDavReadBackend, CalendarResource, DavCallOptions } from '../caldav/read-contracts';
+import { isAddressedResource, type CalDavReadBackend, type CalendarResource, type DavCallOptions, type QueriedResource } from '../caldav/read-contracts';
 import { downloadSupported } from './attachment-access';
 import { buildAttachmentIndex, prescanAttachProperties, toAttachmentMetadata, type AttachmentIndexEntry } from './attachments';
 import type { ReadBudget } from './budget';
@@ -17,7 +17,7 @@ import { parseExpandedResource, parseOriginalResource } from './ical';
 import {
     CALENDAR_CONCURRENCY, DISPLAY_NAME_MAX, ETAG_MAX, ETAG_MIN, MAX_DISCOVERED_CALENDARS, MAX_MEMBERSHIP_BYTES, MAX_MULTIGET_HREFS, MAX_REPORT_BYTES, MAX_RESOURCES_PER_REPORT, MAX_UNREADABLE,
 } from './limits';
-import { BudgetError, IcalError, isCanonicalPath, type EventComponent, type EventTime, type Interval, type OriginalResource } from './model';
+import { BudgetError, IcalError, isCanonicalPath, isResourceHref, type EventComponent, type EventTime, type Interval, type OriginalResource } from './model';
 import { normalizeFullEvent, normalizeSlimEvent, sanitizeDisplayText } from './normalize';
 import { matchesQuery, normalizeQuery, type SearchField } from './search';
 import {
@@ -160,12 +160,19 @@ export function calendarStatus(calendarId: string, summary: CalendarSummary | un
 
 /**
  * Report-level checks before any content is used: every href a direct child of the calendar, unique, with a strong ETag and
- * text calendar-data, and no more resources than the byte-derived cap. Any violation fails the whole calendar.
+ * text calendar-data, and no more entries than the byte-derived cap. Any violation fails the whole calendar. An
+ * unaddressable entry (a refused name of this calendar, see QueriedResource) carries nothing to check.
  */
-function validateReport(calendarId: string, resources: readonly CalendarResource[]): void {
+function validateReport(calendarId: string, resources: readonly QueriedResource[]): void {
     if (resources.length > MAX_RESOURCES_PER_REPORT) { throw new CalDavError('too_large'); }
     const seen = new Set<string>();
-    for (const resource of resources) {
+    for (const entry of resources) {
+        if (typeof entry !== 'object' || entry === null) { throw new CalDavError('protocol'); }
+        if (!isAddressedResource(entry)) {
+            if (entry.unaddressable !== true || Object.keys(entry).length !== 1) { throw new CalDavError('protocol'); }
+            continue;
+        }
+        const resource = entry;
         if (typeof resource.href !== 'string' || !isDirectChildResource(calendarId, resource.href) || seen.has(resource.href)
             || !validEtag(resource.etag) || typeof resource.calendarData !== 'string') {
             throw new CalDavError('protocol');
@@ -205,7 +212,7 @@ interface CalendarContext {
  * Parses each resource once, filters by the requested range and the search, and keeps its candidates only if the whole
  * report passes. A resource that cannot be read becomes an unreadable entry; a report-level or shared-capacity failure throws.
  */
-async function processCalendar(context: CalendarContext, index: number, calendarId: string, resources: readonly CalendarResource[]): Promise<CalendarOutcome> {
+async function processCalendar(context: CalendarContext, index: number, calendarId: string, resources: readonly QueriedResource[]): Promise<CalendarOutcome> {
     validateReport(calendarId, resources);
     const { budget } = context;
     const work = budget.newCalendarWork();
@@ -213,6 +220,12 @@ async function processCalendar(context: CalendarContext, index: number, calendar
     let unsupported = 0;
     let recurringReadable = 0;
     for (const resource of resources) {
+        if (!isAddressedResource(resource)) {
+            // Its href failed the safety check, so it is not echoed: the entry only counts it.
+            outcome.unreadable.push({ calendar: index, resource_href: null, recurrence_id: null, reason: 'unsupported_resource_address' });
+            await budget.afterComponent();
+            continue;
+        }
         let components: readonly EventComponent[];
         try {
             components = parseExpandedResource(resource.calendarData, { work: budget.newResourceWork() }).components;
@@ -256,6 +269,11 @@ function compareUnreadable(calendars: readonly CalendarStatus[]): (a: Unreadable
     return (a, b) => {
         const byCalendar = compareCodePoints(calendars[a.calendar]?.calendar_id ?? '', calendars[b.calendar]?.calendar_id ?? '') || a.calendar - b.calendar;
         if (byCalendar !== 0) { return Math.sign(byCalendar); }
+        // An unaddressable entry (no href) sorts after every named one of its calendar.
+        if (a.resource_href === null || b.resource_href === null) {
+            if (a.resource_href !== b.resource_href) { return a.resource_href === null ? 1 : -1; }
+            return 0;
+        }
         const byHref = compareCodePoints(a.resource_href, b.resource_href);
         if (byHref !== 0) { return byHref; }
         if (a.recurrence_id !== b.recurrence_id) {
@@ -332,8 +350,10 @@ async function readEvents(deps: ReadDeps, input: ListEventsArgs, matcher: Matche
         { start: modelTime(b.event.start), calendarId: b.calendarId, href: b.event.resource_href, token: b.event.recurrence_id },
     ));
     const distinct = new Map<string, Unreadable>();
+    let unaddressable = 0;
     for (const item of [...outcomes.values()].flatMap(outcome => outcome.unreadable)) {
-        distinct.set(JSON.stringify([item.calendar, item.resource_href, item.recurrence_id, item.reason]), item);
+        // Unaddressable entries have no identity to deduplicate by: each one is a separate response, so each one counts.
+        distinct.set(item.resource_href === null ? `unaddressable:${unaddressable++}` : JSON.stringify([item.calendar, item.resource_href, item.recurrence_id, item.reason]), item);
     }
     const unreadable = [...distinct.values()].sort(compareUnreadable(calendars));
     return {
@@ -453,7 +473,7 @@ export interface OriginalRead {
 /** Validates the identifiers of a detail or download call. Returns the parsed occurrence token, or null. */
 export function detailTarget(calendarId: string, href: string, tokenText: string | null): ReturnType<typeof parseOccurrenceId> {
     const token = tokenText === null ? null : parseOccurrenceId(tokenText);
-    if (!isCanonicalPath(calendarId) || !isCanonicalPath(href) || (tokenText !== null && token === null)) { throw new ReadError('invalid_input'); }
+    if (!isCanonicalPath(calendarId) || !isResourceHref(href) || (tokenText !== null && token === null)) { throw new ReadError('invalid_input'); }
     // A path that cannot be a direct child of the calendar can never name one of its events.
     if (!isDirectChildResource(calendarId, href)) { throw new ReadError('invalid_input'); }
     return token;
@@ -509,7 +529,8 @@ export async function expandStoredResource(
     const { budget } = deps;
     const resources = await detailRequest(reporter, () => deps.backend.queryEvents(deps.auth, deps.discovery, { calendarId: query.calendarId, range: query.window }, callOptions(budget, MAX_REPORT_BYTES)));
     try { validateReport(query.calendarId, resources); } catch (error) { throw new ReadError(toolCodeFor(error)); }
-    const target = resources.find(resource => resource.href === query.href);
+    // The target's href passed the rule, so it is never one of the unaddressable entries.
+    const target = resources.filter(isAddressedResource).find(resource => resource.href === query.href);
     if (target === undefined) { return { kind: 'absent' }; }
     if (target.etag !== query.etag) { throw new ReadError('calendar_changed'); }
     let components: readonly EventComponent[];

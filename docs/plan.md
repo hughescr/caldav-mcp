@@ -95,7 +95,7 @@ Still open:
 
 Known quirks:
 
-All are confirmed on one account: by the probe runs of 2026-11-11, and the last one by the write-tool run of 2026-11-12.
+All are confirmed on one account: by the probe runs of 2026-11-11, the `RRULE` part order by the write-tool run of 2026-11-12, and the resource path of an event made from a reminder by a read on 2026-11-13.
 
 - An event with `DTSTART` and neither `DTEND` nor `DURATION` is refused with HTTP 404, not
   with a status that names the problem.
@@ -121,6 +121,20 @@ All are confirmed on one account: by the probe runs of 2026-11-11, and the last 
   an unordered set of `NAME=value` parts: names case-insensitive, values exact text, a name
   given twice never as requested. This does not apply to the check before each `PUT`, which
   verifies the server's own text, in the server's own order.
+- An event created from an Apple reminder has a URL-like `UID`, and iCloud names its resource
+  after it: the last segment of the path carries a percent-encoded colon (`%3A`) and a
+  double-encoded slash (`%252F`), in a well-formed 207 answer. So a resource path is an
+  opaque string issued by iCloud. The server never decodes it, re-encodes it or changes the
+  case of an escape; it returns it as `resource_href` and sends it back byte for byte (the
+  URL of a `PUT` or `DELETE`, the `href` of a multiget, with XML escaping only). It accepts
+  exactly the calendar's own path plus one segment: raw characters only those a URI path
+  allows unchanged (letters, digits, `-._~!$&'()*+,;=:@`), every `%` followed by two hex
+  digits, an escaped slash such as `%2F` or `%252F` an ordinary character of the name, and
+  never `.` or `..`, also not after one decoding (`%2E%2E`), nor an escaped control
+  character. A response in an expanded query that names an event of the calendar by a path
+  outside that rule is reported as one unreadable event (`unsupported_resource_address`,
+  without the path) and the rest of the calendar is listed; a path outside the calendar
+  still fails the whole calendar.
 
 ### Read behaviour that shapes the design
 
@@ -344,7 +358,9 @@ times or rule for a series with `RDATE` or `EXRULE`; adding or changing attachme
   `include_raw` is true. The raw text is unmodified, with attachment links and base64
   included; it is cut to a 16 KiB prefix with `raw_truncated` set when longer.
 - An event the server cannot read goes into `unreadable` (at most 50 entries, with a
-  count). It does not fail the call.
+  count). It does not fail the call. An event whose path iCloud gives in a form the server
+  does not accept (see "Known quirks") is counted with reason `unsupported_resource_address`
+  and `resource_href: null`.
 - Shared calendars appear in `list_calendars`. Whether a calendar is owned, shared with the
   owner or shared by the owner can be read from `resourcetype`, `owner` and `invite`. No tool
   returns it yet.

@@ -85,7 +85,7 @@ describe('exact requests', () => {
 });
 
 describe('scope: only a direct child of a calendar under the authenticated home, on the home origin', () => {
-    test('a foreign account, a nested path, the collection itself, a non-canonical href or a mismatched calendar is refused unsent', async () => {
+    test('a foreign account, a nested path, the collection itself, a refused name or a mismatched calendar is refused unsent', async () => {
         const { fake, backend } = backendFor(() => new Response(null, { status: 204 }));
         const targets: [string, string][] = [
             ['/20000000002/calendars/work/', '/20000000002/calendars/work/a.ics'],
@@ -93,7 +93,8 @@ describe('scope: only a direct child of a calendar under the authenticated home,
             [CALENDAR, CALENDAR],
             [CALENDAR, '/10000000001/calendars/other/a.ics'],
             [CALENDAR, '/10000000001/calendars/work/../other/a.ics'],
-            [CALENDAR, '/10000000001/calendars/work/a%2Fb.ics'],
+            [CALENDAR, '/10000000001/calendars/work/%2E%2E'],
+            [CALENDAR, '/10000000001/calendars/work/a{b}.ics'],
             [CALENDAR, 'https://evil.example/10000000001/calendars/work/a.ics'],
             ['/10000000001/calendars/', '/10000000001/calendars/a.ics'],
             ['/10000000001/calendars/work', '/10000000001/calendars/worka.ics'],

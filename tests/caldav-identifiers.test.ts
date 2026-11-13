@@ -12,7 +12,9 @@ test('raw server braces spaces and carets become canonical escapes', () => {
     expect(canonicalizeServerHref('a {b}^.ics', base)).toBe('/123/calendars/work/a%20%7Bb%7D%5E.ics');
     expect(canonicalizeCalendarPath('/123/calendars/{work}/')).toBe('/123/calendars/%7Bwork%7D/');
 });
-test('collection paths need a trailing slash; containment rejects noncanonical paths', () => {
+test('collection paths need a trailing slash; containment needs a canonical collection and keeps the name opaque', () => {
     expect(() => canonicalizeCalendarPath('/123/calendars/work')).toThrow(new CalDavError('protocol'));
-    expect(isDirectChildResource('/123/calendars/work/', '/123/calendars/work/%61.ics')).toBe(false);
+    expect(isDirectChildResource('/123/calendars/%77ork/', '/123/calendars/%77ork/a.ics')).toBe(false);
+    // A resource name is opaque: an escaped unreserved character is kept, not refused or decoded.
+    expect(isDirectChildResource('/123/calendars/work/', '/123/calendars/work/%61.ics')).toBe(true);
 });

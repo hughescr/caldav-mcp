@@ -1,5 +1,5 @@
 import type { CalDavAuth, CalendarSummary, Discovery } from '../../src/caldav/contracts';
-import type { CalDavReadBackend, CalendarResource, DavCallOptions, ResourceLookup } from '../../src/caldav/read-contracts';
+import type { CalDavReadBackend, CalendarResource, DavCallOptions, QueriedResource, ResourceLookup } from '../../src/caldav/read-contracts';
 import { FAKE_DISCOVERY } from './fake-caldav';
 
 export type ReadMethod = 'listCalendars' | 'queryEvents' | 'multigetEvents';
@@ -35,7 +35,7 @@ export class FakeCalDavRead implements CalDavReadBackend {
     maxInFlight = 0;
     private calendars: CalendarSummary[] = [];
     private listScripts: Scripted<CalendarSummary[], undefined>[] = [];
-    private readonly queryScripts = new Map<string, Scripted<readonly CalendarResource[], QueryArgs>[]>();
+    private readonly queryScripts = new Map<string, Scripted<readonly QueriedResource[], QueryArgs>[]>();
     private readonly multigetScripts = new Map<string, Scripted<readonly ResourceLookup[], MultigetArgs>[]>();
     private readonly servers = new Map<string, CalendarServer>();
 
@@ -47,7 +47,7 @@ export class FakeCalDavRead implements CalDavReadBackend {
         this.listScripts.push(...outcomes);
         return this;
     }
-    scriptQuery(calendarId: string, ...outcomes: Scripted<readonly CalendarResource[], QueryArgs>[]): this {
+    scriptQuery(calendarId: string, ...outcomes: Scripted<readonly QueriedResource[], QueryArgs>[]): this {
         this.queryScripts.set(calendarId, [...(this.queryScripts.get(calendarId) ?? []), ...outcomes]);
         return this;
     }
@@ -62,8 +62,8 @@ export class FakeCalDavRead implements CalDavReadBackend {
     }
 
     /** Holds the next query for this calendar until released or failed. */
-    holdQuery(calendarId: string): Hold<readonly CalendarResource[]> {
-        return this.hold<readonly CalendarResource[], QueryArgs>(outcome => this.scriptQuery(calendarId, outcome));
+    holdQuery(calendarId: string): Hold<readonly QueriedResource[]> {
+        return this.hold<readonly QueriedResource[], QueryArgs>(outcome => this.scriptQuery(calendarId, outcome));
     }
     holdMultiget(calendarId: string): Hold<readonly ResourceLookup[]> {
         return this.hold<readonly ResourceLookup[], MultigetArgs>(outcome => this.scriptMultiget(calendarId, outcome));
@@ -101,7 +101,7 @@ export class FakeCalDavRead implements CalDavReadBackend {
         this.calls.push({ method: 'listCalendars', options });
         return this.run(this.listScripts.shift(), this.calendars, undefined, options);
     }
-    async queryEvents(_auth: CalDavAuth, _discovery: Discovery, query: QueryArgs, options?: DavCallOptions): Promise<readonly CalendarResource[]> {
+    async queryEvents(_auth: CalDavAuth, _discovery: Discovery, query: QueryArgs, options?: DavCallOptions): Promise<readonly QueriedResource[]> {
         this.calls.push({ method: 'queryEvents', calendarId: query.calendarId, range: { ...query.range }, options });
         return this.run(this.queryScripts.get(query.calendarId)?.shift() ?? this.servers.get(query.calendarId)?.query, [], query, options);
     }

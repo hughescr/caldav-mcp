@@ -6,7 +6,7 @@
  */
 import { z } from 'zod';
 import { KNOWN_PRECONDITIONS } from '../caldav/write-contracts';
-import { calendarStatusSchema, etagSchema, eventTimeSchema, fullEventSchema, occurrenceIdSchema, pathSchema } from './event-schemas';
+import { calendarStatusSchema, etagSchema, eventTimeSchema, fullEventSchema, occurrenceIdSchema, pathSchema, resourceHrefSchema } from './event-schemas';
 import { ALARM_DESCRIPTION, MAX_ALARMS, MAX_RRULE_LENGTH, TEXT_LIMITS } from './ics-write';
 
 /** The fixed message of an invalid_input error from a write tool; `reason` and `field` say what was wrong. */
@@ -101,7 +101,7 @@ const recurrenceIdInputSchema = occurrenceIdSchema
 
 export const updateEventInputSchema = z.strictObject({
     calendar_id: pathSchema,
-    resource_href: pathSchema.describe('resource_href from list_events, search_events or get_event.'),
+    resource_href: resourceHrefSchema.describe('resource_href from list_events, search_events or get_event.'),
     expected_version: etagSchema.describe('Required: the expected_version from the latest read of this event. The change is made only if the event is still exactly that version.'),
     edit_scope: editScopeSchema.optional().describe('Required for a repeating event. all: the series and every changed occurrence. this: one occurrence (recurrence_id). this_and_future: that occurrence and every later one, by ending the series before it and creating a new series from it (recurrence_id and operation_id).'),
     recurrence_id: recurrenceIdInputSchema.optional(),
@@ -114,7 +114,7 @@ export const updateEventInputSchema = z.strictObject({
 
 export const deleteEventInputSchema = z.strictObject({
     calendar_id: pathSchema,
-    resource_href: pathSchema,
+    resource_href: resourceHrefSchema,
     expected_version: etagSchema.describe('Required: the expected_version from the latest read of this event.'),
     edit_scope: editScopeSchema.optional().describe('Required for a repeating event. all: deletes the whole series. this: deletes one occurrence (recurrence_id). this_and_future: deletes that occurrence and every later one by ending the series before it (recurrence_id).'),
     recurrence_id: recurrenceIdInputSchema.optional(),
@@ -155,7 +155,7 @@ export const droppedExceptionsSchema = z.strictObject({
 }).describe('What exceptions: "drop" removed, so they can be re-applied with edit_scope this.');
 
 export const createdSeriesSchema = z.strictObject({
-    resource_href: pathSchema.describe('The new series for the occurrences from the split on. Pass it to later calls for those occurrences.'),
+    resource_href: resourceHrefSchema.describe('The new series for the occurrences from the split on. Pass it to later calls for those occurrences.'),
     expected_version: etagSchema.nullable(),
     write_outcome: z.enum(['applied', 'desired_state_present', 'unconfirmed']).describe('applied: this call created it. desired_state_present: it was already there with everything the split writes (a retry). unconfirmed (errors only): a series of this split, from an earlier call with this operation_id, is at this href, but this call did not confirm that it holds everything the split writes (see reason); inspect it.'),
 });
@@ -165,7 +165,7 @@ export const writeEventResultSchema = z.strictObject({
         .describe('applied: iCloud accepted the save this call sent. desired_state_present: the requested state was observed in the calendar (the stored event holds the requested values, for example on a retry after a lost response); it does not say whether this call or an earlier one saved them. For this_and_future it describes the original series (ended before the split); created_series has its own.'),
     readback: z.enum(['ok', 'unavailable']).describe('ok: event is the stored event read back after the write. unavailable: the write outcome stands, but the event could not be read back or shown within the response limit; event is null. Use get_event to see it.'),
     calendar_id: pathSchema,
-    resource_href: pathSchema,
+    resource_href: resourceHrefSchema,
     expected_version: etagSchema.nullable().describe('The stored ETag, from the read-back, else from the save answer; null when neither gave one. Pass it to the next update or delete.'),
     recurrence_id: occurrenceIdSchema.optional().describe('edit_scope this: the occurrence\'s recurrence_id after the change. It can differ from the one sent (an occurrence of a series with a zone name gets an occ2_ id once it has its own changes); use this one from now on.'),
     created_series: createdSeriesSchema.optional().describe('edit_scope this_and_future: the new series that holds the occurrences from the split on.'),
@@ -196,7 +196,7 @@ export const deleteEventResultSchema = z.strictObject({
         .describe('applied: iCloud accepted the delete this call sent. desired_state_present: the requested state was observed in the calendar (no event at this href, or the occurrences already gone, for example on a retry); it does not say whether this call or an earlier one deleted it.'),
     deleted: z.enum(['resource', 'occurrence', 'following']).describe('resource: the whole event or series is gone. occurrence: one occurrence is excluded from the series. following: the series now ends before that occurrence.'),
     calendar_id: pathSchema,
-    resource_href: pathSchema,
+    resource_href: resourceHrefSchema,
     recurrence_id: occurrenceIdSchema.optional().describe('occurrence and following: the recurrence_id the call named.'),
     readback: z.enum(['ok', 'unavailable']).optional().describe('occurrence and following: whether the series was read back after the change.'),
     expected_version: etagSchema.nullable().optional().describe('occurrence and following: the series\' stored ETag after the change (read back, else from the answer, else null). Pass it to the next update or delete.'),

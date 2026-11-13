@@ -218,7 +218,7 @@ describe('the write tools through the MCP boundary, in both protocol eras', () =
             const longest = [...KNOWN_PRECONDITIONS].sort((a, b) => b.length - a.length).slice(0, 8);
             const worstUpstream = { status: 409, content_type: 'xml' as const, preconditions: longest, detail: '"\\'.repeat(256), detail_truncated: true as const };
             // A split's created_series at the longest path and ETag the schemas allow, and the exception counts.
-            const created = { resource_href: `/${'a'.repeat(2046)}/`.slice(0, 2048), expected_version: `"${'e'.repeat(1022)}"`, write_outcome: 'applied' as const };
+            const created = { resource_href: `/${'a'.repeat(2045)}/a`, expected_version: `"${'e'.repeat(1022)}"`, write_outcome: 'applied' as const };
             for (const code of toolErrorCodeSchema.options) {
                 const service: BoundCalendarService = { ...harness().service, create_event: async () => { throw new CalendarError(code, undefined, { reason: 'split_occurrence_changed_supply_times', field: 'travel_time', upstream: worstUpstream, differs: ['title', 'start', 'end', 'location', 'description', 'status', 'transparency', 'alarms', 'recurrence', 'travel_time'], created_series: created, exceptions: { changed_occurrences: 2000, deleted_occurrences: 2000 } }); } };
                 const response = await handleMcp(request('tools/call', { name: 'create_event', arguments: CREATE }, protocol, '\u0000'.repeat(128)), { token: 't', clientId: 'c', scopes: READ_WRITE }, service);
@@ -242,7 +242,7 @@ describe('the write tools through the MCP boundary, in both protocol eras', () =
             };
             const small = { changed_occurrences: 1, deleted_occurrences: 1, changed: [{ original_start: { utc: '2027-02-02T15:00:00Z' }, start: { utc: '2027-02-02T16:00:00Z' }, title: 'Late' }], deleted: [{ utc: '2027-02-09T15:00:00Z' }] };
             const short = { resource_href: '/1/calendars/work/new.ics', expected_version: '"e1"', write_outcome: 'applied' as const };
-            const worst = { resource_href: `/${'a'.repeat(2046)}/`.slice(0, 2048), expected_version: `"${'e'.repeat(1022)}"`, write_outcome: 'applied' as const };
+            const worst = { resource_href: `/${'a'.repeat(2045)}/a`, expected_version: `"${'e'.repeat(1022)}"`, write_outcome: 'applied' as const };
             const send = async (extra: Record<string, unknown>): Promise<{ size: number; error: Record<string, unknown> & { exceptions_dropped?: typeof full } }> => {
                 const service: BoundCalendarService = { ...harness().service, create_event: async () => { throw new CalendarError('split_incomplete', undefined, extra); } };
                 const response = await handleMcp(request('tools/call', { name: 'create_event', arguments: CREATE }, protocol, '\u0000'.repeat(128)), { token: 't', clientId: 'c', scopes: READ_WRITE }, service);
