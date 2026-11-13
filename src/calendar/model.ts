@@ -161,7 +161,10 @@ export interface EventComponent {
     alarmCount: number;
     extensionPropertyCount: number;
     attachments: readonly AttachmentDescriptor[];
-    /** True when RRULE, RDATE or EXDATE survived expansion. */
+    /**
+     * True when the VEVENT has RRULE, RDATE or EXDATE. Read only for an original master (series or single); on an expanded
+     * instance it can be true only from a leftover RDATE/EXDATE, which says nothing about that instance.
+     */
     retainsRecurrenceRules: boolean;
 }
 

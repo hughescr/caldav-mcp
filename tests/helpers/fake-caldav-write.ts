@@ -35,7 +35,9 @@ import { FAKE_DISCOVERY } from './fake-caldav';
  *
  * Expanded REPORT (`queryEvents`), as measured (probe Run 7 P3B-1..6, P3C-1..4, P3D-1..3; Runs 2-5):
  * - Every resource with an instance in the window is returned with the stored ETag; calendar-data has no VERSION, PRODID or
- *   VTIMEZONE (measured) and LF line endings; RRULE, RDATE, EXDATE and EXRULE are gone from the instances.
+ *   VTIMEZONE (measured) and LF line endings; RRULE, EXDATE and EXRULE are gone from the instances, and the master's RDATE
+ *   lines stay on every instance (measured 2026-11, read-only). Each RDATE value of a UTC or TZID master is one more
+ *   instance; a floating value is read as UTC (measured), a UTC or TZID value as its instant (GUESS).
  * - An unmoved instance's DTSTART/DTEND keep the master's form (TZID local digits, UTC, DATE, floating) and its
  *   RECURRENCE-ID is the UTC form: the true instant for UTC and TZID series, the date at T000000Z for DATE series, the
  *   wall digits with Z for floating series (measured).
@@ -210,7 +212,10 @@ function expandResource(text: string, window: Window): string | null {
     const exdates = master.direct.filter(line => nameOf(line) === 'EXDATE').flatMap(line => valueOf(line).split(',').map(value => instantOf(fakeTime(`${line.slice(0, line.length - valueOf(line).length)}${value}`))));
     const overrideAt = new Map<number, Block>();
     for (const block of overrides) { overrideAt.set(instantOf(fakeTime(firstOf(block, 'RECURRENCE-ID') ?? '')), block); }
-    const kept = master.direct.filter(line => !RULE_LINES.has(nameOf(line)) && nameOf(line) !== 'DTSTART' && nameOf(line) !== 'DTEND' && nameOf(line) !== 'DURATION');
+    // The master's RDATE lines stay on every instance (measured 2026-11, read-only); the other rule lines do not.
+    const kept = master.direct.filter(line => (nameOf(line) === 'RDATE' || !RULE_LINES.has(nameOf(line))) && nameOf(line) !== 'DTSTART' && nameOf(line) !== 'DTEND' && nameOf(line) !== 'DURATION');
+    interface Slot { digits: string; ms: number; firstMs: number }
+    const slots: Slot[] = [];
     for (let k = 0; k < 20_000; k++) {
         if (count !== null && k >= count) { break; }
         // The k-th slot on the wall clock of the master's form.
@@ -221,9 +226,23 @@ function expandResource(text: string, window: Window): string | null {
         const slotMs = instantOf(slot);
         if (untilMs !== null && slotMs > untilMs) { break; }
         if (slotMs > window.end + 40 * 86_400_000) { break; }
+        slots.push({ digits: slotDigits, ms: slotMs, firstMs: slot.kind === 'zoned' ? zonedInstant(slot.digits, slot.tzid).first : slotMs });
+    }
+    // RDATE instances (measured for a TZID master): a floating value is read as UTC. GUESS: a UTC value as is, a TZID value
+    // in its zone. Other master or value forms are not modelled.
+    for (const line of master.direct.filter(item => nameOf(item) === 'RDATE')) {
+        if (start.kind !== 'zoned' && start.kind !== 'utc') { throw new Error('fake expansion: RDATE is modelled only for UTC and TZID masters'); }
+        for (const value of valueOf(line).split(',')) {
+            const time = fakeTime(`${line.slice(0, line.length - valueOf(line).length)}${value}`);
+            if (time.kind === 'date') { throw new Error('fake expansion: unmodelled RDATE form'); }
+            const ms = time.kind === 'floating' ? civilMs(time.digits) : instantOf(time);
+            if (!slots.some(slot => slot.ms === ms)) { slots.push({ digits: utcDigits(ms).slice(0, 15), ms, firstMs: ms }); }
+        }
+    }
+    slots.sort((a, b) => a.ms - b.ms);
+    for (const { digits: slotDigits, ms: slotMs, firstMs } of slots) {
         if (exdates.includes(slotMs)) { continue; }
         const override = overrideAt.get(slotMs);
-        const firstMs = slot.kind === 'zoned' ? zonedInstant(slot.digits, slot.tzid).first : slotMs;
         const slotEnd = firstMs + durationMs;
         if (override !== undefined) {
             const own = span(override);

@@ -46,7 +46,12 @@ export interface SeriesRead {
     outlines: EventOutline[];
 }
 
-/** Membership, the original, the attendee gate; a non-repeating event has no occurrences (`not_repeating`). */
+/**
+ * Membership, the original, the attendee gate; a non-repeating event has no occurrences (`not_repeating`). Every occurrence
+ * scope (`this`, `this_and_future`) reads through here, so a master with RDATE is refused here (`rdate_present`), whatever
+ * the version, before any expansion or write: naming one occurrence of it would be a guess (iCloud reads a floating RDATE as
+ * UTC, and stored overrides need not line up with its expansion; measured 2026-11).
+ */
 export async function readSeries(deps: WriteDeps, calendarId: string, href: string): Promise<SeriesRead> {
     const { summary, reporter } = await membership(deps, calendarId);
     const found = await readOriginalText(deps, reporter, calendarId, href);
@@ -54,6 +59,7 @@ export async function readSeries(deps: WriteDeps, calendarId: string, href: stri
     const original = parseStored(deps, found.calendarData);
     const guests = attendeeGate(deps, found.calendarData);
     if (original.kind === 'single') { throw invalid('not_repeating', 'edit_scope'); }
+    if (original.master?.properties.has('rdate') === true) { throw notSupported('rdate_present'); }
     let outlines: EventOutline[];
     try { outlines = describeEvents(found.calendarData, { work: parseWork(deps) }); } catch (error) { throw builderError(error); }
     if (outlines.filter(outline => outline.recurrenceId !== null).length !== original.overrides.length) { throw unsupported('stored_data_not_editable'); }
