@@ -10,9 +10,13 @@ import {
     downloadOutputSchema, eventsOutputSchema, getEventOutputSchema, type AttachmentMetadata, type DownloadOutput, type EventsOutput, type FullEvent, type GetEventOutput, type SlimEvent, type Unreadable,
 } from './event-schemas';
 import {
-    MAX_ATTACHMENTS, MAX_EVENTS, MAX_RAW_BYTES, MAX_UNREADABLE, MAX_WIRE_BYTES, RESULT_TOO_LARGE_NOTICE, RESUME_INSTRUCTION, RESUME_INSTRUCTION_NO_ROW,
+    MAX_ATTACHMENTS, MAX_EVENTS, MAX_RAW_BYTES, MAX_SERIES_WITHOUT_OCCURRENCES, MAX_UNREADABLE, MAX_WIRE_BYTES, RESULT_TOO_LARGE_NOTICE, RESUME_INSTRUCTION, RESUME_INSTRUCTION_NO_ROW,
 } from './limits';
 import type { EventTime } from './model';
+import {
+    DELETE_STORED_DIFFERS_NOTE, DOWNLOAD_LINK_NOTE, EXCEPTIONS_DROPPED_NOTE, EXTERNAL_ATTACHMENT_NOTE, notesField, OUTCOME_NOTES, RANGE_MARGIN_NOTE, READBACK_UNAVAILABLE_NOTE, SPLIT_OUTCOME_NOTE,
+    STORED_DIFFERS_NOTE, timezoneNotes,
+} from './notes';
 import { civilStartText } from './time-core';
 import { deleteEventResultSchema, writeEventResultSchema, type DeleteEventResult, type WriteEventResult } from './write-schemas';
 
@@ -115,12 +119,23 @@ function toolResult(payload: EventsOutput | GetEventOutput | DownloadOutput | Wr
 
 // ---- list/search ----
 
-interface EventsSelection { events: number; unreadable: number }
+interface EventsSelection { events: number; unreadable: number; series: number }
+
+/** A time with a fixed instant: UTC, or a recognised zone. All-day, floating and unrecognised-zone times have none. */
+const hasInstant = (time: SlimEvent['start']): boolean => 'utc' in time && time.utc !== undefined;
+
+/** The notes of a list/search payload: each timezone warning in it, and the range margin when an event has no instant. */
+function eventsNotes(payload: Omit<EventsOutput, 'notes'>): { notes?: string[] } {
+    const found = timezoneNotes(payload);
+    if (payload.events.some(event => !hasInstant(event.start) || (event.end !== null && !hasInstant(event.end)))) { found.add(RANGE_MARGIN_NOTE); }
+    return notesField(found);
+}
 
 function eventsPayload(result: EventsReadResult, limit: number, chosen: EventsSelection): EventsOutput {
     const matched = result.events.length;
     const events: SlimEvent[] = result.events.slice(0, chosen.events);
     const unreadable: Unreadable[] = result.unreadable.slice(0, chosen.unreadable);
+    const series = result.seriesWithoutOccurrences.slice(0, chosen.series);
     const unreadableCount = Math.max(result.unreadableCount, unreadable.length);
     const truncated = matched > events.length;
     const reasons: EventsOutput['truncation_reasons'] = [];
@@ -128,7 +143,8 @@ function eventsPayload(result: EventsReadResult, limit: number, chosen: EventsSe
     if (events.length < Math.min(limit, matched)) { reasons.push('response_bytes'); }
     const last = events.at(-1);
     const allOk = result.calendars.every(calendar => calendar.status === 'ok');
-    return {
+    const seriesTruncated = series.length < result.seriesWithoutOccurrences.length;
+    const payload = {
         calendars: result.calendars,
         range: { start: result.range.start, end: result.range.end },
         events,
@@ -137,6 +153,11 @@ function eventsPayload(result: EventsReadResult, limit: number, chosen: EventsSe
         unreadable,
         unreadable_count: unreadableCount,
         unreadable_truncated: unreadable.length < unreadableCount,
+        // Omitted when empty: the rare case costs nothing in the common result. Their presence is not an error, so it does
+        // not affect `complete`; leaving some out does.
+        ...(series.length > 0 ? { series_without_occurrences: series } : {}),
+        // Also when the wire cap left no entry at all, so a cut is never silent.
+        ...(seriesTruncated ? { series_without_occurrences_truncated: true as const } : {}),
         truncated,
         truncation_reasons: reasons,
         ...(truncated ? {
@@ -145,10 +166,11 @@ function eventsPayload(result: EventsReadResult, limit: number, chosen: EventsSe
                 // The schema output type only widens optional keys to `| undefined`; the value is the model EventTime.
                 : { last_returned_civil_start: civilStartText(last.start as EventTime), instruction: RESUME_INSTRUCTION },
         } : {}),
-        complete: !truncated && unreadableCount === 0 && allOk,
-        coverage: 'server_reports',
-        limitations: ['moved_overrides_unverified', 'silent_server_omissions_undetectable'],
+        complete: !truncated && unreadableCount === 0 && allOk && !seriesTruncated,
+        coverage: 'server_reports' as const,
+        limitations: ['moved_overrides_unverified', 'silent_server_omissions_undetectable'] as ['moved_overrides_unverified', 'silent_server_omissions_undetectable'],
     };
+    return { ...payload, ...eventsNotes(payload) };
 }
 
 /** Fixed notices, rendered from trusted constants and counts only. */
@@ -177,11 +199,18 @@ export function shapeEventsResult(result: EventsReadResult, options: EventsShape
     const matched = result.events.length;
     const attempt = (chosen: EventsSelection): boolean => fits(eventsResult(result, limit, chosen), wire);
 
-    // The envelope: every status and the fixed metadata. Unreadables may be shortened (the exact count stays) to make it fit.
+    // The envelope: every status and the fixed metadata. Series entries, then unreadables, may be shortened (each says so:
+    // series_without_occurrences_truncated, and the exact unreadable count) to make it fit.
     let unreadable = Math.min(result.unreadable.length, MAX_UNREADABLE);
-    if (!attempt({ events: 0, unreadable })) {
-        if (!attempt({ events: 0, unreadable: 0 })) { return errorResult('result_too_large'); }
-        unreadable = largestFitting(0, unreadable - 1, count => attempt({ events: 0, unreadable: count }));
+    let series = Math.min(result.seriesWithoutOccurrences.length, MAX_SERIES_WITHOUT_OCCURRENCES);
+    if (!attempt({ events: 0, unreadable, series })) {
+        if (!attempt({ events: 0, unreadable: 0, series: 0 })) { return errorResult('result_too_large'); }
+        if (attempt({ events: 0, unreadable, series: 0 })) {
+            series = largestFitting(0, series - 1, count => attempt({ events: 0, unreadable, series: count }));
+        } else {
+            series = 0;
+            unreadable = largestFitting(0, unreadable - 1, count => attempt({ events: 0, unreadable: count, series }));
+        }
     }
 
     // Each row appears at least twice (structured and text copy) in at least its JSON length, which bounds the search cheaply.
@@ -192,11 +221,11 @@ export function shapeEventsResult(result: EventsReadResult, options: EventsShape
         if (lowerBound > MAX_WIRE_BYTES) { ceiling = index; break; }
     }
     // Below the full match count every candidate carries the resume hint, so fit is monotone in the row count there.
-    const events = ceiling > 0 && attempt({ events: ceiling, unreadable })
+    const events = ceiling > 0 && attempt({ events: ceiling, unreadable, series })
         ? ceiling
-        : largestFitting(0, Math.max(0, Math.min(ceiling, matched - 1)), count => attempt({ events: count, unreadable }));
+        : largestFitting(0, Math.max(0, Math.min(ceiling, matched - 1)), count => attempt({ events: count, unreadable, series }));
 
-    const shaped = eventsResult(result, limit, { events, unreadable });
+    const shaped = eventsResult(result, limit, { events, unreadable, series });
     return eventsOutputSchema.safeParse(shaped.structuredContent).success ? shaped : errorResult('upstream_error');
 }
 
@@ -254,9 +283,11 @@ function detailPayload(result: DetailReadResult, rawPrefix: string | null, allAt
         attachments_total: allAttachments.length,
         attachments_truncated: attachments.length < allAttachments.length,
     };
-    if (rawPrefix === null || result.rawIcs === null) { return { ...base, raw_included: false }; }
+    // Cutting text never changes a time, so the notes are the same for every candidate.
+    const notes = notesField(timezoneNotes(base));
+    if (rawPrefix === null || result.rawIcs === null) { return { ...base, raw_included: false, ...notes }; }
     const raw = unitPrefix(rawPrefix, state.raw);
-    return { ...base, raw_included: true, raw_ics: raw, raw_truncated: raw.length < result.rawIcs.length, raw_representation: 'report_calendar_data' };
+    return { ...base, raw_included: true, raw_ics: raw, raw_truncated: raw.length < result.rawIcs.length, raw_representation: 'report_calendar_data', ...notes };
 }
 
 /** Reduces in order: raw prefix, attendee suffix, attachment suffix, description/location/title prefixes. */
@@ -319,13 +350,35 @@ function withEventCut(event: FullEvent, state: EventTextState): FullEvent {
  * cannot fit, the event is left out and the result says `readback: "unavailable"`, so an applied write is never reported
  * as a failure.
  */
-export function shapeWriteResult(result: WriteEventResult, options: DetailShapeOptions): CallToolResult {
-    if (!writeEventResultSchema.safeParse(result).success) { return errorResult('upstream_error'); }
+/**
+ * The notes of a write result: a write_outcome other than the ordinary "applied" (a split's new series too), and each
+ * rare field or timezone warning it holds. An ordinary save has none.
+ */
+function writeNotes(payload: WriteEventResult): { notes?: string[] } {
+    const found = timezoneNotes(payload);
+    if (payload.write_outcome === 'desired_state_present') { found.add(OUTCOME_NOTES.desired_state_present); }
+    const created = payload.created_series;
+    if (created !== undefined) {
+        found.add(SPLIT_OUTCOME_NOTE);
+        // A result names only a confirmed new series (the schema refuses `unconfirmed` here).
+        if (created.write_outcome === 'desired_state_present') { found.add(OUTCOME_NOTES.desired_state_present); }
+    }
+    if (payload.readback === 'unavailable') { found.add(READBACK_UNAVAILABLE_NOTE); }
+    if ((payload.stored_differs_from_request?.length ?? 0) > 0) { found.add(STORED_DIFFERS_NOTE); }
+    if (payload.exceptions_dropped !== undefined) { found.add(EXCEPTIONS_DROPPED_NOTE); }
+    return notesField(found);
+}
+
+export function shapeWriteResult(input: WriteEventResult, options: DetailShapeOptions): CallToolResult {
+    if (!writeEventResultSchema.safeParse(input).success) { return errorResult('upstream_error'); }
     const { wire } = options;
+    // The notes are the server's own, computed from what is sent; any given ones are replaced.
+    const { notes: _given, ...result } = input;
     const source = result.event;
-    const build = (event: FullEvent | null): CallToolResult => toolResult(event === null
-        ? { ...result, readback: 'unavailable', stored_differs_from_request: null, event: null }
-        : { ...result, event }, []);
+    const build = (event: FullEvent | null): CallToolResult => {
+        const payload: WriteEventResult = event === null ? { ...result, readback: 'unavailable', stored_differs_from_request: null, event: null } : { ...result, event };
+        return toolResult({ ...payload, ...writeNotes(payload) }, []);
+    };
     if (source === null) { return fits(build(null), wire) ? build(null) : errorResult('upstream_error'); }
     const state: EventTextState = { attendees: source.attendees.length, description: source.description?.length ?? 0, location: source.location?.length ?? 0, title: source.title?.length ?? 0 };
     const attempt = (candidate: EventTextState): boolean => fits(build(withEventCut(source, candidate)), wire);
@@ -347,25 +400,31 @@ export function shapeWriteResult(result: WriteEventResult, options: DetailShapeO
     return writeEventResultSchema.safeParse(shaped.structuredContent).success ? shaped : errorResult('upstream_error');
 }
 
-/** The delete result: fixed fields and identifiers only; validated, never cut. */
-export function shapeDeleteResult(result: DeleteEventResult, options: DetailShapeOptions): CallToolResult {
-    if (!deleteEventResultSchema.safeParse(result).success) { return errorResult('upstream_error'); }
-    const shaped = toolResult(result, []);
-    return fits(shaped, options.wire) ? shaped : errorResult('upstream_error');
+/** The delete result: fixed fields, identifiers and the notes of its outcome; validated, never cut. */
+export function shapeDeleteResult(input: DeleteEventResult, options: DetailShapeOptions): CallToolResult {
+    if (!deleteEventResultSchema.safeParse(input).success) { return errorResult('upstream_error'); }
+    const { notes: _given, ...result } = input;
+    const found = new Set<string>(result.write_outcome === 'desired_state_present' ? [OUTCOME_NOTES.desired_state_present] : []);
+    if (result.readback === 'unavailable') { found.add(READBACK_UNAVAILABLE_NOTE); }
+    if (result.stored_differs_from_request?.includes('recurrence') === true) { found.add(DELETE_STORED_DIFFERS_NOTE); }
+    const shaped = toolResult({ ...result, ...notesField(found) }, []);
+    return deleteEventResultSchema.safeParse(shaped.structuredContent).success && fits(shaped, options.wire) ? shaped : errorResult('upstream_error');
 }
 
 // ---- get_event_attachment_download ----
 
-/** Fixed notice on an external link: rendered from a trusted constant, never from upstream text. */
-export const EXTERNAL_LINK_NOTICE = 'This attachment is an external link stored on the event. This server did not fetch or check it; what it points to is untrusted.';
-
 /**
- * Structured result and its JSON text copy, and nothing else for a staged copy; an external link also gets one fixed
- * notice that does not repeat the link. The link is in each representation once. Nothing in it is shortened: if it
- * cannot fit, it is result_too_large.
+ * Structured result and its JSON text copy. Every download_url comes with the note on handling it; an external link with
+ * the note that it was not fetched and is untrusted (fixed text that does not repeat the link). The link is in each
+ * representation once. Nothing in it is shortened: if it cannot fit, it is result_too_large.
  */
-export function shapeDownloadResult(result: DownloadOutput, options: DetailShapeOptions): CallToolResult {
-    if (!downloadOutputSchema.safeParse(result).success) { return errorResult('upstream_error'); }
-    const shaped = toolResult(result, result.form === 'external' ? [EXTERNAL_LINK_NOTICE] : []);
+export function shapeDownloadResult(input: DownloadOutput, options: DetailShapeOptions): CallToolResult {
+    if (!downloadOutputSchema.safeParse(input).success) { return errorResult('upstream_error'); }
+    const { notes: _given, ...result } = input;
+    const found: string[] = [];
+    if (result.download_url !== undefined) { found.push(DOWNLOAD_LINK_NOTE); }
+    if (result.form === 'external') { found.push(EXTERNAL_ATTACHMENT_NOTE); }
+    const shaped = toolResult({ ...result, ...notesField(found) }, []);
+    if (!downloadOutputSchema.safeParse(shaped.structuredContent).success) { return errorResult('upstream_error'); }
     return fits(shaped, options.wire) ? shaped : errorResult('result_too_large');
 }

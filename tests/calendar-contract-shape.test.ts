@@ -14,7 +14,7 @@ function event(index: number, text = 'Title'): SlimEvent {
     return { calendar: 0, resource_href: `${calendarId}${String(index).padStart(3, '0')}.ics`, recurrence_id: null, expected_version: '"v1"', recurring: false, start: { utc: '2027-01-11T10:00:00Z' }, end: { utc: '2027-01-11T11:00:00Z' }, duration: null, title: text, location: null, description: null, attendees_count: 0 };
 }
 function readResult(count: number, text?: string): EventsReadResult {
-    return { calendars: [calendar], range, events: Array.from({ length: count }, (_, i) => event(i, text)), unreadable: [], unreadableCount: 0 };
+    return { calendars: [calendar], range, events: Array.from({ length: count }, (_, i) => event(i, text)), unreadable: [], unreadableCount: 0, seriesWithoutOccurrences: [] };
 }
 const full: FullEvent = { ...event(0), calendar_id: calendarId, uid: 'synthetic', view: 'single', end_exclusive: true, organizer: null, attendees: [], omitted: { alarms: 0, extension_properties: 0 } };
 const raw = await Bun.file(new URL('./fixtures/calendar/attachments/original.ics', import.meta.url)).text();

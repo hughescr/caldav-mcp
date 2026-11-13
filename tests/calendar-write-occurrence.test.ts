@@ -56,7 +56,8 @@ const puts = (fake: FakeICloud): { href?: string; precondition?: string; body?: 
 async function instances(fake: FakeICloud, href: string, startUtc = '20261101T000000Z', endUtc = '20271231T000000Z'): Promise<string[]> {
     const resources = await fake.queryEvents(AUTH, FAKE_DISCOVERY, { calendarId: WORK, range: { startUtc, endUtc } });
     const text = resources.find(resource => resource.href === href)?.calendarData ?? '';
-    return text.split('BEGIN:VEVENT').slice(1).map(block => {
+    // A window holding only deleted occurrences returns the stored master alone (measured): a master is not an instance.
+    return text.split('BEGIN:VEVENT').slice(1).filter(block => !/\nRRULE[;:]/u.test(block)).map(block => {
         const value = (name: string): string => block.split('\n').find(line => line.startsWith(name))?.replace(/^[^:]*:/u, '') ?? '-';
         return `${value('DTSTART')}/${value('DTEND')}/${value('RECURRENCE-ID')}/${value('SUMMARY')}`;
     });

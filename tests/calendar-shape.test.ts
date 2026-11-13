@@ -16,7 +16,7 @@ function event(index: number, title = 'Title'): SlimEvent {
     return { calendar: 0, resource_href: `${calendarId}${String(index).padStart(4, '0')}.ics`, recurrence_id: null, expected_version: '"v1"', recurring: false, start: { date: '2027-01-11', all_day: true }, end: null, duration: null, title, location: null, description: null, attendees_count: 0 };
 }
 function readResult(count: number, title?: string): EventsReadResult {
-    return { calendars: [ok], range, events: Array.from({ length: count }, (_, index) => event(index, title)), unreadable: [], unreadableCount: 0 };
+    return { calendars: [ok], range, events: Array.from({ length: count }, (_, index) => event(index, title)), unreadable: [], unreadableCount: 0, seriesWithoutOccurrences: [] };
 }
 const texts = (result: CallToolResult): string[] => (result.content ?? []).flatMap(item => (item.type === 'text' ? [item.text] : []));
 const attendee = (index: number): Attendee => ({ address: `mailto:person${index}@example.test`, name: 'n'.repeat(100), role: 'REQ-PARTICIPANT', participation: 'ACCEPTED' });

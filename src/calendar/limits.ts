@@ -12,6 +12,12 @@ export const MAX_DISCOVERED_CALENDARS = 300;
 export const MAX_WIRE_BYTES = 96 * KIB;
 export const MAX_RAW_BYTES = 16 * KIB;
 export const MAX_UNREADABLE = 50;
+/** Entries of series_without_occurrences in one list/search result (more set series_without_occurrences_truncated). */
+export const MAX_SERIES_WITHOUT_OCCURRENCES = 10;
+/** Stored EXDATE values listed per series_without_occurrences entry; excluded_count has them all. */
+export const MAX_EXCLUDED_STARTS = 10;
+/** Longest stored RRULE value text passed through, in printable ASCII; a longer or other one leaves the resource as today. */
+export const REPEAT_RULE_MAX = 1024;
 export const MAX_ATTENDEES = 100;
 export const MAX_ATTACHMENTS = 100;
 
@@ -118,6 +124,12 @@ export const MIN_RESOURCE_ENVELOPE_BYTES = RESOURCE_ENVELOPE_MARKUP.reduce((sum,
 /** Fixed resume hint texts. A hint, never a cursor. */
 export const RESUME_INSTRUCTION = 'Re-query from this civil start with an explicit offset or Z, de-duplicate by calendar_id/resource_href/recurrence_id, and narrow the range or select fewer calendars if the same prefix repeats. This is a hint, not a cursor or completeness guarantee.';
 export const RESUME_INSTRUCTION_NO_ROW = 'No event fit in the result. Narrow the range or select fewer calendars. This is a hint, not a cursor or completeness guarantee.';
+
+/**
+ * Fixed explanation carried by every series_without_occurrences entry, so the tool texts every conversation loads do not
+ * grow for this rare case. Never built from calendar content.
+ */
+export const SERIES_WITHOUT_OCCURRENCES_NOTE = 'iCloud matched this repeating event to the range but returned no occurrence in it. Usually an occurrence in the range was deleted (see excluded_starts). This is not an error; get_event reads the series.';
 
 /** Fixed trusted notice rendered whenever any calendar status is result_too_large. Never built from upstream text. */
 export const RESULT_TOO_LARGE_NOTICE = `A calendar exceeded a safety limit: ${MAX_REPORT_BYTES / MIB} MiB/report, ${MAX_AGGREGATE_BYTES / MIB} MiB/tool, ${MAX_RESOURCE_BYTES / MIB} MiB/resource, ${MAX_EXPANDED_VEVENTS_PER_CALENDAR.toLocaleString('en-US')} expanded events/calendar, ${MAX_EXPANDED_VEVENTS_PER_TOOL.toLocaleString('en-US')}/tool, ${MAX_RESOURCES_PER_REPORT.toLocaleString('en-US')} resources/report, ${MAX_LINES_PER_RESOURCE.toLocaleString('en-US')} lines and ${MAX_PROPERTIES_PER_RESOURCE.toLocaleString('en-US')} properties/resource. Narrow the range or select fewer calendars.`;

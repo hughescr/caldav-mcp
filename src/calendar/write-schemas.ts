@@ -6,8 +6,8 @@
  */
 import { z } from 'zod';
 import { KNOWN_PRECONDITIONS } from '../caldav/write-contracts';
-import { calendarStatusSchema, etagSchema, eventTimeSchema, fullEventSchema, occurrenceIdSchema, pathSchema, resourceHrefSchema } from './event-schemas';
-import { ALARM_DESCRIPTION, MAX_ALARMS, MAX_RRULE_LENGTH, TEXT_LIMITS } from './ics-write';
+import { calendarStatusSchema, etagSchema, eventTimeSchema, fullEventSchema, listedObject, listedObjects, notesSchema, occurrenceIdSchema, pathSchema, resourceHrefSchema } from './event-schemas';
+import { MAX_ALARMS, MAX_RRULE_LENGTH, TEXT_LIMITS } from './ics-write';
 
 /** The fixed message of an invalid_input error from a write tool; `reason` and `field` say what was wrong. */
 export const WRITE_INVALID_INPUT_MESSAGE = 'Invalid arguments for this write tool; see reason and field. Client times need an explicit UTC offset, Z, or a zone name; all-day values are dates.';
@@ -18,14 +18,13 @@ export const GUEST_NOTICE = 'This event has guests (attendees or an organizer), 
 
 // ---- Shared inputs ----
 
-const OPERATION_ID_FORM = '8-128 of A-Z a-z 0-9 . _ : -';
+// The listed JSON Schema states the form (a pattern), so the description does not.
 export const operationIdSchema = z.string(FIXED).regex(/^[A-Za-z0-9._:-]{8,128}$/u, FIXED)
-    .describe(`Idempotency key, ${OPERATION_ID_FORM}: a new random UUID per new event; the same value only to retry the same create.`);
+    .describe('Idempotency key: a new random UUID per new event; the same value only to retry.');
 const splitOperationIdSchema = z.string(FIXED).regex(/^[A-Za-z0-9._:-]{8,128}$/u, FIXED)
-    .describe(`this_and_future only: idempotency key for the split, ${OPERATION_ID_FORM}; a new random UUID per split, the same value only to retry or finish it.`);
+    .describe('this_and_future only: a new random UUID per split; the same value only to retry.');
 
 const shortText = (max: number) => z.string(FIXED).max(max, FIXED);
-const PASSED_BACK = 'are ignored (accepted so a read value can be passed back)';
 
 /**
  * The five client time forms (design 4.1); write-time.ts checks their meaning and reports a fixed reason. Like
@@ -36,37 +35,37 @@ export const writeTimeSchema = z.union([
     z.strictObject({ utc: shortText(64).describe('YYYY-MM-DDTHH:mm:ssZ') }, FIXED),
     z.strictObject({
         local: shortText(64).describe('YYYY-MM-DDTHH:mm[:ss], no offset'),
-        zone: shortText(256).optional().describe('Required. Zone name, e.g. America/New_York, stored as given'),
+        zone: shortText(256).optional().describe('Required. Zone name, e.g. America/New_York'),
+        // Read values, accepted so a time from a read can be passed back; the server ignores them.
         floating: z.boolean(FIXED).optional(),
         utc: shortText(64).optional(),
         offset: shortText(64).optional(),
         timezone_warning: shortText(64).optional(),
-    }, FIXED).describe(`floating, utc, offset and timezone_warning ${PASSED_BACK}.`),
+    }, FIXED),
     z.strictObject({
         date: shortText(64).describe('YYYY-MM-DD; an end date is exclusive'),
         zone: shortText(256).optional(),
         all_day: z.boolean(FIXED).optional(),
         timezone_warning: shortText(64).optional(),
-    }, FIXED).describe(`All-day. A zone is dropped (timezone_dropped_from_date); all_day and timezone_warning ${PASSED_BACK}.`),
+    }, FIXED).describe('All-day'),
 ], FIXED).meta({ id: 'write_time' });
 
 export const alarmInputSchema = z.strictObject({
-    before_start: shortText(32).describe('Unsigned RFC 5545 duration before the start, e.g. PT10M, P1D'),
+    before_start: shortText(32).describe('Duration before the start, e.g. PT10M, P1D'),
 }, FIXED);
-const alarmsSchema = z.array(alarmInputSchema, FIXED).max(MAX_ALARMS, FIXED).describe(`Display alarms ("${ALARM_DESCRIPTION}")`);
+const alarmsSchema = z.array(alarmInputSchema, FIXED).max(MAX_ALARMS, FIXED);
 
 export const recurrenceInputSchema = z.strictObject({
-    rrule: z.string(FIXED).min(1, FIXED).max(MAX_RRULE_LENGTH, FIXED)
-        .describe('RRULE value without "RRULE:", e.g. FREQ=WEEKLY;BYDAY=TU. An UNTIL must have the form of the start.'),
+    // What an UNTIL must look like is in the rrule_until_form refusal (mcp.ts).
+    rrule: z.string(FIXED).min(1, FIXED).max(MAX_RRULE_LENGTH, FIXED).describe('RRULE value without "RRULE:", e.g. FREQ=WEEKLY;BYDAY=TU'),
 }, FIXED);
 
-export const travelTimeSchema = shortText(32)
-    .describe('Apple Calendar travel time before the event, up to PT12H, e.g. PT30M. Written as X-APPLE-TRAVEL-DURATION only (no route or geocoding).');
+export const travelTimeSchema = shortText(32).describe('Travel time before the event, e.g. PT30M (max PT12H)');
 
 const titleSchema = shortText(TEXT_LIMITS.SUMMARY);
 const locationSchema = shortText(TEXT_LIMITS.LOCATION);
 const descriptionSchema = shortText(TEXT_LIMITS.DESCRIPTION);
-const transparencySchema = z.enum(['OPAQUE', 'TRANSPARENT'], FIXED).describe('OPAQUE busy, TRANSPARENT free');
+const transparencySchema = z.enum(['OPAQUE', 'TRANSPARENT'], FIXED);
 
 // ---- create_event ----
 
@@ -89,20 +88,20 @@ export const createEventInputSchema = z.strictObject({
 
 export const updateChangesSchema = z.strictObject({
     title: titleSchema.nullable().optional(),
-    location: locationSchema.nullable().optional().describe('Any change also removes an Apple map pin (removed_apple_location_pin)'),
-    description: descriptionSchema.nullable().optional().describe('Any change also removes its HTML copy (X-ALT-DESC)'),
+    location: locationSchema.nullable().optional().describe('Any change also removes an Apple map pin'),
+    description: descriptionSchema.nullable().optional().describe('Any change also removes its HTML copy'),
     status: z.enum(['CONFIRMED', 'TENTATIVE', 'CANCELLED'], FIXED).nullable().optional(),
     transparency: transparencySchema.nullable().optional(),
-    alarms: alarmsSchema.nullable().optional().describe('Replaces every alarm; null or [] removes them all'),
+    alarms: alarmsSchema.nullable().optional().describe('Replaces all alarms; null or [] removes them'),
     start: writeTimeSchema.optional(),
     end: writeTimeSchema.optional(),
-    recurrence: recurrenceInputSchema.nullable().optional().describe('The new rule (null: a single event; this_and_future: the new series\' rule). Not with this.'),
+    recurrence: recurrenceInputSchema.nullable().optional().describe('The new rule; null makes a single event'),
     travel_time: travelTimeSchema.nullable().optional(),
-}, FIXED).describe('Only the fields to change: absent is unchanged, a value replaces, null removes.');
+}, FIXED).describe('Only the fields to change; null removes a field');
 
 export const editScopeSchema = z.enum(['all', 'this', 'this_and_future'], FIXED).describe('Required for a repeating event');
 const recurrenceIdInputSchema = occurrenceIdSchema.describe('For this and this_and_future: the occurrence\'s recurrence_id, unchanged');
-const changeVersionSchema = etagSchema.describe('From the latest read of this event');
+const changeVersionSchema = etagSchema.describe('From the latest read');
 
 export const updateEventInputSchema = z.strictObject({
     calendar_id: pathSchema,
@@ -111,7 +110,8 @@ export const updateEventInputSchema = z.strictObject({
     edit_scope: editScopeSchema.optional(),
     recurrence_id: recurrenceIdInputSchema.optional(),
     operation_id: splitOperationIdSchema.optional(),
-    exceptions: z.enum(['drop', 'shift'], FIXED).optional(),
+    // What drop and shift do, and when shift is allowed, is in the refusal that asks for this (exceptions_choice_required).
+    exceptions: z.enum(['drop', 'shift'], FIXED).optional().describe('Only when a refusal asks for it'),
     changes: updateChangesSchema,
 }, FIXED);
 
@@ -156,18 +156,20 @@ export const droppedExceptionsSchema = z.strictObject({
         title: z.string().max(256).nullable(),
     })).max(MAX_LISTED_EXCEPTIONS),
     deleted: z.array(eventTimeSchema).max(MAX_LISTED_EXCEPTIONS),
-    truncated: z.literal(true).optional().describe('More were dropped than listed; the counts are complete'),
-}).describe('Removed by exceptions "drop"; re-apply them with edit_scope this.');
+    truncated: z.literal(true).optional(),
+});
 
 export const createdSeriesSchema = z.strictObject({
     resource_href: resourceHrefSchema.describe('The new series; use it for the occurrences from the split on'),
     expected_version: etagSchema.nullable(),
-    write_outcome: z.enum(['applied', 'desired_state_present', 'unconfirmed']).describe('unconfirmed (errors only): not confirmed to hold everything the split wrote; inspect it'),
+    // unconfirmed only in a split_incomplete error, whose message explains it.
+    write_outcome: z.enum(['applied', 'desired_state_present', 'unconfirmed']),
 });
 
-export const writeEventResultSchema = z.strictObject({
-    write_outcome: writeOutcomeSchema.describe('For this_and_future: the original series; created_series has its own'),
-    readback: z.enum(['ok', 'unavailable']).describe('unavailable: saved but not read back (event null); use get_event'),
+// What write_outcome, readback, stored_differs_from_request and exceptions_dropped mean is in the result's notes (notes.ts).
+const writeEventResultShape = {
+    write_outcome: writeOutcomeSchema,
+    readback: z.enum(['ok', 'unavailable']),
     calendar_id: pathSchema,
     resource_href: resourceHrefSchema,
     expected_version: etagSchema.nullable().describe('For the next update or delete; null when unknown'),
@@ -183,7 +185,22 @@ export const writeEventResultSchema = z.strictObject({
     ...guestFields,
     calendars: z.tuple([calendarStatusSchema]),
     event: fullEventSchema.nullable().describe('The stored event as get_event returns it (this: the occurrence; this_and_future: the new series)'),
-}).superRefine((value, context) => {
+    notes: notesSchema,
+};
+
+/**
+ * What tools/list publishes for create_event and update_event: the strict schema with the rare-case fields shown without
+ * their field schema. Results are checked against writeEventResultSchema first.
+ */
+export const listedWriteEventResultSchema = z.strictObject({
+    ...writeEventResultShape,
+    request_warnings: listedObjects(),
+    exceptions_dropped: listedObject(),
+    exceptions_shifted: listedObject(),
+    guest_notice: z.string().optional(),
+});
+
+export const writeEventResultSchema = z.strictObject(writeEventResultShape).superRefine((value, context) => {
     const fail = (message: string): void => { context.addIssue({ code: 'custom', message }); };
     if ((value.event === null) !== (value.readback === 'unavailable')) { fail('event is null exactly when readback is unavailable'); }
     if ((value.stored_differs_from_request === null) !== (value.readback === 'unavailable')) { fail('stored_differs_from_request is null exactly when readback is unavailable'); }
@@ -194,7 +211,7 @@ export const writeEventResultSchema = z.strictObject({
     if (value.recurrence_id !== undefined && value.event !== null && (value.event.view !== 'occurrence' || value.event.recurrence_id !== value.recurrence_id)) { fail('an occurrence result shows that occurrence'); }
 });
 
-export const deleteEventResultSchema = z.strictObject({
+const deleteEventResultShape = {
     write_outcome: writeOutcomeSchema,
     deleted: z.enum(['resource', 'occurrence', 'following']).describe('following: the series now ends before that occurrence'),
     calendar_id: pathSchema,
@@ -202,11 +219,16 @@ export const deleteEventResultSchema = z.strictObject({
     recurrence_id: occurrenceIdSchema.optional(),
     readback: z.enum(['ok', 'unavailable']).optional(),
     expected_version: etagSchema.nullable().optional().describe('The series\' version after the change, for the next update or delete'),
-    stored_differs_from_request: z.array(z.literal('recurrence')).max(1).nullable().optional()
-        .describe('["recurrence"] when the series read back does not show this change'),
+    stored_differs_from_request: z.array(z.literal('recurrence')).max(1).nullable().optional(),
     ...guestFields,
     calendars: z.tuple([calendarStatusSchema]),
-}).superRefine((value, context) => {
+    notes: notesSchema,
+};
+
+/** What tools/list publishes for delete_event: the strict schema with the guest notice shown as a string. */
+export const listedDeleteEventResultSchema = z.strictObject({ ...deleteEventResultShape, guest_notice: z.string().optional() });
+
+export const deleteEventResultSchema = z.strictObject(deleteEventResultShape).superRefine((value, context) => {
     const fail = (message: string): void => { context.addIssue({ code: 'custom', message }); };
     if ((value.guests_may_be_emailed === true) !== (value.guest_notice !== undefined)) { fail('guest_notice accompanies guests_may_be_emailed'); }
     const partial = value.deleted !== 'resource';

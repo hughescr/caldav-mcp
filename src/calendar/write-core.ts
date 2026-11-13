@@ -25,7 +25,7 @@ import { parseOriginalResource } from './ical';
 import { DAV_LAMBDA_RESERVE_MS, DAV_REQUEST_MS } from './limits';
 import { BudgetError, IcalError, isCanonicalPath, type EventComponent, type OccurrenceId, type OriginalResource } from './model';
 import { OccurrenceTargetError } from './occurrence-target';
-import { calendarStatus, occurrenceView, originalEventView, readCalendarMembership, readStoredResource, ReadError, type ReadDeps, type UnauthorizedReporter } from './read';
+import { calendarStatus, occurrenceView, originalEventView, readCalendarMembership, readStoredResource, ReadError, type ErrorDetail, type ReadDeps, type UnauthorizedReporter } from './read';
 import type { ToolErrorCode } from './schemas';
 import { formatInstant, occurrenceIdFromRecurrenceId } from './time-core';
 import { holdsExpectation, normaliseLine, storedDifferences, storedEvents, type ComponentRequest, type FieldLine, type StoredExpectation } from './write-compare';
@@ -66,9 +66,12 @@ export interface WriteErrorExtra {
     exceptions_dropped?: NonNullable<WriteEventResult['exceptions_dropped']>;
 }
 
-/** A fixed, sanitised write failure. Carries enums, counts, identifiers and the sanitised upstream summary only. */
+/**
+ * A fixed, sanitised write failure. Carries enums, counts, identifiers and the sanitised upstream summary only; `detail`,
+ * a read's fixed reason (ReadError), selects a more precise fixed message.
+ */
 export class WriteError extends Error {
-    constructor(public readonly code: ToolErrorCode, public readonly extra: WriteErrorExtra = {}) { super(code); }
+    constructor(public readonly code: ToolErrorCode, public readonly extra: WriteErrorExtra = {}, public readonly detail?: ErrorDetail) { super(code); }
 }
 
 export const INVITE_SCOPE = 'calendar:invite';
@@ -187,7 +190,7 @@ export function requireVerified(verdict: OutcomeVerdict): void {
 
 export function readFailure(error: unknown): WriteError {
     if (error instanceof WriteError) { return error; }
-    if (error instanceof ReadError) { return new WriteError(error.code); }
+    if (error instanceof ReadError) { return new WriteError(error.code, {}, error.detail); }
     if (error instanceof BudgetError) { return budgetFailure(error); }
     if (error instanceof CalDavError && error.code === 'unauthorized') { return new WriteError('reconnect_required'); }
     return new WriteError('temporarily_unavailable');

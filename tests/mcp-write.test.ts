@@ -7,7 +7,8 @@ import { toolErrorCodeSchema } from '../src/calendar/schemas';
 import { bindCalendarService, CalendarError, type BoundCalendarService } from '../src/calendar/service';
 import { KNOWN_PRECONDITIONS } from '../src/caldav/write-contracts';
 import { deleteEventResultSchema, GUEST_NOTICE, upstreamDetailSchema, WRITE_INVALID_INPUT_MESSAGE, writeEventResultSchema, writeToolErrorCodeSchema } from '../src/calendar/write-schemas';
-import { handleMcp, SERVER_INSTRUCTIONS } from '../src/mcp';
+import { OUTCOME_NOTES } from '../src/calendar/notes';
+import { handleMcp, OUTCOME_UNKNOWN_TEXT, SERVER_INSTRUCTIONS } from '../src/mcp';
 import { FAKE_DISCOVERY, FakeICloud } from './helpers/fake-caldav-write';
 
 const WORK = '/10000000001/calendars/work/';
@@ -171,8 +172,8 @@ describe('the write tools through the MCP boundary, in both protocol eras', () =
             })(h.fake.putEvent.bind(h.fake));
             const unknown = (await h.call('update_event', { calendar_id: WORK, resource_href: SINGLE_HREF, expected_version: etag, changes: { title: 'Mine' } }, READ_WRITE, protocol)).reply.result.structuredContent.error;
             expect(unknown.code).toBe('outcome_unknown');
-            expect(unknown.message).toContain('may or may not have been saved');
-            expect(unknown.message).toContain('before doing anything else');
+            expect(unknown.message).toContain(OUTCOME_UNKNOWN_TEXT);
+            expect(unknown.message).toContain('do not assume either outcome');
             expect(unknown.message).not.toContain('Retrying the same call is safe');
             // calendar_changed says "nothing saved" only for this call, which a 412 or an unsent call makes true.
             const changed = (await h.call('update_event', { calendar_id: WORK, resource_href: SINGLE_HREF, expected_version: etag, changes: { title: 'Other' } }, READ_WRITE, protocol)).reply.result.structuredContent.error;
@@ -180,7 +181,9 @@ describe('the write tools through the MCP boundary, in both protocol eras', () =
             const response = await handleMcp(request('tools/list', undefined, protocol), { token: 't', clientId: 'c', scopes: ['calendar:read'] }, h.service);
             const listed = `${JSON.stringify((await response.json()).result.tools)} ${SERVER_INSTRUCTIONS}`;
             for (const claim of ['this call saved nothing', 'nothing was sent', 'Retrying the same call after a lost answer is safe']) { expect<unknown>([claim, listed.includes(claim)]).toEqual([claim, false]); }
-            expect(SERVER_INSTRUCTIONS).toContain('the requested state was observed in the calendar, not proof of who saved it');
+            // The outcome meanings travel with each result (notes), not in the text every conversation loads.
+            expect(OUTCOME_NOTES.desired_state_present).toContain('does not show whether this call, an earlier attempt of it, or another client saved it');
+            expect(SERVER_INSTRUCTIONS).not.toContain('desired_state_present');
         });
 
         test(`${protocol}: iCloud's refusal text appears only in upstream.detail, never in the message or the logs`, async () => {

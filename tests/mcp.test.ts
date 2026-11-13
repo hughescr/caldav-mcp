@@ -11,10 +11,11 @@ import { FAKE_DISCOVERY, FakeCalDav } from './helpers/fake-caldav';
 import { FakeCalDavRead } from './helpers/fake-caldav-read';
 import { downloadOutputSchema, eventsOutputSchema, getEventOutputSchema, INVALID_INPUT_MESSAGE, readToolErrorCodeSchema, type DownloadOutput } from '../src/calendar/event-schemas';
 import { MAX_WIRE_BYTES } from '../src/calendar/limits';
+import { DOWNLOAD_LINK_NOTE, EXTERNAL_ATTACHMENT_NOTE } from '../src/calendar/notes';
 import type { DetailReadResult, EventsReadResult } from '../src/calendar/read';
 
 const range = { start: '2027-01-01T00:00:00Z', end: '2027-02-01T00:00:00Z' };
-const emptyRead: EventsReadResult = { calendars: [], range, events: [], unreadable: [], unreadableCount: 0 };
+const emptyRead: EventsReadResult = { calendars: [], range, events: [], unreadable: [], unreadableCount: 0, seriesWithoutOccurrences: [] };
 const row = { calendar: 0, resource_href: '/1/calendars/home/e.ics', recurrence_id: null, expected_version: '"v1"', recurring: false, start: { utc: '2027-01-11T10:00:00Z' }, end: null, duration: null, title: 'Title', location: null, description: null, attendees_count: 0 };
 const detailRead: DetailReadResult = {
     calendars: [{ calendar_id: '/1/calendars/home/', display_name: 'Home', status: 'ok' }],
@@ -151,33 +152,37 @@ test('the server is caldav-mcp and lists five read-only and three write calendar
     expect(download.inputSchema.required.toSorted()).toEqual(['attachment_ref', 'calendar_id', 'resource_href']);
     expect(Object.keys(download.inputSchema.properties).toSorted()).toEqual(['attachment_ref', 'calendar_id', 'expected_version', 'recurrence_id', 'resource_href']);
     expect(download.outputSchema.type).toBe('object');
-    for (const phrase of ['20 MiB', 'five minutes', 'bearer credential', 'about a day', 'does not fetch', 'never takes a URL']) { expect(download.description).toContain(phrase); }
+    // What the agent needs before calling. How to handle the link travels with it, in the result's notes.
+    for (const phrase of ['20 MiB', 'short-lived download_url', 'never takes a URL']) { expect(download.description).toContain(phrase); }
+    for (const phrase of ['bearer credential', 'about a day', 'fetched_by_server']) { expect(download.description).not.toContain(phrase); }
     expect(f.calls()).toBe(0);
 });
 
-test('a staged download returns its link in structured content and the JSON text copy only', async () => {
+test('a staged download returns its link in structured content and the JSON text copy only, with the note on handling it', async () => {
+    const withNote = { ...stagedDownload, notes: [DOWNLOAD_LINK_NOTE] };
     for (const protocol of ['2025-11-25', '2026-07-28']) {
         const f = fixture();
         const reply = await f.rpc('tools/call', { name: 'get_event_attachment_download', arguments: downloadArgs }, undefined, { 'mcp-protocol-version': protocol });
         const result = reply.result;
         expect(result.isError).toBeUndefined();
-        expect(downloadOutputSchema.parse(result.structuredContent)).toEqual(stagedDownload);
+        expect(downloadOutputSchema.parse(result.structuredContent)).toEqual(withNote);
         expect(result.structuredContent.result).toBeUndefined();
-        expect(JSON.parse(result.content[0].text)).toEqual(stagedDownload);
+        expect(JSON.parse(result.content[0].text)).toEqual(withNote);
         expect(result.content.map((item: { type: string }) => item.type)).toEqual(['text']);
         expect(f.calls()).toBe(1);
     }
     expect(JSON.stringify(warn.mock.calls)).not.toContain('presigned-canary');
 });
 
-test('an external attachment is returned as an unfetched link with a fixed notice', async () => {
+test('an external attachment is returned as an unfetched link with a fixed note', async () => {
     const f = fixture();
     f.service.get_event_attachment_download = async () => externalDownload;
     const result = (await f.rpc('tools/call', { name: 'get_event_attachment_download', arguments: downloadArgs })).result;
-    expect(result.structuredContent).toEqual(externalDownload);
-    expect(result.content.map((item: { type: string }) => item.type)).toEqual(['text', 'text']);
-    expect(JSON.parse(result.content[0].text)).toEqual(externalDownload);
-    expect(result.content[1].text).toContain('did not fetch');
+    const withNote = { ...externalDownload, notes: [EXTERNAL_ATTACHMENT_NOTE] };
+    expect(result.structuredContent).toEqual(withNote);
+    expect(result.content.map((item: { type: string }) => item.type)).toEqual(['text']);
+    expect(JSON.parse(result.content[0].text)).toEqual(withNote);
+    expect(EXTERNAL_ATTACHMENT_NOTE).toContain('did not fetch');
 });
 
 /** How many times `needle` occurs in `haystack`. */
@@ -268,22 +273,23 @@ for (const protocol of ['2025-11-25', '2026-07-28']) {
             const reply = JSON.parse(body);
             expect(reply.id).toBe(id);
             expect(reply.result.isError).toBeUndefined();
-            expect(reply.result.structuredContent).toEqual(worst);
-            expect(JSON.parse(reply.result.content[0].text)).toEqual(worst);
+            const sent = { ...worst, notes: [worst.form === 'external' ? EXTERNAL_ATTACHMENT_NOTE : DOWNLOAD_LINK_NOTE] };
+            expect(reply.result.structuredContent).toEqual(sent);
+            expect(JSON.parse(reply.result.content[0].text)).toEqual(sent);
             expect(Buffer.byteLength(body)).toBeLessThanOrEqual(MAX_WIRE_BYTES);
         }
     });
 }
 
-test('raw text descriptions advertise the 16 KiB prefix and truncation flag', async () => {
+test('raw text descriptions advertise the 16 KiB prefix; the output schema names the truncation flag', async () => {
     const f = fixture();
     const tool = (await f.rpc('tools/list')).result.tools.find((item: { name: string }) => item.name === 'get_event');
     for (const description of [tool.description, tool.outputSchema.properties.raw_ics.description]) {
         expect(description).toContain('16 KiB');
         expect(description).toContain('prefix');
-        expect(description).toContain('raw_truncated');
         expect(description).not.toContain('Entire original');
     }
+    expect(tool.outputSchema.properties.raw_ics.description).toContain('raw_truncated');
 });
 
 test('auth design lists every current tool error code, read and write', async () => {

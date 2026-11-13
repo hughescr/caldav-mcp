@@ -174,6 +174,20 @@ export interface ExpandedResource {
     vtimezoneCount: number;
 }
 
+/**
+ * An expanded-query answer that is a stored series master alone, in the stripped shape iCloud returns when the window holds
+ * only deleted occurrences (measured 2026-11-13; see ical.ts parseExpandedListing). Values as stored; nothing computed.
+ */
+export interface StrippedSeries {
+    master: EventComponent;
+    /** The RRULE value text, unfolded, exactly as stored. */
+    repeatRule: string;
+    /** The first EXDATE values in stored order (at most MAX_EXCLUDED_STARTS). */
+    excludedStarts: readonly StoredTime[];
+    /** Every EXDATE value of the master. */
+    excludedCount: number;
+}
+
 export interface OriginalResource {
     /** series: master (+ overrides); single: one non-recurring component; occurrence_only: iTIP detached overrides. */
     kind: 'series' | 'single' | 'occurrence_only';

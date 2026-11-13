@@ -11,14 +11,14 @@ import { downloadSupported } from './attachment-access';
 import { buildAttachmentIndex, prescanAttachProperties, toAttachmentMetadata, type AttachmentIndexEntry } from './attachments';
 import type { ReadBudget } from './budget';
 import type {
-    AttachmentMetadata, CalendarStatus, EventTimeOutput, FullEvent, GetEventArgs, ListEventsArgs, ReadToolErrorCode, SearchEventsArgs, SlimEvent, Unreadable,
+    AttachmentMetadata, CalendarStatus, EventTimeOutput, FullEvent, GetEventArgs, ListEventsArgs, ReadToolErrorCode, SearchEventsArgs, SeriesWithoutOccurrences, SlimEvent, Unreadable,
 } from './event-schemas';
-import { parseExpandedResource, parseOriginalResource } from './ical';
+import { parseExpandedListing, parseOriginalResource, type ExpandedListing } from './ical';
 import {
     CALENDAR_CONCURRENCY, DISPLAY_NAME_MAX, ETAG_MAX, ETAG_MIN, MAX_DISCOVERED_CALENDARS, MAX_MEMBERSHIP_BYTES, MAX_MULTIGET_HREFS, MAX_REPORT_BYTES, MAX_RESOURCES_PER_REPORT, MAX_UNREADABLE,
 } from './limits';
 import { BudgetError, IcalError, isCanonicalPath, isResourceHref, type EventComponent, type EventTime, type Interval, type OriginalResource } from './model';
-import { normalizeFullEvent, normalizeSlimEvent, sanitizeDisplayText } from './normalize';
+import { normalizeFullEvent, normalizeSeriesWithoutOccurrences, normalizeSlimEvent, sanitizeDisplayText } from './normalize';
 import { matchesQuery, normalizeQuery, type SearchField } from './search';
 import {
     compareCodePoints, compareEventOrder, eventSpan, nominalSpanSeconds, occurrenceServerForm, occurrenceTransportWindow, parseOccurrenceId, parseRange,
@@ -49,6 +49,8 @@ export interface EventsReadResult {
     /** Deterministic sorted prefix of at most 50. */
     unreadable: Unreadable[];
     unreadableCount: number;
+    /** Every series iCloud returned without an occurrence in the window, from ok calendars, sorted; shape.ts caps it. */
+    seriesWithoutOccurrences: SeriesWithoutOccurrences[];
 }
 
 export interface DetailReadResult {
@@ -60,8 +62,12 @@ export interface DetailReadResult {
     rawIcs: string | null;
 }
 
-/** Why a result_too_large happened, when the message should say so. Only `attachment_size` exists: the attachment itself is over the download cap. */
-export type ErrorDetail = 'attachment_size';
+/**
+ * Why an error happened, when the message should say so: `attachment_size` (result_too_large), the attachment itself is
+ * over the download cap; `occurrence_not_expanded` (not_found), iCloud's expansion for the occurrence's window returned
+ * the series alone, in the measured stripped shape (ical.ts parseExpandedListing), so the occurrence was probably deleted.
+ */
+export type ErrorDetail = 'attachment_size' | 'occurrence_not_expanded';
 
 /** A whole-tool read failure with one fixed code. It never carries upstream text, values or causes. */
 export class ReadError extends Error {
@@ -191,6 +197,7 @@ type Matcher = (component: EventComponent) => boolean;
 interface CalendarOutcome {
     events: { event: SlimEvent; calendarId: string }[];
     unreadable: Unreadable[];
+    seriesWithoutOccurrences: SeriesWithoutOccurrences[];
 }
 
 function unreadableReason(error: IcalError): Unreadable['reason'] {
@@ -216,7 +223,7 @@ async function processCalendar(context: CalendarContext, index: number, calendar
     validateReport(calendarId, resources);
     const { budget } = context;
     const work = budget.newCalendarWork();
-    const outcome: CalendarOutcome = { events: [], unreadable: [] };
+    const outcome: CalendarOutcome = { events: [], unreadable: [], seriesWithoutOccurrences: [] };
     let unsupported = 0;
     let recurringReadable = 0;
     for (const resource of resources) {
@@ -226,9 +233,9 @@ async function processCalendar(context: CalendarContext, index: number, calendar
             await budget.afterComponent();
             continue;
         }
-        let components: readonly EventComponent[];
+        let listing: ExpandedListing;
         try {
-            components = parseExpandedResource(resource.calendarData, { work: budget.newResourceWork() }).components;
+            listing = parseExpandedListing(resource.calendarData, { work: budget.newResourceWork() });
         } catch (error) {
             // A per-resource line/property cap is that resource's problem; spent shared capacity is the calendar's.
             const resourceCap = error instanceof BudgetError && error.kind === 'work' && !budget.exhausted();
@@ -239,6 +246,20 @@ async function processCalendar(context: CalendarContext, index: number, calendar
             await budget.afterComponent();
             continue;
         }
+        if (listing.kind === 'series_without_occurrences') {
+            // iCloud's answer for a window holding only deleted occurrences: reported as data, never range-filtered (the server
+            // cannot compute occurrences). It counts neither as unsupported nor as recurring readable, so it neither fails the
+            // calendar nor vouches for the expansion of the others: an unexpanded master beside it still fails the calendar.
+            work.chargeComponents(1);
+            await budget.afterComponent();
+            if (context.cancelled()) { throw new CalDavError('unauthorized'); }
+            budget.throwIfExpired();
+            if (context.matcher === null || context.matcher(listing.series.master)) {
+                outcome.seriesWithoutOccurrences.push(normalizeSeriesWithoutOccurrences(listing.series, { calendar: index, resourceHref: resource.href }));
+            }
+            continue;
+        }
+        const components = listing.resource.components;
         work.chargeComponents(components.length);
         if (components.some(component => component.recurrenceId !== null)) { recurringReadable++; }
         for (const component of components) {
@@ -356,12 +377,17 @@ async function readEvents(deps: ReadDeps, input: ListEventsArgs, matcher: Matche
         distinct.set(item.resource_href === null ? `unaddressable:${unaddressable++}` : JSON.stringify([item.calendar, item.resource_href, item.recurrence_id, item.reason]), item);
     }
     const unreadable = [...distinct.values()].sort(compareUnreadable(calendars));
+    // Each href appears at most once per report (validateReport) and each calendar once, so there is nothing to deduplicate.
+    const series = [...outcomes.values()].flatMap(outcome => outcome.seriesWithoutOccurrences).sort((a, b) => (
+        compareCodePoints(calendars[a.calendar]?.calendar_id ?? '', calendars[b.calendar]?.calendar_id ?? '') || a.calendar - b.calendar || compareCodePoints(a.resource_href, b.resource_href)
+    ));
     return {
         calendars,
         range: { start: input.range.start, end: input.range.end },
         events: rows.map(row => row.event),
         unreadable: unreadable.slice(0, MAX_UNREADABLE),
         unreadableCount: unreadable.length,
+        seriesWithoutOccurrences: series,
     };
 }
 
@@ -521,7 +547,9 @@ export type ExpandedLookup = { kind: 'absent' } | { kind: 'found'; components: r
 /**
  * One expanded REPORT over `window`, reduced to the one resource at `href`. The instances must come from the same stored
  * version that was read (`etag`) and carry its UID (`uid`), else ReadError('calendar_changed'): an expansion of another
- * version is never used. Charges the invocation's work caps. Throws ReadError.
+ * version is never used. iCloud's answer for a window that holds only deleted occurrences, the series alone in the measured
+ * stripped shape, is not_found (`occurrence_not_expanded`), never unsupported data. Charges the invocation's work caps.
+ * Throws ReadError.
  */
 export async function expandStoredResource(
     deps: ReadDeps, reporter: UnauthorizedReporter, query: { calendarId: string; href: string; etag: string; uid: string; window: { startUtc: string; endUtc: string } },
@@ -533,14 +561,16 @@ export async function expandStoredResource(
     const target = resources.filter(isAddressedResource).find(resource => resource.href === query.href);
     if (target === undefined) { return { kind: 'absent' }; }
     if (target.etag !== query.etag) { throw new ReadError('calendar_changed'); }
-    let components: readonly EventComponent[];
+    let listing: ExpandedListing;
     try {
-        components = parseExpandedResource(target.calendarData, { work: budget.newResourceWork() }).components;
-        budget.newCalendarWork().chargeComponents(components.length);
+        listing = parseExpandedListing(target.calendarData, { work: budget.newResourceWork() });
+        budget.newCalendarWork().chargeComponents(listing.kind === 'instances' ? listing.resource.components.length : 1);
     } catch (error) {
         throw detailDataError(error);
     }
+    const components = listing.kind === 'instances' ? listing.resource.components : [listing.series.master];
     if (components.some(component => component.uid !== query.uid)) { throw new ReadError('calendar_changed'); }
+    if (listing.kind === 'series_without_occurrences') { throw new ReadError('not_found', 'occurrence_not_expanded'); }
     return { kind: 'found', components };
 }
 

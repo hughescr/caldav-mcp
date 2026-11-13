@@ -6,9 +6,10 @@
 import ICAL from 'ical.js';
 import { describeComponentAttachments, parseContentLine, prescanAttachProperties, unfoldLines, type AttachPrescan } from './attachments';
 import { createReadBudget, type ResourceWork } from './budget';
-import { MAX_EXPANDED_VEVENTS_PER_CALENDAR, MAX_ICS_NESTING, MAX_ORIGINAL_VEVENTS, MAX_PARAMETERS_PER_PROPERTY, MAX_RESOURCE_BYTES } from './limits';
+import { MAX_EXCLUDED_STARTS, MAX_EXPANDED_VEVENTS_PER_CALENDAR, MAX_ICS_NESTING, MAX_ORIGINAL_VEVENTS, MAX_PARAMETERS_PER_PROPERTY, MAX_RESOURCE_BYTES, REPEAT_RULE_MAX } from './limits';
 import {
     IcalError, type AttachmentDescriptor, type EventComponent, type ExpandedResource, type JCalValue, type OriginalResource, type RawProperty, type RecurrenceIdInfo, type StoredTime,
+    type StrippedSeries,
 } from './model';
 import { eventSpan, occurrenceIdFromRecurrenceId, storedTimeFromJcal } from './time-core';
 
@@ -75,7 +76,12 @@ function readShape(raw: unknown): ComponentShape {
 // ---- Resource-level reading ----
 
 interface ParsedEvent { properties: RawProperty[]; alarmCount: number }
-interface ParsedResource { events: ParsedEvent[]; vtimezoneCount: number }
+interface ParsedResource {
+    events: ParsedEvent[];
+    vtimezoneCount: number;
+    /** Lower-case names of the VCALENDAR's own properties. */
+    calendarProperties: ReadonlySet<string>;
+}
 
 function countLines(text: string): number {
     let lines = 1;
@@ -88,18 +94,27 @@ function countLines(text: string): number {
 
 const TIME_PROPERTIES = new Set(['dtstart', 'dtend', 'recurrence-id', 'due', 'dtstamp', 'created', 'completed', 'last-modified']);
 
+type ContentLine = NonNullable<ReturnType<typeof parseContentLine>>;
+
+/**
+ * One DATE or DATE-TIME value as spelled in the source (`type` is the upper-case VALUE parameter), as its jCal type and
+ * text; null for any other type or for any spelling but exactly `YYYYMMDD` (DATE) or `YYYYMMDDTHHMMSS` with an optional
+ * trailing `Z` (DATE-TIME). Read before ical.js can repair a value by slicing fixed positions.
+ */
+function timeLiteral(type: string, value: string): { type: 'date' | 'date-time'; jcal: string } | null {
+    const date = type === 'DATE';
+    if ((!date && type !== 'DATE-TIME') || !(date ? /^\d{8}$/u : /^\d{8}T\d{6}Z?$/u).test(value)) { return null; }
+    const civil = `${value.slice(0, 4)}-${value.slice(4, 6)}-${value.slice(6, 8)}`;
+    return date ? { type: 'date', jcal: civil } : { type: 'date-time', jcal: `${civil}T${value.slice(9, 11)}:${value.slice(11, 13)}:${value.slice(13, 15)}${value.endsWith('Z') ? 'Z' : ''}` };
+}
+
 /** Validate source spelling before ical.js can repair it by slicing fixed positions. */
-function validateTimeLiteral(line: NonNullable<ReturnType<typeof parseContentLine>>): void {
+function validateTimeLiteral(line: ContentLine): void {
     if (!TIME_PROPERTIES.has(line.name) && !(line.name === 'trigger' && line.parameters.get('value')?.[0]?.toUpperCase() === 'DATE-TIME')) { return; }
     const types = line.parameters.get('value');
     if (types !== undefined && types.length !== 1) { throw new IcalError(MALFORMED); }
-    const type = (types?.[0] ?? 'DATE-TIME').toUpperCase();
-    const value = line.value;
-    const date = type === 'DATE';
-    if (!(date ? /^\d{8}$/u : /^\d{8}T\d{6}Z?$/u).test(value) || (!date && type !== 'DATE-TIME')) { throw new IcalError(MALFORMED); }
-    const civil = `${value.slice(0, 4)}-${value.slice(4, 6)}-${value.slice(6, 8)}`;
-    const jcal = date ? civil : `${civil}T${value.slice(9, 11)}:${value.slice(11, 13)}:${value.slice(13, 15)}${value.endsWith('Z') ? 'Z' : ''}`;
-    if (storedTimeFromJcal(date ? 'date' : 'date-time', jcal, undefined) === null) { throw new IcalError(MALFORMED); }
+    const literal = timeLiteral((types?.[0] ?? 'DATE-TIME').toUpperCase(), line.value);
+    if (literal === null || storedTimeFromJcal(literal.type, literal.jcal, undefined) === null) { throw new IcalError(MALFORMED); }
 }
 
 /** Bounded linear lexical pass, including ignored components and duplicate parameter names. */
@@ -151,7 +166,8 @@ function readResource(calendarData: string, work: ResourceWork, versionRequired:
     preflight(calendarData, work);
     const root = readShape(parseJcal(calendarData));
     if (root.name !== 'vcalendar') { throw new IcalError(MALFORMED); }
-    const versions = root.properties.map(readProperty).filter(property => property.name === 'version');
+    const calendarProperties = root.properties.map(readProperty);
+    const versions = calendarProperties.filter(property => property.name === 'version');
     const version = versions[0];
     if (versions.length > 1 || (versions.length === 0 && versionRequired)) { throw new IcalError(MALFORMED); }
     if (version !== undefined && (version.values.length !== 1 || version.values[0] !== '2.0')) { throw new IcalError(MALFORMED); }
@@ -176,7 +192,7 @@ function readResource(calendarData: string, work: ResourceWork, versionRequired:
         }
         events.push({ properties: shape.properties.map(readProperty), alarmCount });
     }
-    return { events, vtimezoneCount };
+    return { events, vtimezoneCount, calendarProperties: new Set(calendarProperties.map(property => property.name)) };
 }
 
 // ---- One VEVENT ----
@@ -268,7 +284,122 @@ function ridKey(info: RecurrenceIdInfo): string {
  * resources need no master. Throws IcalError for a malformed or unsupported resource; ignores VTIMEZONE structurally.
  */
 export function parseExpandedResource(calendarData: string, options: ParseOptions): ExpandedResource {
+    return expandedFrom(readResource(calendarData, options.work ?? createReadBudget().newResourceWork(), false));
+}
+
+/** What one list/search expanded resource holds: instances, or a series iCloud returned without any occurrence. */
+export type ExpandedListing = { kind: 'instances'; resource: ExpandedResource } | { kind: 'series_without_occurrences'; series: StrippedSeries };
+
+/**
+ * Parses one expanded REPORT resource like parseExpandedResource, except that the measured stripped shape is recognised
+ * instead of refused. iCloud answers a window that holds only deleted (EXDATE) occurrences of a series
+ * with the stored master alone (measured read-only, 2026-11-13): a VCALENDAR without VERSION, PRODID, CALSCALE or any
+ * VTIMEZONE, holding exactly one VEVENT with RRULE and without RECURRENCE-ID. Exactly that, with one RRULE line without
+ * parameters, of printable ASCII within REPEAT_RULE_MAX, one DTSTART line with no parameter but a single VALUE and TZID, and
+ * EXDATE lines whose raw text is exact (strippedSeries), is recognised; anything else is parsed (and refused) exactly as
+ * parseExpandedResource does. list/search report the shape as a series without occurrences; the one-occurrence expansion
+ * of get_event and the write path (read.ts expandStoredResource) answers it as not_found (the occurrence was deleted).
+ */
+export function parseExpandedListing(calendarData: string, options: ParseOptions): ExpandedListing {
     const parsed = readResource(calendarData, options.work ?? createReadBudget().newResourceWork(), false);
+    const series = strippedSeries(calendarData, parsed);
+    return series === null ? { kind: 'instances', resource: expandedFrom(parsed) } : { kind: 'series_without_occurrences', series };
+}
+
+const STRIPPED_ABSENT_PROPERTIES = ['version', 'prodid', 'calscale'] as const;
+const STRIPPED_RAW_PROPERTIES: ReadonlySet<string> = new Set(['dtstart', 'rrule', 'exdate']);
+const REPEAT_RULE_RE = new RegExp(`^[\\x21-\\x7E]{1,${REPEAT_RULE_MAX}}$`, 'u');
+
+/** The raw lines of the named properties directly inside top-level VEVENTs, unfolded and parsed, in stored order: one pass. */
+function rawEventLines(calendarData: string, names: ReadonlySet<string>): ContentLine[] {
+    const lines: ContentLine[] = [];
+    let depth = 0;
+    let inEvent = false;
+    for (const text of unfoldLines(calendarData)) {
+        if (text === '') { continue; }
+        // preflight already parsed every line of this text, so none is null here.
+        const line = parseContentLine(text);
+        if (line === null) { throw new IcalError(MALFORMED); }
+        if (line.name === 'begin') {
+            depth++;
+            if (depth === 2) { inEvent = line.value.toLowerCase() === 'vevent'; }
+        } else if (line.name === 'end') {
+            if (depth === 2) { inEvent = false; }
+            depth--;
+        } else if (depth === 2 && inEvent && names.has(line.name)) {
+            lines.push(line);
+        }
+    }
+    return lines;
+}
+
+/**
+ * True when a raw time line has no parameter but VALUE and TZID, each at most once with a single value. The raw line is
+ * the judge: ical.js keeps only the last of a repeated parameter, so `TZID=A;TZID=B` reaches the jCal as B alone.
+ */
+function plainTimeParameters(line: ContentLine): boolean {
+    for (const [name, values] of line.parameters) {
+        if ((name !== 'value' && name !== 'tzid') || values.length !== 1) { return false; }
+    }
+    return true;
+}
+
+/**
+ * Every value of one raw EXDATE line as a stored time, read from its own spelling (never ical.js's repair of it): VALUE
+ * DATE or DATE-TIME (default DATE-TIME) and an optional TZID, each once, and every comma-separated value exactly of that
+ * form (timeLiteral). Null when anything differs.
+ */
+function rawExcludedStarts(line: ContentLine): StoredTime[] | null {
+    if (!plainTimeParameters(line)) { return null; }
+    const type = (line.parameters.get('value')?.[0] ?? 'DATE-TIME').toUpperCase();
+    const tzid = line.parameters.get('tzid')?.[0];
+    const times: StoredTime[] = [];
+    for (const value of line.value.split(',')) {
+        const literal = timeLiteral(type, value);
+        const time = literal === null ? null : storedTimeFromJcal(literal.type, literal.jcal, tzid);
+        if (time === null) { return null; }
+        times.push(time);
+    }
+    return times;
+}
+
+/**
+ * The measured stripped shape (see parseExpandedListing), or null for anything else. Cheap for every other resource. The
+ * master's DTSTART, RRULE and EXDATE lines are judged by their raw text, strictly, with no repair and no guess; the
+ * preflight has already checked DTSTART's literal and its single VALUE, but not its other parameters.
+ */
+function strippedSeries(calendarData: string, parsed: ParsedResource): StrippedSeries | null {
+    const [event, ...more] = parsed.events;
+    if (event === undefined || more.length > 0 || parsed.vtimezoneCount !== 0 || STRIPPED_ABSENT_PROPERTIES.some(name => parsed.calendarProperties.has(name))) { return null; }
+    if (event.properties.filter(property => property.name === 'rrule').length !== 1 || event.properties.some(property => property.name === 'recurrence-id')) { return null; }
+    // Validated as an original master is (UID, DTSTART, span); a structural fault throws as it would for parseExpandedResource.
+    const master = buildEvent(event, null, false);
+    const raw = rawEventLines(calendarData, STRIPPED_RAW_PROPERTIES);
+    const starts = raw.filter(line => line.name === 'dtstart');
+    const rules = raw.filter(line => line.name === 'rrule');
+    const [start] = starts;
+    const [rule] = rules;
+    if (starts.length !== 1 || start === undefined || !plainTimeParameters(start)) { return null; }
+    if (rules.length !== 1 || rule === undefined || rule.parameters.size !== 0 || !REPEAT_RULE_RE.test(rule.value)) { return null; }
+    const excludedStarts: StoredTime[] = [];
+    let excludedCount = 0;
+    for (const line of raw) {
+        if (line.name !== 'exdate') { continue; }
+        const times = rawExcludedStarts(line);
+        if (times === null) { return null; }
+        for (const time of times) {
+            if (excludedStarts.length < MAX_EXCLUDED_STARTS) { excludedStarts.push(time); }
+            excludedCount++;
+        }
+    }
+    // The jCal must hold as many EXDATE values as the raw text: a different split means the two readings disagree.
+    let parsedCount = 0;
+    for (const property of master.properties.get('exdate') ?? []) { parsedCount += property.values.length; }
+    if (parsedCount !== excludedCount) { return null; }
+    return { master, repeatRule: rule.value, excludedStarts, excludedCount };
+}
+
+function expandedFrom(parsed: ParsedResource): ExpandedResource {
     if (parsed.events.length === 0) { throw new IcalError(MALFORMED); }
     if (parsed.events.length > MAX_EXPANDED_VEVENTS_PER_CALENDAR) { throw new IcalError('resource_too_large'); }
     const components = parsed.events.map(event => buildEvent(event, null, true));

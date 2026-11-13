@@ -8,10 +8,35 @@ import { FAKE_DISCOVERY, FakeICloud } from './helpers/fake-caldav-write';
 
 /**
  * The context budget of the tool list. Every client loads the whole `tools/list` result into each conversation that has
- * this connector, so its size is a cost paid on every turn. The limits sit a little above the sizes they were set at;
- * raise one only for a rule an agent needs before calling a tool, and say which in the commit.
+ * this connector, so its size is a cost paid on every turn. The limits sit a little above the sizes they were set at
+ * (tools/list 46,438 and 46,582 bytes in the two eras, descriptions 3,519 characters, instructions 2,100 characters, and
+ * 14,778 bytes of model-visible text: every description plus every input schema plus the instructions); raise one only
+ * for a rule an agent needs before calling a tool, and say which in the commit. An error, a result field or a rare case is
+ * explained where it occurs (the error message, or the result's notes), never here.
  */
-const LIMITS = { description: 1200, descriptions: 5000, toolsList: 55_000, instructions: 2700 } as const;
+const LIMITS = { description: 1200, descriptions: 3670, toolsList: 46_900, instructions: 2250, modelVisible: 14_930 } as const;
+
+/**
+ * Phrases that explain an error, a result field or a rare case. They belong in the response that holds the situation
+ * (the error message, or a note from src/calendar/notes.ts), not in the text every conversation loads.
+ */
+const RESPONSE_ONLY_PHRASES = [
+    'split_incomplete', 'stored_differs_from_request', 'desired_state_present', 'outcome_unknown', 'write_outcome', 'unrecognized_timezone', 'utc_uncertain_dst_transition',
+    'no_timezone_on_event', 'timezone_dropped_from_date', 'timezone_warning', 'fetched_by_server', 'exceptions_dropped', 'series_without_occurrences', 'calendar_changed', 'attendees_present',
+    'exceptions_shift', 'FREQ up to WEEKLY', '"drop"', '"shift"', 'two saves', 'not at the first occurrence', 'resume_hint', 'not a cursor', 'bearer credential', 'about a day',
+    'outside the range', 'raw_truncated', 'created_series', 'readback', 'removed_apple_location_pin', 'ignored', 'accepted so',
+];
+
+/** Every `description` text in a JSON Schema (its keys are not descriptions, so a property named description is skipped). */
+function descriptions(schema: unknown, found: string[] = []): string[] {
+    if (Array.isArray(schema)) { for (const item of schema) { descriptions(item, found); } }
+    else if (typeof schema === 'object' && schema !== null) {
+        for (const [key, value] of Object.entries(schema)) {
+            if (key === 'description' && typeof value === 'string') { found.push(value); } else { descriptions(value, found); }
+        }
+    }
+    return found;
+}
 
 const WORK = '/10000000001/calendars/work/';
 const NOW_MS = Date.UTC(2026, 10, 13, 9, 0, 0);
@@ -57,6 +82,11 @@ async function listTools(protocol: string = ERAS[0]) {
     return { tools, bytes: Buffer.byteLength(JSON.stringify(reply.result), 'utf8'), byName: new Map(tools.map(tool => [tool.name, tool])) };
 }
 
+/** What the model reads on every turn: each tool's description and input schema, and the server instructions (output schemas are not shown to it). */
+function modelVisibleBytes(tools: readonly ListedTool[]): number {
+    return tools.reduce((sum, tool) => sum + Buffer.byteLength(tool.description, 'utf8') + Buffer.byteLength(JSON.stringify(tool.inputSchema), 'utf8'), Buffer.byteLength(SERVER_INSTRUCTIONS, 'utf8'));
+}
+
 /** Every `$ref` in a schema, with the `$defs` it can point at. */
 function refs(schema: unknown, found: string[] = []): string[] {
     if (Array.isArray(schema)) { for (const item of schema) { refs(item, found); } }
@@ -75,6 +105,7 @@ describe('the tool list stays within its context budget', () => {
             for (const tool of tools) { expect<unknown>([protocol, tool.name, tool.description.length <= LIMITS.description]).toEqual([protocol, tool.name, true]); }
             expect(tools.reduce((sum, tool) => sum + tool.description.length, 0)).toBeLessThanOrEqual(LIMITS.descriptions);
             expect(bytes).toBeLessThanOrEqual(LIMITS.toolsList);
+            expect(modelVisibleBytes(tools)).toBeLessThanOrEqual(LIMITS.modelVisible);
         }
         expect(SERVER_INSTRUCTIONS.length).toBeLessThanOrEqual(LIMITS.instructions);
     });
@@ -97,16 +128,38 @@ describe('the rules an agent needs are stated, wherever a client shows them', ()
             'back exactly as received', 'recurrence_id (an occurrence token)', 'never decode or re-encode its escapes',
             // The time model.
             'RFC 3339 text with an offset or Z', 'exact UTC instant', '{local, zone}', 'stored as given', 'exclusive end', 'A time without an offset, Z or zone is refused',
-            'local time shifts at daylight-saving changes', 'recognised IANA name', 'the instant is unknown', 'unrecognized_timezone', 'utc_uncertain_dst_transition', 'no_timezone_on_event', 'timezone_dropped_from_date',
+            'local time shifts at daylight-saving changes', 'recognised IANA name', 'the instant is unknown',
             // Writes.
-            'still exactly expected_version', 'calendar_changed and nothing is saved', 'get the event again and decide', 'a new random UUID per new event or split', 'the same value only to retry',
-            'applied: this call\'s save was accepted', 'the requested state was observed in the calendar', 'outcome_unknown: the change may or may not be saved', 'get the event again before anything else', 'No call overwrites a newer version',
+            'still exactly expected_version', 'from your latest read', 'a new random UUID per new event or split', 'the same value only to retry', 'No call overwrites a newer version',
             // Guests.
-            'emails them at once', 'cannot be suppressed', 'Ask the user before changing or deleting', 'calendar:invite', 'attendees_present', 'No tool adds, removes or changes guests',
-            // Permissions.
-            'calendar:read', 'calendar:write', 'calendar:delete',
+            'emails them at once', 'cannot be suppressed', 'Ask the user before changing or deleting', 'calendar:invite', 'No tool adds, removes or changes guests',
+            // Permissions, and where the rest is explained.
+            'calendar:read', 'calendar:write', 'calendar:delete', 'Error messages and the notes in results say what happened and what to do next',
         ];
         for (const rule of rules) { expect<unknown>([rule, SERVER_INSTRUCTIONS.includes(rule)]).toEqual([rule, true]); }
+    });
+
+    test('no description or instruction explains an error, a result field or a rare case', async () => {
+        const { tools } = await listTools();
+        for (const [where, text] of [['instructions', SERVER_INSTRUCTIONS], ...tools.map(tool => [tool.name, tool.description])] as const) {
+            for (const phrase of RESPONSE_ONLY_PHRASES) { expect<unknown>([where, phrase, text.includes(phrase)]).toEqual([where, phrase, false]); }
+        }
+        // The input schemas' field descriptions are model-visible too (their property names are not text and are not scanned).
+        for (const tool of tools) {
+            for (const text of descriptions(tool.inputSchema)) {
+                for (const phrase of RESPONSE_ONLY_PHRASES) { expect<unknown>([tool.name, text, phrase, text.includes(phrase)]).toEqual([tool.name, text, phrase, false]); }
+            }
+        }
+    });
+
+    test('a time form says its shape once per tool; the operation_id pattern is not repeated in its description', async () => {
+        const { tools } = await listTools();
+        for (const tool of tools) {
+            const texts = descriptions(tool.inputSchema);
+            expect<unknown>([tool.name, texts.filter(text => text.startsWith('RFC 3339') || text.includes(': RFC 3339')).length <= 1]).toEqual([tool.name, true]);
+            expect<unknown>([tool.name, texts.some(text => text.includes('A-Z a-z') || text.includes('8-128'))]).toEqual([tool.name, false]);
+        }
+        for (const name of ['create_event', 'update_event']) { expect<unknown>([name, JSON.stringify(tools.find(tool => tool.name === name)?.inputSchema).includes('^[A-Za-z0-9._:-]{8,128}$')]).toEqual([name, true]); }
     });
 
     test('every tool keeps its untrusted-data clause, and every write tool its guest warning, without the instructions', async () => {
@@ -124,18 +177,43 @@ describe('the rules an agent needs are stated, wherever a client shows them', ()
     test('each tool states the behaviour an agent must know before calling it', async () => {
         const { byName } = await listTools();
         const rules: Record<string, string[]> = {
-            list_calendars: ['at most 200', 'truncated', 'calendar_id'],
-            list_events: ['half-open', 'separate occurrences', 'status CANCELLED', 'up to 24 hours outside the range', 'not by instant', 'max 100', 'resume_hint, not a cursor'],
+            list_calendars: ['at most 200', 'calendar_id'],
+            list_events: ['half-open', 'separate occurrences', 'status CANCELLED', 'not by instant', 'max 100'],
             search_events: ['literal, case-insensitive', 'not a regex', 'as in list_events'],
-            get_event: ['recurrence_id for one occurrence', 'calendar_changed', '16 KiB', 'prefix', 'raw_truncated', 'malicious instructions', 'whole event, not only the occurrence', 'travel_time'],
-            get_event_attachment_download: ['never takes a URL', '20 MiB', 'five minutes', 'about a day', 'bearer credential', 'does not fetch', 'untrusted'],
-            create_event: ['operation_id', 'never a duplicate', 'refused', 'For a repeating event give {local, zone}', 'X-APPLE-TRAVEL-DURATION', 'stored_differs_from_request'],
-            update_event: ['expected_version', 'start and end only together', '"all"', '"this" with recurrence_id', 'returned recurrence_id', '"this_and_future" with recurrence_id and operation_id', 'created_series', 'not at the first occurrence', 'exceptions', '"drop"', '"shift"', 'FREQ up to WEEKLY', 'two saves', 'split_incomplete', 'invites them to the new series'],
-            delete_event: ['expected_version', 'omit edit_scope', '"this" with recurrence_id', '"this_and_future" with recurrence_id', 'not at the first occurrence', 'new expected_version'],
+            get_event: ['recurrence_id for one occurrence', '16 KiB', 'prefix', 'malicious instructions', 'whole event, not only the occurrence', 'travel_time'],
+            get_event_attachment_download: ['never takes a URL', '20 MiB', 'short-lived download_url', 'untrusted'],
+            create_event: ['operation_id', 'idempotency key', 'never makes a duplicate', 'For a repeating event give {local, zone}', 'X-APPLE-TRAVEL-DURATION'],
+            update_event: ['expected_version', 'start and end only together', '"all"', '"this" with recurrence_id', 'returned recurrence_id', '"this_and_future" with recurrence_id and operation_id', 'invites them to the new series'],
+            delete_event: ['expected_version', 'omit edit_scope', '"this" with recurrence_id', '"this_and_future" with recurrence_id', 'new expected_version'],
         };
         for (const [name, phrases] of Object.entries(rules)) {
             const description = byName.get(name)?.description ?? '';
             for (const phrase of phrases) { expect<unknown>([name, phrase, description.includes(phrase)]).toEqual([name, phrase, true]); }
+        }
+        // The few words an agent needs to know an input exists, in that input's schema description.
+        const inputDescription = (tool: string, field: string): unknown => (byName.get(tool)?.inputSchema['properties'] as Record<string, { description?: string }> | undefined)?.[field]?.description;
+        expect(inputDescription('update_event', 'exceptions')).toBe('Only when a refusal asks for it');
+        for (const tool of ['get_event', 'get_event_attachment_download']) { expect<unknown>([tool, inputDescription(tool, 'expected_version')]).toEqual([tool, 'Optional: fail if the event changed']); }
+        expect(String(inputDescription('create_event', 'operation_id'))).toContain('a new random UUID per new event; the same value only to retry');
+    });
+
+    test('the listed output schemas show rare-case fields only as objects; notes as a plain string array', async () => {
+        const { byName } = await listTools();
+        const property = (tool: string, field: string): Record<string, unknown> => ((byName.get(tool)?.outputSchema['properties'] ?? {}) as Record<string, Record<string, unknown>>)[field] ?? {};
+        const looseItems = { type: 'array', items: { type: 'object', properties: {}, additionalProperties: {} } };
+        for (const tool of ['list_events', 'search_events']) {
+            expect<unknown>([tool, property(tool, 'unreadable')]).toEqual([tool, looseItems]);
+            expect<unknown>([tool, property(tool, 'series_without_occurrences')]).toEqual([tool, { ...looseItems, description: 'Series iCloud returned without occurrences; see each note' }]);
+            expect<unknown>([tool, property(tool, 'series_without_occurrences_truncated')]).toEqual([tool, { type: 'boolean' }]);
+        }
+        for (const tool of ['create_event', 'update_event']) {
+            for (const field of ['exceptions_dropped', 'exceptions_shifted']) { expect<unknown>([tool, field, property(tool, field)]).toEqual([tool, field, { type: 'object', properties: {}, additionalProperties: {} }]); }
+            expect<unknown>([tool, property(tool, 'request_warnings')]).toEqual([tool, looseItems]);
+        }
+        for (const tool of ['create_event', 'update_event', 'delete_event']) { expect<unknown>([tool, property(tool, 'guest_notice')]).toEqual([tool, { type: 'string' }]); }
+        for (const tool of ['list_events', 'search_events', 'get_event', 'get_event_attachment_download', 'create_event', 'update_event', 'delete_event']) {
+            const notes = property(tool, 'notes');
+            expect<unknown>([tool, notes['type'], notes['items'], String(notes['description']).length <= 60]).toEqual([tool, 'array', { type: 'string' }, true]);
         }
     });
 });

@@ -96,7 +96,7 @@ export function bindCalendarService(binding: CalendarBinding): BoundCalendarServ
         try {
             return await call(credentials, unauthorized);
         } catch (error) {
-            if (read && error instanceof WriteError) { throw new CalendarError(error.code, undefined, error.extra); }
+            if (read && error instanceof WriteError) { throw new CalendarError(error.code, error.detail, error.extra); }
             if (read && (error instanceof ReadError || error instanceof CalendarError)) { throw new CalendarError(error.code, error.detail); }
             if (read && error instanceof BudgetError) { throw new CalendarError(error.kind === 'deadline' ? 'temporarily_unavailable' : 'result_too_large'); }
             if (!(error instanceof CalDavError)) { throw new CalendarError('temporarily_unavailable'); }
