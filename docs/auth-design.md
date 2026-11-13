@@ -84,8 +84,6 @@ Form pages use `Referrer-Policy: same-origin` (so Chromium sends a trustworthy `
 
 ## Scopes and consent
 
-On develop, not released. Release 0.3.0 lists the requested scopes as fixed rows and requires an `allow_invite=yes` acknowledgment when `calendar:invite` is requested; that field no longer exists.
-
 The owner's decision: "We want the user to be in full control of what they are allowing their agent to do." So the user picks the permissions on the login page.
 
 Scopes are defined once in `src/auth/scopes.ts` (`SCOPES`, in page order, with their labels), re-exported by `src/auth/http.ts`, and advertised as `scopes_supported` in both metadata documents:
@@ -99,7 +97,7 @@ Scopes are defined once in `src/auth/scopes.ts` (`SCOPES`, in page order, with t
 
 Only requested scopes get a row, in the order above. With at least one checkbox the rows sit in a `<fieldset>` with the legend "Choose permissions"; each checkbox is a whole-row `<label>` at least 48 px high. A read-only request has nothing to choose and keeps the plain "Requested permissions" list.
 
-The default tick state is the orchestrator's ruling, not the owner's, and differs from the write-tools design (which had every box unticked): the user came to connect an agent to their calendar and can untick write or delete, while anything that makes iCloud send mail needs a deliberate tick.
+The default tick state (write and delete ticked, invite not) is this implementation's choice, not the owner's: the user came to connect an agent to their calendar and can untick write or delete, while anything that makes iCloud send mail needs a deliberate tick.
 
 The POST carries one `grant` field per ticked box. `grant` is the only field that may repeat. The granted set is computed after the CSRF and request-binding check, so it can only draw on the `scope` value bound into the flow:
 
@@ -112,7 +110,7 @@ The POST carries one `grant` field per ticked box. `grant` is the only field tha
 
 Each tool lists its required scopes, and all of them must be granted (`requiredScope` in `src/mcp.ts`, a non-empty list per tool). `insufficient_scope` names the missing scopes and tells the agent that the user must reconnect and tick the named checkbox, quoting its label; for `calendar:read` it says the page includes it whenever the client requests it.
 
-Meaning change: before this change, `calendar:write` was labelled "Create, change and delete events". Now deleting needs `calendar:delete`. No tool uses `calendar:write` or `calendar:delete` yet, so behaviour does not change for existing grants. Existing connections and grants are left as they are: nothing migrates, widens or narrows them, and a grant that holds `calendar:write` does not gain `calendar:delete`. A connection that wants delete must reconnect.
+`calendar:write` covers creating and changing events; deleting needs `calendar:delete`. Existing connections and grants are left as they are: nothing migrates, widens or narrows them, and a grant that holds `calendar:write` does not gain `calendar:delete`. A connection that wants the write tools or delete must reconnect and tick the boxes.
 
 ### One consent per client
 
@@ -174,7 +172,7 @@ Every replacement of the stored credential increments the connection's credentia
 
 `/mcp` verifies the access token (reading the grant, the connection and the client's consent record, and checking the credential generation and the consent), checks the allowlist, and builds a request-local calendar service from the connection record that verification returned. It makes no separate validation request: the tool call itself reaches iCloud. The credential is decrypted lazily, inside the bound service, only when a tool on an active connection needs iCloud; `initialize` and `tools/list` never decrypt, and an inactive or expired connection is never decrypted. A credential that cannot be opened or re-validated (`UnreadableCredentials`) is handled like a definitive 401: the tool returns `reconnect_required`, the connection is conditionally marked `reconnect_required`, and a new login replaces it.
 
-The read tools (`list_calendars`, `list_events`, `search_events`, `get_event`, `get_event_attachment_download`) require `calendar:read`. The write tools (on develop, not released) require `calendar:read` plus `calendar:write` (`create_event`, `update_event`) or `calendar:delete` (`delete_event`); changing or deleting an event with attendees or an organizer also requires `calendar:invite`, checked after the event is read (`attendees_present`). Errors are structured `{ error: { code, message, request_id } }` with codes `reconnect_required`, `temporarily_unavailable`, `insufficient_scope`, `upstream_error`, `invalid_input`, `not_found`, `result_too_large`, `calendar_changed`, `unsupported_calendar_data`, `unsupported_attachment` and `verification_failed`, and a server-generated request id; the write tools add `create_conflict`, `read_only_calendar`, `forbidden`, `attendees_present`, `edit_not_supported`, `write_refused` and `outcome_unknown`, a fixed `reason` and `field`, and for an iCloud refusal a bounded, sanitised `upstream` summary whose `detail` is untrusted. The read tools forward no upstream text. Only the tool name, request id and code are logged.
+The read tools (`list_calendars`, `list_events`, `search_events`, `get_event`, `get_event_attachment_download`) require `calendar:read`. The write tools require `calendar:read` plus `calendar:write` (`create_event`, `update_event`) or `calendar:delete` (`delete_event`); changing or deleting an event with attendees or an organizer also requires `calendar:invite`, checked after the event is read (`attendees_present`). Errors are structured `{ error: { code, message, request_id } }` with codes `reconnect_required`, `temporarily_unavailable`, `insufficient_scope`, `upstream_error`, `invalid_input`, `not_found`, `result_too_large`, `calendar_changed`, `unsupported_calendar_data`, `unsupported_attachment` and `verification_failed`, and a server-generated request id; the write tools add `create_conflict`, `read_only_calendar`, `forbidden`, `attendees_present`, `edit_not_supported`, `write_refused` and `outcome_unknown`, a fixed `reason` and `field`, and for an iCloud refusal a bounded, sanitised `upstream` summary whose `detail` is untrusted. The read tools forward no upstream text. Only the tool name, request id and code are logged.
 
 If iCloud answers a tool call with a definitive 401, the service marks the connection `reconnect_required` with a CAS on the revision it read, and returns `reconnect_required`. A connection reconnected concurrently is not overwritten. While a connection is `reconnect_required`, tool calls return that code without contacting iCloud; access tokens of the same generation stay valid until they expire, and refresh fails with `invalid_grant`. A fresh login restores service under the next credential generation, for newly authorized grants only: every earlier grant has ended. A 403 from iCloud is treated as temporary, not as invalid credentials.
 

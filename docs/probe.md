@@ -5,11 +5,12 @@ The probe checks what Apple's iCloud CalDAV server really does, for every point 
 "Known quirks". Each check reports `confirmed`, `refuted`, `inconclusive`, `skipped` or `error`
 against one exact claim.
 
-**Status: the current probe version is 0.6.0.** Versions up to 0.5.0 have been run against a real
-iCloud account, locally: read-only and `--write` with 0.4.1, `--write` and `--invite` (the single
-step I1) with 0.5.0. Version 0.6.0 adds the [phase 3 checks](#phase-3-checks-probe-060) and the
-[invite steps](#invite-steps-i2-to-i10) I2 to I10; it has been tested only against the simulated
-CalDAV server. The `--cleanup` mode has been tested only against the simulated server, and the
+**Status: the current probe version is 0.6.0.** It has been run against a real iCloud account,
+locally, on 2026-11-12: `--write` with the [phase 3 checks](#phase-3-checks-probe-060) and the
+[invite steps](#invite-steps-i2-to-i10), owner-authorised. Earlier versions ran read-only and
+`--write` (0.4.1) and the single invite step I1 (0.5.0). The measured results are in
+[plan.md](plan.md) ("Invitations when an event with attendees is saved"). The `--cleanup` mode has
+been tested only against the simulated server, and the
 Lambda path has not been run against real AWS. An `inconclusive` result is useful evidence, not a
 failed run.
 
@@ -201,7 +202,7 @@ verified where possible. A second signal exits at once (then run `--cleanup`, be
 ### 3. Invite run (optional; sends real email)
 
 `--invite` saves events that list an attendee address you supply, and iCloud's server-side
-scheduling sends real email for them: run 6 (probe 0.5.0) measured an invitation email about
+scheduling sends real email for them: a run on 2026-11-12 measured an invitation email about
 20 s after the save and a cancellation email about 5 s after the delete, with no confirmation.
 Without `--invite-steps` the probe runs the single step I1: one event, an invitation and a
 cancellation. Before using it, know that:
@@ -249,7 +250,7 @@ attendee addresses, and the probe never invents one.
 
 | Step | What it sends (each in its own event, SUMMARY `caldav-mcp probe invitation <step>`) | Question it answers | Roles (tag suffix) | Most emails |
 |---|---|---|---|---|
-| I1 | create; read twice, 3 s apart; delete | Invitation on save, cancellation on delete (measured in run 6) | none | 2 |
+| I1 | create; read twice, 3 s apart; delete | Invitation on save, cancellation on delete (measured: both sent) | none | 2 |
 | I2 | create; PUT moving it one hour later, SEQUENCE+1, new DTSTAMP; delete | Update mail for a time change? | `a` | 3 |
 | I2b | create; PUT changing only DESCRIPTION, SEQUENCE+1; delete | Mail for a non-time change? | `a` | 3 |
 | I3 | create; PUT adding only a VALARM (SEQUENCE unchanged); PUT changing only TRANSP; delete | Mail for personal properties? | `a` | 4 |
