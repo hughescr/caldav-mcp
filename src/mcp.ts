@@ -66,7 +66,7 @@ const messages: Record<ToolErrorCode, (name: ToolName, detail: ErrorDetail | und
         return detail === 'attachment_size' ? 'The attachment is larger than the 20 MiB download limit.' : 'The event or the download result exceeded a size limit of this server.';
     },
     calendar_changed: name => (isWrite(name)
-        ? 'The event is not the version this call expected (iCloud refused the conditional save, or the call was not sent), or a different event already exists for this operation_id; see reason. This call saved nothing. Get the event again and decide before retrying.'
+        ? 'The event is not the version this call expected (iCloud refused the conditional save with 412, or the stored version differed so nothing was sent), or a different event already exists for this operation_id; see reason. This call saved nothing. Get the event again and decide before retrying.'
         : 'The calendar event changed between reads. List or get the event again before retrying.'),
     unsupported_calendar_data: name => (isWrite(name)
         ? 'The stored event holds data this server cannot change safely, or the change could not be verified before sending; see reason. Nothing was saved.'
