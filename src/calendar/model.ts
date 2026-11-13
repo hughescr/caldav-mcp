@@ -73,11 +73,12 @@ export function isCanonicalPath(value: string): boolean {
 /**
  * The last segment of a resource href: an opaque name issued by iCloud, never decoded, re-encoded or case-normalised.
  * Raw characters are RFC 3986 pchar (unreserved, sub-delims, ':' and '@'); every '%' starts an escape of two hex digits in
- * either case. An encoded slash (`%2F`, `%2f`), a double-encoded one (`%252F`) and `%3A` are ordinary characters of the name.
+ * either case. A double-encoded slash (`%252F`), `%3A` and every other escape are ordinary characters of the name.
  * Refused: an empty name; `.` and `..`, also as a single case-insensitive decode (WHATWG URL resolves `%2e` and `%2E%2E` as
- * dot segments); escaped C0 controls and DEL; and raw characters outside pchar, which WHATWG URL would percent-encode
- * (space, `"`, `<`, `>`, `` ` ``, `{`, `}`, `^`) or which are not valid in a URI path (`|`, `[`, `]`, `\`, non-ASCII), so
- * the bytes sent could differ from the bytes issued.
+ * dot segments); a single-encoded slash or backslash (`%2F`, `%5C`, either case), the one form a single upstream decode
+ * would turn into a path separator; escaped C0 controls and DEL; and raw characters outside pchar, which WHATWG URL would
+ * percent-encode (space, `"`, `<`, `>`, `` ` ``, `{`, `}`, `^`) or which are not valid in a URI path (`|`, `[`, `]`, `\`,
+ * non-ASCII), so the bytes sent could differ from the bytes issued.
  */
 export function isResourceName(name: string): boolean {
     if (name.length === 0 || !/^(?:[A-Za-z0-9\-._~!$&'()*+,;=:@]|%[0-9A-Fa-f]{2})+$/u.test(name)) { return false; }
@@ -85,7 +86,7 @@ export function isResourceName(name: string): boolean {
     if (decoded === '.' || decoded === '..') { return false; }
     for (const match of name.matchAll(/%([0-9A-Fa-f]{2})/gu)) {
         const code = Number.parseInt(match[1] ?? '', 16);
-        if (code < 0x20 || code === 0x7F) { return false; }
+        if (code < 0x20 || code === 0x7F || code === 0x2F || code === 0x5C) { return false; }
     }
     return true;
 }

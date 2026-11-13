@@ -152,7 +152,9 @@ try {
         // Synthetic ids; the name has the measured shape (a URL-like UID: %3A and a double-encoded slash %252F).
         const calendar = '/10000000001/calendars/11111111-2222-4333-8444-555555555555/';
         const measured = `${calendar}x-apple-reminderkit%3A%252FSYNTHETICLIST%252F00000000-0000-4000-8000-000000000001.ics`;
-        const names = [measured, `${calendar}..%2F..%2Fother%2Fx.ics`, `${calendar}a%2fb%2Fc%3a.ics`, `${calendar}%65vent%7b1%7d.ics`];
+        const names = [measured, `${calendar}..%252F..%252Fother`, `${calendar}a%252fb%252Fc%3a.ics`, `${calendar}%65vent%7b1%7d.ics`];
+        // A single-encoded slash or backslash is refused before any request: one upstream decode would make it a separator.
+        const refused = [`${calendar}..%2F..%2Fother%2Fx.ics`, `${calendar}a%5cb.ics`];
         const card = 'BEGIN:VCALENDAR\nVERSION:2.0\nBEGIN:VEVENT\nUID:synthetic\nDTSTART:20270111T100000Z\nDTEND:20270111T110000Z\nEND:VEVENT\nEND:VCALENDAR\n';
         const multistatus = `<?xml version="1.0" encoding="UTF-8"?><D:multistatus xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav"><D:response><D:href>${measured}</D:href><D:propstat><D:prop><D:getetag>"v1"</D:getetag><C:calendar-data><![CDATA[${card}]]></C:calendar-data></D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response></D:multistatus>`;
         const seen = [];
@@ -177,6 +179,13 @@ try {
             const backend = createICloudBackend({ fetch: (input, init) => fetch(String(input).replace(origin, local), init) });
             const auth = { appleId: 'synthetic@example.invalid', appPassword: 'synthetic-password' };
             const discovery = { principalUrl: `${origin}/10000000001/principal/`, calendarHomeUrl: `${origin}/10000000001/calendars/` };
+            for (const href of refused) {
+                const protocol = error => error.code === 'protocol';
+                await assert.rejects(backend.putEvent(auth, discovery, { calendarId: calendar, href, body: card, precondition: { kind: 'match', etag: '"v1"' } }), protocol);
+                await assert.rejects(backend.deleteEvent(auth, discovery, { calendarId: calendar, href, etag: '"v1"' }), protocol);
+                await assert.rejects(backend.multigetEvents(auth, discovery, { calendarId: calendar, hrefs: [href] }), protocol);
+            }
+            assert.equal(seen.length, 0, 'no request was sent for a refused name');
             for (const href of names) {
                 assert.equal((await backend.putEvent(auth, discovery, { calendarId: calendar, href, body: card, precondition: { kind: 'match', etag: '"v1"' } })).status, 204);
                 assert.equal((await backend.deleteEvent(auth, discovery, { calendarId: calendar, href, etag: '"v1"' })).status, 204);

@@ -14,7 +14,7 @@ import { eventsOutputSchema, unreadableSchema } from '../src/calendar/event-sche
 import { parseOriginalResource } from '../src/calendar/ical';
 import { PATH_MAX } from '../src/calendar/limits';
 import { isCanonicalPath, isResourceHref, isResourceName } from '../src/calendar/model';
-import { listEvents, type ReadDeps } from '../src/calendar/read';
+import { getEvent, listEvents, type ReadDeps } from '../src/calendar/read';
 import { bindCalendarService } from '../src/calendar/service';
 import { handleMcp } from '../src/mcp';
 import { createFakeFetch, xmlResponse } from './fixtures/caldav/fake-fetch';
@@ -35,13 +35,18 @@ const DISCOVERY: Discovery = { principalUrl: `${ORIGIN}/10000000001/principal/`,
 const AUTH: CalDavAuth = { appleId: 'synthetic@example.invalid', appPassword: 'synthetic-password' };
 const ETAG = strongEtag('"v1"') as StrongEtag;
 
+/** A traversal-shaped name whose slashes are double-encoded: one decode leaves `%2F`, never a separator. Accepted, kept verbatim. */
+const DOUBLE_ENCODED_TRAVERSAL = '..%252F..%252Fother';
 /** Names accepted as opaque: every escape is kept byte for byte, in its own case. */
 const ACCEPTED_NAMES = [
-    MEASURED_NAME, 'a%2Fb.ics', 'a%2fb.ics', 'a%252F.ics', 'a%3Ab.ics', 'a%3ab.ics', '..%2F..%2Fother', '..%2F..%2Fother%2Fx.ics', '%2E%2E%2F', '%2e%2e%2fx',
-    '%65vent%20%7b1%7d.ics', 'a%25.ics', 'a%2525.ics', "a!$&'()*+,;=:@~-._b.ics", '...', '.ics', 'a.', 'a%FF.ics', '%2E%2E.ics', '%20',
+    MEASURED_NAME, 'a%252F.ics', 'a%252f.ics', 'a%255C.ics', 'a%3Ab.ics', 'a%3ab.ics', DOUBLE_ENCODED_TRAVERSAL, '..%252F..%252Fother%252Fx.ics', '%2E%2E%252F',
+    '%65vent%20%7b1%7d.ics', 'a%25.ics', 'a%2525.ics', "a!$&'()*+,;=:@~-._b.ics", '...', '.ics', 'a.', 'a%FF.ics', '%2E%2E.ics', '%20', 'a%2Eb.ics', 'a%5Bb%5D.ics',
 ];
-/** Names refused: dot segments (also after one case-insensitive decode), escaped controls, bad escapes, and raw characters URL would change or that are not in a URI path. */
+/** A single-encoded slash or backslash, in either case: the one form a single upstream decode would turn into a path separator. */
+const ENCODED_SEPARATOR_NAMES = ['a%2Fb.ics', 'a%2fb.ics', 'a%5Cb.ics', 'a%5cb.ics', '..%2F..%2Fother', '..%2F..%2Fother%2Fx.ics', '%2E%2E%2F', '%2e%2e%2fx', '..%5C..%5Cother', '%2F', '%5c', MEASURED_NAME.replaceAll('%252F', '%2F')];
+/** Names refused: dot segments (also after one case-insensitive decode), escaped separators and controls, bad escapes, and raw characters URL would change or that are not in a URI path. */
 const REJECTED_NAMES = [
+    ...ENCODED_SEPARATOR_NAMES,
     '', '.', '..', '%2E%2E', '%2e%2e', '%2E%2e', '.%2E', '%2e.', '%2e', '%2E', '%00', 'a%00.ics', 'a%1F.ics', 'a%1f.ics', 'a%7F.ics', 'a%zz.ics', 'a%2.ics', 'a%', '%',
     'a b.ics', ' a.ics', 'a.ics ', 'a\tb.ics', 'a\nb.ics', 'a\u0000b.ics', 'a\u007Fb.ics', 'café.ics', 'a b.ics', 'a/b.ics', 'a\\b.ics', 'a?b.ics', 'a#b.ics',
     'a{b}.ics', 'a^b.ics', 'a|b.ics', 'a[b].ics', 'a"b.ics', 'a<b>.ics', 'a`b.ics',
@@ -99,7 +104,7 @@ describe('server hrefs resolve to their exact bytes, or are refused', () => {
         }
     });
     test('a name of this calendar that the rule refuses is attributable to its own response', () => {
-        for (const name of ['a%zz.ics', 'a b.ics', 'a{b}.ics', 'café.ics', 'a%00.ics', 'a.ics?x=1', 'a#b', 'a|b.ics', 'a\tb.ics']) {
+        for (const name of [...ENCODED_SEPARATOR_NAMES, 'a%zz.ics', 'a b.ics', 'a{b}.ics', 'café.ics', 'a%00.ics', 'a.ics?x=1', 'a#b', 'a|b.ics', 'a\tb.ics']) {
             expect<unknown>([name, resolve(`${CAL}${name}`)]).toEqual([name, { kind: 'unsupported_name' }]);
         }
         expect(resolve(`${CAL}${'a'.repeat(PATH_MAX)}`)).toEqual({ kind: 'unsupported_name' });
@@ -133,6 +138,12 @@ describe('REPORT extraction keeps the href opaque and isolates one bad response'
         const xml = multistatus(response(`${CAL}a{b}.ics`, '"v2"'), response(MEASURED), response(`${CAL}café.ics`, '"v3"'));
         expect<unknown>(extractEventReport(xml, context)).toEqual([{ unaddressable: true }, resource, { unaddressable: true }]);
     });
+    test('a name with a single-encoded slash or backslash is one unaddressable entry, not a calendar failure', () => {
+        const xml = multistatus(response(`${CAL}..%2F..%2Fother%2Fx.ics`, '"v2"'), response(MEASURED), response(`${CAL}a%5cb.ics`, '"v3"'), response(`${CAL}${DOUBLE_ENCODED_TRAVERSAL}`, '"v4"'));
+        expect<unknown>(extractEventReport(xml, context)).toEqual([
+            { unaddressable: true }, resource, { unaddressable: true }, { href: `${CAL}${DOUBLE_ENCODED_TRAVERSAL}`, etag: '"v4"', calendarData: CARD },
+        ]);
+    });
     test('the bad response still has to be well formed: its own defects stay whole-answer failures', () => {
         expect(() => extractEventReport(multistatus(response(`${CAL}a{b}.ics`, 'W/"weak"'), response(MEASURED)), context)).toThrow(new CalDavError('protocol'));
         const twoHrefs = `<D:response><D:href>${CAL}a{b}.ics</D:href><D:href>${MEASURED}</D:href><D:status>HTTP/1.1 200 OK</D:status></D:response>`;
@@ -159,10 +170,11 @@ describe('REPORT extraction keeps the href opaque and isolates one bad response'
         }
     });
     test('the multiget body carries the href with XML escaping only', () => {
-        const body = buildMultiget([MEASURED, `${CAL}a&b'%2F.ics`]);
+        const body = buildMultiget([MEASURED, `${CAL}a&b'%252F.ics`, `${CAL}${DOUBLE_ENCODED_TRAVERSAL}`]);
         expect(body).toContain(`<d:href>${MEASURED}</d:href>`);
-        expect(body).toContain(`<d:href>${CAL}a&amp;b&apos;%2F.ics</d:href>`);
-        for (const name of ['%2E%2E', 'a{b}.ics', 'a%zz.ics', '']) { expect(() => buildMultiget([`${CAL}${name}`])).toThrow(new CalDavError('protocol')); }
+        expect(body).toContain(`<d:href>${CAL}a&amp;b&apos;%252F.ics</d:href>`);
+        expect(body).toContain(`<d:href>${CAL}${DOUBLE_ENCODED_TRAVERSAL}</d:href>`);
+        for (const name of ['%2E%2E', 'a{b}.ics', 'a%zz.ics', '', ...ENCODED_SEPARATOR_NAMES]) { expect(() => buildMultiget([`${CAL}${name}`])).toThrow(new CalDavError('protocol')); }
     });
 });
 
@@ -185,7 +197,7 @@ describe('the iCloud backend sends the href byte for byte', () => {
         const backend = createWriteBackend({ fetch: async (input, init) => { await fake.fetch(input, init); return new Response(null, { status, headers: { etag: '"v2"' } }); }, authorization: () => 'Basic c3ludGhldGlj' });
         return { fake, backend };
     };
-    for (const name of [MEASURED_NAME, '..%2F..%2Fother', '..%2F..%2Fother%2Fx.ics', 'a%2fb.ics', 'a%2Fb.ics', '%65vent%7b1%7d.ics', 'a%3Ab%3ac.ics']) {
+    for (const name of [MEASURED_NAME, DOUBLE_ENCODED_TRAVERSAL, '..%252F..%252Fother%252Fx.ics', 'a%252fb.ics', 'a%255Cb.ics', '%65vent%7b1%7d.ics', 'a%3Ab%3ac.ics']) {
         test(`PUT and DELETE of ${name} go to exactly that URL, never decoded or re-encoded`, async () => {
             const { fake, backend } = writer();
             const href = `${CAL}${name}`;
@@ -198,7 +210,7 @@ describe('the iCloud backend sends the href byte for byte', () => {
     test('a write to a refused name, another calendar or a nested path is never sent', async () => {
         const { fake, backend } = writer();
         const cases: [string, string][] = [
-            ...['%2E%2E', '%2e', '..', 'a{b}.ics', 'a%zz.ics', 'a/b.ics', 'a b.ics', 'a%00.ics'].map((name): [string, string] => [CAL, `${CAL}${name}`]),
+            ...['%2E%2E', '%2e', '..', 'a{b}.ics', 'a%zz.ics', 'a/b.ics', 'a b.ics', 'a%00.ics', ...ENCODED_SEPARATOR_NAMES].map((name): [string, string] => [CAL, `${CAL}${name}`]),
             [CAL, `${OTHER}a.ics`], [OTHER, MEASURED], [CAL, CAL], [`${HOME}a/b/`, `${HOME}a/b/c.ics`],
         ];
         for (const [calendarId, href] of cases) {
@@ -246,9 +258,9 @@ describe('the bytes on the wire (Bun fetch, loopback only)', () => {
     /** The real global fetch, with only the iCloud origin swapped for the loopback server by plain string replacement. */
     const loopback = (input: string | URL | Request, init?: RequestInit) => globalThis.fetch(String(input).replace(ORIGIN, `http://127.0.0.1:${port}`), init);
 
-    test('PUT, DELETE and multiget carry the measured href and an encoded-slash traversal name unchanged', async () => {
+    test('PUT, DELETE and multiget carry the measured href and a double-encoded traversal name unchanged', async () => {
         const backend = createICloudBackend({ fetch: loopback });
-        const traversal = `${CAL}..%2F..%2Fother%2Fx.ics`;
+        const traversal = `${CAL}${DOUBLE_ENCODED_TRAVERSAL}`;
         for (const href of [MEASURED, traversal]) {
             expect(await backend.putEvent(AUTH, DISCOVERY, { calendarId: CAL, href, body: CARD, precondition: { kind: 'match', etag: ETAG } })).toMatchObject({ status: 204 });
             expect(await backend.deleteEvent(AUTH, DISCOVERY, { calendarId: CAL, href, etag: ETAG })).toMatchObject({ status: 204 });
@@ -256,6 +268,15 @@ describe('the bytes on the wire (Bun fetch, loopback only)', () => {
         expect<unknown>(await backend.multigetEvents(AUTH, DISCOVERY, { calendarId: CAL, hrefs: [MEASURED] })).toEqual([{ kind: 'found', resource }]);
         expect(lines).toEqual([`PUT ${MEASURED} HTTP/1.1`, `DELETE ${MEASURED} HTTP/1.1`, `PUT ${traversal} HTTP/1.1`, `DELETE ${traversal} HTTP/1.1`, `REPORT ${CAL} HTTP/1.1`]);
         expect(bodies[4]).toContain(`<d:href>${MEASURED}</d:href>`);
+    });
+    test('a single-encoded slash or backslash name never reaches the socket', async () => {
+        const backend = createICloudBackend({ fetch: loopback });
+        for (const href of [`${CAL}..%2F..%2Fother%2Fx.ics`, `${CAL}a%5cb.ics`]) {
+            await expect(backend.putEvent(AUTH, DISCOVERY, { calendarId: CAL, href, body: CARD, precondition: { kind: 'match', etag: ETAG } })).rejects.toEqual(new CalDavError('protocol'));
+            await expect(backend.deleteEvent(AUTH, DISCOVERY, { calendarId: CAL, href, etag: ETAG })).rejects.toEqual(new CalDavError('protocol'));
+            await expect(backend.multigetEvents(AUTH, DISCOVERY, { calendarId: CAL, hrefs: [href] })).rejects.toEqual(new CalDavError('protocol'));
+        }
+        expect(lines).toEqual([]);
     });
 });
 
@@ -304,18 +325,47 @@ describe('the measured shape end to end through the MCP tools, on the in-memory 
         expect(writes.every(call => call.calendarId === CAL && (call.href === undefined || call.href === MEASURED))).toBe(true);
     });
 
-    test('a different spelling of the same name is a different, absent resource; nothing is decoded to find it', async () => {
+    test('this application does not normalise aliases: another spelling is passed through as its own href and not found here', async () => {
+        // The in-memory iCloud is keyed by the exact string, so this proves only that nothing here decodes or re-cases an
+        // href to find a stored one; what iCloud itself does with an alias is a separate question (see the next test).
         const h = harness();
         h.fake.seed(CAL, MEASURED, ORIGINAL);
-        for (const href of [MEASURED.replace('%3A', '%3a'), MEASURED.replaceAll('%252F', '%2F'), MEASURED.replace('%3A', ':')]) {
+        const aliases = [MEASURED.replace('%3A', '%3a'), MEASURED.replaceAll('%252F', '%252f'), MEASURED.replace('%3A', ':')];
+        for (const href of aliases) {
             const got = await h.call('get_event', { calendar_id: CAL, resource_href: href });
             expect<unknown>([href, got.structuredContent.error?.code]).toEqual([href, 'not_found']);
+        }
+        const asked = h.fake.calls.filter(call => call.method === 'multigetEvents').map(call => call.hrefs);
+        expect<unknown>(asked).toEqual(aliases.map(href => [href]));
+    });
+
+    test('a multiget answered with another spelling of the asked href fails closed: nothing is attributed to the asked href', async () => {
+        const calendarUrl = `${ORIGIN}${CAL}`;
+        const answered = [MEASURED.replace('%3A', '%3a'), MEASURED.replaceAll('%252F', '%252f'), MEASURED.replace('%3A', ':'), `${ORIGIN}${MEASURED.replace('%3A', '%3a')}`];
+        for (const spelling of answered) {
+            // The HTTP-level script: iCloud answers the multiget for MEASURED with a response naming `spelling`.
+            const fake = createFakeFetch({ [`REPORT ${calendarUrl}`]: () => xmlResponse(multistatus(response(spelling))) });
+            const backend = createICloudBackend({ fetch: fake.fetch });
+            await expect(backend.multigetEvents(AUTH, DISCOVERY, { calendarId: CAL, hrefs: [MEASURED] })).rejects.toEqual(new CalDavError('protocol'));
+            expect(fake.calls.map(call => call.body?.includes(`<d:href>${MEASURED}</d:href>`))).toEqual([true]);
+        }
+        // The same answer scripted one layer up, as a backend lookup: get_event refuses it rather than show its data.
+        for (const spelling of answered.slice(0, 3)) {
+            const read = new FakeCalDavRead().setCalendars([{ id: CAL, displayName: 'Reminders', components: ['VEVENT'], color: null }]);
+            read.scriptMultiget(CAL, [{ kind: 'found', resource: { href: spelling, etag: '"v1"', calendarData: CARD } }]);
+            const deps: ReadDeps = { backend: read, auth: AUTH, discovery: FAKE_DISCOVERY, accountId: 'synthetic-account', budget: createReadBudget({ now: () => 0, yieldFn: async () => {} }) };
+            await expect(getEvent(deps, { calendar_id: CAL, resource_href: MEASURED })).rejects.toMatchObject({ code: 'upstream_error' });
+            read.scriptMultiget(CAL, [{ kind: 'not_found', href: spelling }]);
+            await expect(getEvent(deps, { calendar_id: CAL, resource_href: MEASURED })).rejects.toMatchObject({ code: 'upstream_error' });
         }
     });
 
     test('a refused href from a client is invalid input, with no upstream request', async () => {
         const h = harness();
-        for (const href of [`${CAL}%2E%2E`, `${CAL}..`, `${CAL}a/b.ics`, `${OTHER}a.ics`, `${CAL}a%zz.ics`, `${CAL}a b.ics`, `${CAL}a{b}.ics`, `${CAL}café.ics`, CAL]) {
+        for (const href of [
+            `${CAL}%2E%2E`, `${CAL}..`, `${CAL}a/b.ics`, `${OTHER}a.ics`, `${CAL}a%zz.ics`, `${CAL}a b.ics`, `${CAL}a{b}.ics`, `${CAL}café.ics`, CAL,
+            `${CAL}..%2F..%2Fother%2Fx.ics`, `${CAL}a%2fb.ics`, `${CAL}a%5Cb.ics`, MEASURED.replaceAll('%252F', '%2F'),
+        ]) {
             for (const [name, args] of [
                 ['get_event', { calendar_id: CAL, resource_href: href }],
                 ['update_event', { calendar_id: CAL, resource_href: href, expected_version: '"v1"', changes: { title: 'x' } }],
@@ -362,7 +412,7 @@ describe('one unaddressable resource does not fail its calendar', () => {
 describe('values derived from an href', () => {
     test('attachment refs of differently escaped hrefs never collide', async () => {
         const ics = await Bun.file(new URL('./fixtures/calendar/attachments/original.ics', import.meta.url)).text();
-        const refs = ['a%2Fb.ics', 'a%2fb.ics', 'a%252Fb.ics', 'a%3Ab.ics', 'a:b.ics', '..%2F..%2Fother'].map(name => buildAttachmentIndex({
+        const refs = ['a%252Fb.ics', 'a%252fb.ics', 'a%25252Fb.ics', 'a%3Ab.ics', 'a:b.ics', DOUBLE_ENCODED_TRAVERSAL].map(name => buildAttachmentIndex({
             accountId: 'synthetic-account', calendarId: CAL, href: `${CAL}${name}`, resource: parseOriginalResource(ics, {}), prescan: prescanAttachProperties(ics),
         }).map(entry => entry.ref));
         const all = refs.flat();

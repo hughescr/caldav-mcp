@@ -129,9 +129,10 @@ All are confirmed on one account: by the probe runs of 2026-11-11, the `RRULE` p
   URL of a `PUT` or `DELETE`, the `href` of a multiget, with XML escaping only). It accepts
   exactly the calendar's own path plus one segment: raw characters only those a URI path
   allows unchanged (letters, digits, `-._~!$&'()*+,;=:@`), every `%` followed by two hex
-  digits, an escaped slash such as `%2F` or `%252F` an ordinary character of the name, and
-  never `.` or `..`, also not after one decoding (`%2E%2E`), nor an escaped control
-  character. A response in an expanded query that names an event of the calendar by a path
+  digits, a double-encoded slash (`%252F`) an ordinary character of the name, and never `.`
+  or `..`, also not after one decoding (`%2E%2E`), nor an escaped control character, nor a
+  single-encoded slash or backslash (`%2F`, `%5C`, either case): that is the one form a
+  single decoding upstream would turn into a path separator. A response in an expanded query that names an event of the calendar by a path
   outside that rule is reported as one unreadable event (`unsupported_resource_address`,
   without the path) and the rest of the calendar is listed; a path outside the calendar
   still fails the whole calendar.
