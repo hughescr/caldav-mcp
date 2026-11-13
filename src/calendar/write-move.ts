@@ -11,7 +11,9 @@
  *   slot, keeping a moved override's own times (P3D-2) — only when the old start, the new start and every shifted value are
  *   UTC instants (ORCH-R: "only if both old and new values are UTC-computable instants"; zone-free arithmetic on UTC only;
  *   DATE and floating series are refused here although P3D-2 measured a DATE shift, because the arbitration and the build
- *   brief allow UTC only; `exceptions_shift_not_utc`), and never with a rule change (`exceptions_shift_with_rule_change`).
+ *   brief allow UTC only; `exceptions_shift_not_utc`), never with a rule change (`exceptions_shift_with_rule_change`), and only
+ *   when the stored rule provably moves with its start: FREQ SECONDLY to WEEKLY with no part but INTERVAL, COUNT and WKST
+ *   (no BY* part, no UNTIL; `exceptions_shift_rule_not_supported`: use drop and re-apply the listed exceptions).
  *   There is no "keep": an override whose RECURRENCE-ID no longer matches an instance is hidden by iCloud (P3C-4).
  * - The other requested fields apply to the master and to every kept override, as for `all` without a move.
  * - RDATE (`rdate_present`) and EXRULE (`exrule_present`) series are refused: their values would need moving too.
@@ -119,6 +121,7 @@ export function planSeriesMove(input: { deps: WriteDeps; original: OriginalResou
             && exdates.every(value => value.kind === 'utc')
             && original.overrides.every(override => override.recurrenceId?.time.kind === 'utc' && (!atSlot(override) || override.start.kind === 'utc') && (!atSlot(override) || override.end === null || override.end.kind === 'utc'));
         if (!allUtc || found === null) { throw notSupported('exceptions_shift_not_utc'); }
+        if (!shiftInvariant(masterOutline, master)) { throw notSupported('exceptions_shift_rule_not_supported'); }
         delta = found;
     }
     const shift = (time: IcsTime): IcsTime => {
@@ -245,6 +248,26 @@ export function planSeriesMove(input: { deps: WriteDeps; original: OriginalResou
         // Exceptions that a shift would move (again) cannot be judged on another version: calendar_changed, never a guess.
         staleProvable: !(input.exceptions === 'shift' && hasExceptions),
     };
+}
+
+const SHIFT_FREQUENCIES: ReadonlySet<string> = new Set(['SECONDLY', 'MINUTELY', 'HOURLY', 'DAILY', 'WEEKLY']);
+const SHIFT_PARTS: ReadonlySet<string> = new Set(['FREQ', 'INTERVAL', 'COUNT', 'WKST']);
+
+/**
+ * Whether moving the start moves every occurrence by the same UTC difference, proven from the rule's text alone (ORCH ruling
+ * on review finding 2): exactly one stored RRULE, FREQ up to WEEKLY, and no part but INTERVAL, COUNT and WKST (no BY* part,
+ * no UNTIL). Then each occurrence is the start plus a whole multiple of a fixed period, so shifted exceptions stay
+ * occurrences. Anything else (a MONTHLY rule on the 30th moved to the 31st, a BYDAY list, an UNTIL that cuts the shifted
+ * series) could leave a shifted override or EXDATE on no occurrence, so it is refused.
+ */
+function shiftInvariant(outline: ReturnType<typeof describeEvents>[number], master: EventComponent): boolean {
+    const lines = outline.properties.filter(line => line.name === 'rrule').map(line => ruleText(line.text));
+    const text = lines[0];
+    if (lines.length !== 1 || text === null || text === undefined) { return false; }
+    let parts: readonly { key: string; value: string }[];
+    try { parts = parseRrule(text, master.start.kind, 'rrule').parts; } catch { return false; }
+    const freq = parts.find(part => part.key === 'FREQ')?.value;
+    return freq !== undefined && SHIFT_FREQUENCIES.has(freq) && parts.every(part => SHIFT_PARTS.has(part.key));
 }
 
 /** An override that sits at its own slot: its DTSTART is its RECURRENCE-ID, same form and text (it was not moved). */

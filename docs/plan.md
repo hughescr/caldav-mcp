@@ -456,6 +456,11 @@ series moves are built on `develop`, not released).
       `RELATED-TO` is written (how Apple Calendar links split series is not measured).
     - series move (`all` with new times or rule): exceptions are dropped, or shifted by one UTC
       delta when every value is UTC (P3D-1 to P3D-3); a zoned or all-day series cannot shift.
+      A shift also needs a rule that provably moves with its start, judged from its text: `FREQ`
+      `SECONDLY` to `WEEKLY` with no part but `INTERVAL`, `COUNT` and `WKST`. A `BY*` part, an
+      `UNTIL` or a monthly or yearly rule can leave a shifted exception on no occurrence (a
+      monthly series on the 30th moved to the 31st), so it is refused and the agent drops the
+      exceptions and re-applies them.
 11. Every edited component gets `SEQUENCE` plus one (1 when absent) and new `DTSTAMP` and
     `LAST-MODIFIED`. iCloud changes none of them, so this server must.
 12. Leap seconds need no handling.
@@ -574,7 +579,7 @@ No decisions are open.
   text and iCloud's expansion cannot prove rather than compute it. Refused: a split at a
   changed occurrence of a zoned series, a `COUNT` split whose remaining count the expansion
   cannot prove unless the agent gives the rule, shifting exceptions of a zoned, all-day or
-  floating series, and series with `RDATE` or `EXRULE` for splits and moves. A repeated
+  floating series or of a rule with a `BY*` part, an `UNTIL` or a frequency above weekly, and series with `RDATE` or `EXRULE` for splits and moves. A repeated
   `this` call on a zoned series after its first success is `calendar_changed`, not
   `desired_state_present`: the occurrence's id changed (`occ1_` to `occ2_`) and the old id
   can no longer be mapped by text. A split that fails between its two writes shows the later

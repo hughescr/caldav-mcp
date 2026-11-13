@@ -595,6 +595,35 @@ describe('update_event, edit_scope all: moving a series', () => {
         expect(writeEventResultSchema.safeParse(result).success).toBe(true);
     });
 
+    test('shift only for a rule that provably moves with its start: FREQ up to WEEKLY with INTERVAL, COUNT, WKST; anything else refused, nothing sent', async () => {
+        // A monthly series on the 30th: an override of Apr 30 would land on May 1, which the moved rule never produces.
+        const monthly = crlf([
+            'BEGIN:VCALENDAR', 'VERSION:2.0', 'PRODID:-//Apple Inc.//macOS 15.1//EN',
+            'BEGIN:VEVENT', 'UID:MONTHLY-1', 'DTSTAMP:20261101T120000Z', 'SEQUENCE:1', 'DTSTART:20270130T150000Z', 'DTEND:20270130T160000Z', 'RRULE:FREQ=MONTHLY;COUNT=8', 'SUMMARY:Monthly', 'END:VEVENT',
+            'BEGIN:VEVENT', 'UID:MONTHLY-1', 'RECURRENCE-ID:20270430T150000Z', 'DTSTAMP:20261101T120000Z', 'DTSTART:20270430T150000Z', 'DTEND:20270430T160000Z', 'SUMMARY:Monthly (agenda)', 'END:VEVENT',
+            'END:VCALENDAR',
+        ]);
+        const refused = { code: 'edit_not_supported', reason: 'exceptions_shift_rule_not_supported' };
+        const cases: [string, string, { start: string; end: string }][] = [
+            ['monthly', monthly, { start: '2027-01-31T15:00:00Z', end: '2027-01-31T16:00:00Z' }],
+            ['weekly BYDAY', SHIFT_SERIES.replace('RRULE:FREQ=WEEKLY;COUNT=6', 'RRULE:FREQ=WEEKLY;COUNT=6;BYDAY=MO'), { start: '2027-02-09T16:00:00Z', end: '2027-02-09T17:00:00Z' }],
+            ['daily UNTIL', SHIFT_SERIES.replace('RRULE:FREQ=WEEKLY;COUNT=6', 'RRULE:FREQ=DAILY;UNTIL=20270401T000000Z'), { start: '2027-02-09T16:00:00Z', end: '2027-02-09T17:00:00Z' }],
+        ];
+        for (const [name, text, changes] of cases) {
+            const h = harness();
+            const etag = h.fake.seed(WORK, SHIFT_HREF, text);
+            expect<unknown>([name, await failure(() => update(h, { calendar_id: WORK, resource_href: SHIFT_HREF, expected_version: etag, edit_scope: 'all', exceptions: 'shift', changes }))]).toEqual([name, refused]);
+            expect<unknown>([name, h.fake.count('putEvent')]).toEqual([name, 0]);
+        }
+        // Plain DAILY and WEEKLY with INTERVAL and COUNT still shift.
+        for (const rule of ['FREQ=DAILY', 'FREQ=WEEKLY;INTERVAL=1;COUNT=6;WKST=MO']) {
+            const h = harness();
+            const etag = h.fake.seed(WORK, SHIFT_HREF, SHIFT_SERIES.replace('RRULE:FREQ=WEEKLY;COUNT=6', `RRULE:${rule}`));
+            const result = await update(h, { calendar_id: WORK, resource_href: SHIFT_HREF, expected_version: etag, edit_scope: 'all', exceptions: 'shift', changes: { start: '2027-02-09T16:00:00Z', end: '2027-02-09T17:00:00Z' } });
+            expect<unknown>([rule, result.write_outcome, result.exceptions_shifted, unfold(puts(h.fake)[0]?.body ?? '').filter(line => line.startsWith('RECURRENCE-ID'))]).toEqual([rule, 'applied', { changed_occurrences: 2, deleted_occurrences: 1 }, ['RECURRENCE-ID:20270216T160000Z', 'RECURRENCE-ID:20270223T160000Z']]);
+        }
+    });
+
     test('a rule change: the new RRULE, exceptions must be dropped', async () => {
         const h = harness();
         const etag = h.fake.seed(WORK, SHIFT_HREF, SHIFT_SERIES);

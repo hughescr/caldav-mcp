@@ -106,7 +106,7 @@ export const updateEventInputSchema = z.strictObject({
     edit_scope: editScopeSchema.optional().describe('Required for a repeating event. all: the series and every changed occurrence. this: one occurrence (recurrence_id). this_and_future: that occurrence and every later one, by ending the series before it and creating a new series from it (recurrence_id and operation_id).'),
     recurrence_id: recurrenceIdInputSchema.optional(),
     operation_id: splitOperationIdSchema.optional(),
-    exceptions: z.enum(['drop', 'shift'], FIXED).optional().describe('Needed when a change moves a series that has changed or deleted occurrences (edit_scope all with new start/end or recurrence; this_and_future with new start/end and such occurrences after the split). drop: remove them all. shift: move them by the same UTC difference; only for a series stored in UTC (no zone name), only for a time change, not a rule change.'),
+    exceptions: z.enum(['drop', 'shift'], FIXED).optional().describe('Needed when a change moves a series that has changed or deleted occurrences (edit_scope all with new start/end or recurrence; this_and_future with new start/end and such occurrences after the split). drop: remove them all. shift: move them by the same UTC difference; only for a series stored in UTC (no zone name), only for a time change, not a rule change, and only when the stored rule is FREQ=SECONDLY to WEEKLY with no part but INTERVAL, COUNT and WKST (no BY* part, no UNTIL); otherwise use drop and re-apply the listed exceptions.'),
     changes: updateChangesSchema,
 }, FIXED);
 
@@ -240,7 +240,7 @@ export const writeErrorReasonSchema = z.enum([
     // edit_not_supported
     'occurrence_only_resource', 'rrule_not_editable', 'rdate_present', 'exrule_present', 'split_at_series_start', 'split_at_changed_zoned_occurrence',
     'count_series_needs_rrule', 'split_occurrence_changed_supply_times', 'occurrence_end_not_copyable', 'exceptions_choice_required',
-    'exceptions_shift_not_utc', 'exceptions_shift_with_rule_change', 'exceptions_shift_not_supported_for_split',
+    'exceptions_shift_not_utc', 'exceptions_shift_with_rule_change', 'exceptions_shift_rule_not_supported', 'exceptions_shift_not_supported_for_split',
     // occurrence_identity_unprovable
     'override_not_matched', 'form_mismatch', 'unrecognized_zone', 'shares_time_with_other_occurrence', 'override_exists_unmatched', 'split_near_changed_occurrence', 'window_too_wide',
     // split_incomplete
